@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Reflection;
+using System.Text.RegularExpressions;
 using System.Threading;
 using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.CSharp;
@@ -33,9 +34,12 @@ public sealed class Compiler
 {
     private static int _counter;
     private readonly List<MetadataReference> references;
-    private readonly int templateLineOffset;
 
-    private const string TemplatePrefix = """
+    private static readonly Regex SimpleUsing = new (@"^using\s+(static\s+)?[A-Za-z_][\w.]*\s*;$");
+
+    private static readonly Regex AliasUsing = new (@"^using\s+[A-Za-z_]\w*\s*=\s*[A-Za-z_][\w.]*\s*;$");
+
+    private const string DefaultUsings = """
 using System;
 using System.Collections;
 using System.Collections.Generic;
@@ -95,6 +99,9 @@ using SpaceEngineers.Game.Entities.Blocks;
 using VRage.Input;
 using VRage.Serialization;
 
+""";
+
+    private const string ClassPrefix = """
 public class __REPL__
 {
     public static IEnumerable<object> Run(TextWriter Console)
@@ -102,17 +109,17 @@ public class __REPL__
 
 """;
 
-    private const string TemplateSuffix = """
-
+    private const string ClassSuffix = """
         yield break;
     }
 }
 """;
+    
+    private static readonly int DefaultUsingLineCount = DefaultUsings.Count(c => c == '\n');
+    private static readonly int ClassPrefixLineCount = ClassPrefix.Count(c => c == '\n');
 
     public Compiler()
     {
-        templateLineOffset = TemplatePrefix.Count(c => c == '\n');
-
         references = [];
         foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
         {
@@ -134,7 +141,15 @@ public class __REPL__
 
     public CompilationResult Compile(string userCode)
     {
-        var fullSource = TemplatePrefix + userCode + TemplateSuffix;
+        var lines = userCode.Split('\n');
+        var cut = FindUsingBoundary(lines);
+
+        var userUsings = cut > 0 ? string.Join("\n", lines, 0, cut) + "\n" : "";
+        var userBody = string.Join("\n", lines, cut, lines.Length - cut) + "\n";
+        var preamble = DefaultUsings + userUsings + ClassPrefix;
+        var fullSource = preamble + userBody + ClassSuffix;
+        var bodyOffset = DefaultUsingLineCount + ClassPrefixLineCount;
+        var bodyStart = bodyOffset + cut;
         var assemblyName = "__REPL__" + Interlocked.Increment(ref _counter);
 
         var syntaxTree = CSharpSyntaxTree.ParseText(
@@ -154,7 +169,7 @@ public class __REPL__
         var result = compilation.Emit(ms);
         if (!result.Success)
         {
-            var errors = result.Diagnostics.Select(FormatDiagnostic);
+            var errors = result.Diagnostics.Select(d => FormatDiagnostic(d, bodyStart, bodyOffset));
             return new CompilationResult(string.Join("\n", errors));
         }
 
@@ -163,10 +178,34 @@ public class __REPL__
         return new CompilationResult(assembly);
     }
 
-    private string FormatDiagnostic(Diagnostic d)
+    private static int FindUsingBoundary(string[] lines)
+    {
+        var boundary = 0;
+        for (var i = 0; i < lines.Length; i++)
+        {
+            var trimmed = lines[i].Trim();
+            if (string.IsNullOrWhiteSpace(trimmed) || trimmed.StartsWith("//"))
+                continue;
+            if (!IsUsingDirective(trimmed))
+                return boundary;
+            boundary = i + 1;
+        }
+        return boundary;
+    }
+
+    private static bool IsUsingDirective(string trimmedLine)
+    {
+        var idx = trimmedLine.IndexOf("//", StringComparison.Ordinal);
+        var effective = (idx >= 0 ? trimmedLine.Substring(0, idx) : trimmedLine).TrimEnd();
+        return SimpleUsing.IsMatch(effective) || AliasUsing.IsMatch(effective);
+    }
+
+    private static string FormatDiagnostic(Diagnostic d, int bodyStart, int bodyOffset)
     {
         var span = d.Location.GetLineSpan();
-        var line = span.StartLinePosition.Line + 1 - templateLineOffset;
+        var compiled = span.StartLinePosition.Line;
+        var offset = compiled >= bodyStart ? bodyOffset : DefaultUsingLineCount;
+        var line = Math.Max(1, compiled + 1 - offset);
         var col = span.StartLinePosition.Character + 1;
         return $"({line},{col}): error {d.Id}: {d.GetMessage()}";
     }

@@ -77,9 +77,9 @@ public sealed class Executor
         var session = MyAPIGateway.Session;
         if (session == null || session.OnlineMode == MyOnlineModeEnum.OFFLINE)
             return null;
-        if (session.PromoteLevel >= MyPromoteLevel.Admin)
-            return null;
-        return "Multiplayer non-admin: code execution is disabled. You must be Admin or Owner to use SeMcp in multiplayer.";
+        return session.PromoteLevel >= MyPromoteLevel.Admin
+            ? null
+            : "Multiplayer non-admin: code execution is disabled. You must be Admin or Owner to use SeMcp in multiplayer.";
     }
 
     private void Start(WorkItem item)

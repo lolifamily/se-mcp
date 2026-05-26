@@ -1,4 +1,3 @@
-using System.Reflection;
 using ClientPlugin.Settings;
 using ClientPlugin.Settings.Layouts;
 using JetBrains.Annotations;
@@ -6,6 +5,7 @@ using Sandbox.Graphics.GUI;
 using VRage.Plugins;
 
 #if !DEV_BUILD
+using System.Reflection;
 [assembly: AssemblyVersion("1.0.0.0")]
 [assembly: AssemblyFileVersion("1.0.0.0")]
 #endif

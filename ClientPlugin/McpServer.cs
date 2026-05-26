@@ -209,7 +209,7 @@ public sealed class McpServer : IDisposable
 
     private static string JsonToolsList()
     {
-        return """{"tools":[{"name":"execute_code","description":"Execute C# code inside Space Engineers. Full .NET + game API access. Use Console.WriteLine() for output. Use yield return null to pause until next frame. In multiplayer, requires Admin or Owner promote level. Common namespaces (System, VRage, Sandbox, SpaceEngineers, etc.) are pre-imported. Do NOT add 'using' directives — they will cause compilation errors. Use fully qualified names for uncommon types if needed.","inputSchema":{"type":"object","properties":{"code":{"type":"string","description":"C# code body (function body only, no class/method declaration needed)"}},"required":["code"]}}]}""";
+        return """{"tools":[{"name":"execute_code","description":"Execute C# code inside Space Engineers. Full .NET + game API access. Use Console.WriteLine() for output. Use yield return null to pause until next frame. In multiplayer, requires Admin or Owner promote level. Pre-imported namespaces: System.*, VRage.*, VRageMath, Sandbox.*, SpaceEngineers.Game.* — use short type names (e.g. MySession.Static, MyEntities, MyCubeGrid). Extra 'using' directives at the top of your code are supported. Only use fully qualified names when you get an ambiguous type error.","inputSchema":{"type":"object","properties":{"code":{"type":"string","description":"C# code body. Using directives at the top are supported; no class/method wrapper needed."}},"required":["code"]}}]}""";
     }
 
     private static string JsonToolResult(string text, bool isError)
