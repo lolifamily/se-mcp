@@ -67,6 +67,9 @@ using VRage.Game.GUI.TextPanel;
 using VRage.Game.ModAPI;
 using VRage.Game.ModAPI.Interfaces;
 using VRage.Game.ModAPI.Network;
+using VRage.Game.ModAPI.Ingame.Utilities;
+using VRage.Network;
+using Sandbox;
 using Sandbox.ModAPI;
 using Sandbox.ModAPI.Interfaces;
 using Sandbox.ModAPI.Interfaces.Terminal;
@@ -74,15 +77,23 @@ using Sandbox.ModAPI.Weapons;
 using Sandbox.ModAPI.Contracts;
 using Sandbox.Game;
 using Sandbox.Game.Entities;
+using Sandbox.Game.Entities.Cube;
+using Sandbox.Game.Entities.Blocks;
+using Sandbox.Game.Entities.Character;
 using Sandbox.Game.EntityComponents;
 using Sandbox.Game.World;
 using Sandbox.Game.GameSystems;
+using Sandbox.Game.Gui;
 using Sandbox.Game.Lights;
+using Sandbox.Game.Multiplayer;
 using Sandbox.Game.Components;
 using Sandbox.Definitions;
 using Sandbox.Common.ObjectBuilders;
 using Sandbox.Common.ObjectBuilders.Definitions;
 using SpaceEngineers.Game.ModAPI;
+using SpaceEngineers.Game.Entities.Blocks;
+using VRage.Input;
+using VRage.Serialization;
 
 public class __REPL__
 {

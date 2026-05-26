@@ -112,7 +112,7 @@ public sealed class McpServer : IDisposable
                 }
             }
 
-            using var reader = new StreamReader(ctx.Request.InputStream, ctx.Request.ContentEncoding);
+            using var reader = new StreamReader(ctx.Request.InputStream, System.Text.Encoding.UTF8);
             var body = await reader.ReadToEndAsync();
 
             using var doc = JsonDocument.Parse(body);
@@ -209,7 +209,7 @@ public sealed class McpServer : IDisposable
 
     private static string JsonToolsList()
     {
-        return """{"tools":[{"name":"execute_code","description":"Execute C# code inside Space Engineers. Full .NET + game API access. Use Console.WriteLine() for output. Use yield return null to pause until next frame. In multiplayer, requires Admin or Owner promote level.","inputSchema":{"type":"object","properties":{"code":{"type":"string","description":"C# code body (function body only, no class/method declaration needed)"}},"required":["code"]}}]}""";
+        return """{"tools":[{"name":"execute_code","description":"Execute C# code inside Space Engineers. Full .NET + game API access. Use Console.WriteLine() for output. Use yield return null to pause until next frame. In multiplayer, requires Admin or Owner promote level. Common namespaces (System, VRage, Sandbox, SpaceEngineers, etc.) are pre-imported. Do NOT add 'using' directives — they will cause compilation errors. Use fully qualified names for uncommon types if needed.","inputSchema":{"type":"object","properties":{"code":{"type":"string","description":"C# code body (function body only, no class/method declaration needed)"}},"required":["code"]}}]}""";
     }
 
     private static string JsonToolResult(string text, bool isError)
