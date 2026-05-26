@@ -5,8 +5,6 @@ using System.Linq;
 using System.Reflection;
 using System.Text.RegularExpressions;
 using System.Threading;
-using Microsoft.CodeAnalysis;
-using Microsoft.CodeAnalysis.CSharp;
 using VRage.Utils;
 
 namespace ClientPlugin;
@@ -33,11 +31,17 @@ public sealed class CompilationResult
 public sealed class Compiler
 {
     private static int _counter;
-    private readonly List<MetadataReference> references;
 
-    private static readonly Regex SimpleUsing = new (@"^using\s+(static\s+)?[A-Za-z_][\w.]*\s*;$");
+    private readonly MethodInfo parseText;
+    private readonly MethodInfo compilationCreate;
+    private readonly object parseOptions;
+    private readonly object compileOptions;
+    private readonly Type syntaxTreeBase;
+    private readonly Type metaRefBase;
+    private readonly List<object> references;
 
-    private static readonly Regex AliasUsing = new (@"^using\s+[A-Za-z_]\w*\s*=\s*[A-Za-z_][\w.]*\s*;$");
+    private static readonly Regex SimpleUsing = new(@"^using\s+(static\s+)?[A-Za-z_][\w.]*\s*;$");
+    private static readonly Regex AliasUsing = new(@"^using\s+[A-Za-z_]\w*\s*=\s*[A-Za-z_][\w.]*\s*;$");
 
     private const string DefaultUsings = """
 using System;
@@ -121,29 +125,59 @@ public class __REPL__
     }
 }
 """;
-    
+
     private static readonly int DefaultUsingLineCount = DefaultUsings.Count(c => c == '\n');
     private static readonly int ClassPrefixLineCount = ClassPrefix.Count(c => c == '\n');
 
     public Compiler()
     {
+        var (csharpAsm, commonAsm) = LoadRoslyn();
+
+        metaRefBase = commonAsm.GetType("Microsoft.CodeAnalysis.MetadataReference");
+        syntaxTreeBase = commonAsm.GetType("Microsoft.CodeAnalysis.SyntaxTree");
+
+        var createFromFile = metaRefBase.GetMethods(BindingFlags.Public | BindingFlags.Static)
+            .First(m => m.Name == "CreateFromFile" && m.GetParameters()[0].ParameterType == typeof(string));
+
+        parseText = csharpAsm.GetType("Microsoft.CodeAnalysis.CSharp.CSharpSyntaxTree")
+            .GetMethods(BindingFlags.Public | BindingFlags.Static)
+            .First(m => m.Name == "ParseText" && m.GetParameters()[0].ParameterType == typeof(string));
+
+        compilationCreate = csharpAsm.GetType("Microsoft.CodeAnalysis.CSharp.CSharpCompilation")
+            .GetMethods(BindingFlags.Public | BindingFlags.Static)
+            .First(m => m.Name == "Create" && m.GetParameters().Length == 4
+                        && m.GetParameters()[0].ParameterType == typeof(string));
+
+        var langVerType = csharpAsm.GetType("Microsoft.CodeAnalysis.CSharp.LanguageVersion");
+        var parseOptsType = csharpAsm.GetType("Microsoft.CodeAnalysis.CSharp.CSharpParseOptions");
+        parseOptions = NewWithDefaults(
+            parseOptsType.GetConstructors().First(c => c.GetParameters()[0].ParameterType == langVerType),
+            langVerType.GetField("Latest").GetValue(null));
+
+        var outputKindType = commonAsm.GetType("Microsoft.CodeAnalysis.OutputKind");
+        var compOptsType = csharpAsm.GetType("Microsoft.CodeAnalysis.CSharp.CSharpCompilationOptions");
+        compileOptions = NewWithDefaults(
+            compOptsType.GetConstructors().First(c => c.GetParameters()[0].ParameterType == outputKindType),
+            outputKindType.GetField("DynamicallyLinkedLibrary").GetValue(null));
+
         references = [];
         foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
         {
-            if (asm.IsDynamic)
-                continue;
-
+            if (asm.IsDynamic) continue;
             try
             {
-                var location = asm.Location;
-                if (!string.IsNullOrEmpty(location))
-                    references.Add(MetadataReference.CreateFromFile(location));
+                var loc = asm.Location;
+                if (string.IsNullOrEmpty(loc)) continue;
+                if (Path.GetFileName(loc) == "VRage.Native.dll") continue;
+                references.Add(CallWithDefaults(createFromFile, null, loc));
             }
             catch (Exception ex)
             {
                 MyLog.Default.WriteLine($"SeMcp: skipped reference {asm.GetName().Name}: {ex.Message}");
             }
         }
+
+        MyLog.Default.WriteLine($"SeMcp: Roslyn {csharpAsm.GetName().Version}, {references.Count} references");
     }
 
     public CompilationResult Compile(string userCode)
@@ -159,31 +193,66 @@ public class __REPL__
         var bodyStart = bodyOffset + cut;
         var assemblyName = "__REPL__" + Interlocked.Increment(ref _counter);
 
-        var syntaxTree = CSharpSyntaxTree.ParseText(
-            fullSource,
-            new CSharpParseOptions(LanguageVersion.Latest));
+        var tree = CallWithDefaults(parseText, null, fullSource, parseOptions);
 
-        var compilation = CSharpCompilation.Create(
-            assemblyName,
-            [syntaxTree],
-            references,
-            new CSharpCompilationOptions(
-                OutputKind.DynamicallyLinkedLibrary,
-                optimizationLevel: OptimizationLevel.Debug,
-                allowUnsafe: false));
+        var treesArr = Array.CreateInstance(syntaxTreeBase, 1);
+        treesArr.SetValue(tree, 0);
+
+        var refsArr = Array.CreateInstance(metaRefBase, references.Count);
+        for (var i = 0; i < references.Count; i++)
+            refsArr.SetValue(references[i], i);
+
+        dynamic compilation = compilationCreate.Invoke(null, [assemblyName, treesArr, refsArr, compileOptions]);
 
         using var ms = new MemoryStream();
-        var result = compilation.Emit(ms);
-        if (!result.Success)
+        var emitResult = compilation.Emit(ms);
+
+        if (!(bool)emitResult.Success)
         {
-            var errors = result.Diagnostics.Select(d => FormatDiagnostic(d, bodyStart, bodyOffset));
+            var errors = new List<string>();
+            foreach (dynamic d in emitResult.Diagnostics)
+            {
+                var span = d.Location.GetLineSpan();
+                var compiled = (int)span.StartLinePosition.Line;
+                var col = (int)span.StartLinePosition.Character;
+                var offset = compiled >= bodyStart ? bodyOffset : DefaultUsingLineCount;
+                var line = Math.Max(1, compiled + 1 - offset);
+                errors.Add($"({line},{col + 1}): error {d.Id}: {d.GetMessage()}");
+            }
             return new CompilationResult(string.Join("\n", errors));
         }
 
         ms.Seek(0, SeekOrigin.Begin);
-        var assembly = Assembly.Load(ms.ToArray());
-        return new CompilationResult(assembly);
+        return new CompilationResult(Assembly.Load(ms.ToArray()));
     }
+
+    private static (Assembly csharp, Assembly common) LoadRoslyn()
+    {
+        try
+        {
+            var csharp = Assembly.Load(MakeAssemblyName("Microsoft.CodeAnalysis.CSharp", 4, 12, 0, 0));
+            var common = Assembly.Load(MakeAssemblyName("Microsoft.CodeAnalysis", 4, 12, 0, 0));
+            return (csharp, common);
+        }
+        catch (Exception ex)
+        {
+            MyLog.Default.WriteLine($"SeMcp: NuGet Roslyn unavailable ({ex.GetType().Name}), using game Roslyn");
+        }
+
+        return (
+            FindLoaded("Microsoft.CodeAnalysis.CSharp"),
+            FindLoaded("Microsoft.CodeAnalysis"));
+    }
+
+    private static AssemblyName MakeAssemblyName(string name, int major, int minor, int build, int rev)
+    {
+        var an = new AssemblyName(name) { Version = new Version(major, minor, build, rev) };
+        an.SetPublicKeyToken([0x31, 0xbf, 0x38, 0x56, 0xad, 0x36, 0x4e, 0x35]);
+        return an;
+    }
+
+    private static Assembly FindLoaded(string name) =>
+        AppDomain.CurrentDomain.GetAssemblies().First(a => a.GetName().Name == name);
 
     private static int FindUsingBoundary(string[] lines)
     {
@@ -207,13 +276,37 @@ public class __REPL__
         return SimpleUsing.IsMatch(effective) || AliasUsing.IsMatch(effective);
     }
 
-    private static string FormatDiagnostic(Diagnostic d, int bodyStart, int bodyOffset)
+    private static object CallWithDefaults(MethodInfo method, object target, params object[] leading)
     {
-        var span = d.Location.GetLineSpan();
-        var compiled = span.StartLinePosition.Line;
-        var offset = compiled >= bodyStart ? bodyOffset : DefaultUsingLineCount;
-        var line = Math.Max(1, compiled + 1 - offset);
-        var col = span.StartLinePosition.Character + 1;
-        return $"({line},{col}): error {d.Id}: {d.GetMessage()}";
+        var parms = method.GetParameters();
+        var args = new object[parms.Length];
+        for (var i = 0; i < parms.Length; i++)
+        {
+            if (i < leading.Length)
+                args[i] = leading[i];
+            else if (parms[i].HasDefaultValue)
+                args[i] = parms[i].DefaultValue;
+            else
+                args[i] = parms[i].ParameterType.IsValueType
+                    ? Activator.CreateInstance(parms[i].ParameterType) : null;
+        }
+        return method.Invoke(target, args);
+    }
+
+    private static object NewWithDefaults(ConstructorInfo ctor, params object[] leading)
+    {
+        var parms = ctor.GetParameters();
+        var args = new object[parms.Length];
+        for (var i = 0; i < parms.Length; i++)
+        {
+            if (i < leading.Length)
+                args[i] = leading[i];
+            else if (parms[i].HasDefaultValue)
+                args[i] = parms[i].DefaultValue;
+            else
+                args[i] = parms[i].ParameterType.IsValueType
+                    ? Activator.CreateInstance(parms[i].ParameterType) : null;
+        }
+        return ctor.Invoke(args);
     }
 }
