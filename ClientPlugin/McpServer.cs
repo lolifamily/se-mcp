@@ -19,7 +19,6 @@ public sealed class McpServer : IDisposable
     private HttpListener listener;
     private readonly CancellationTokenSource cts = new();
     private readonly ConcurrentDictionary<object, CancellationTokenSource> pending = new();
-    private string sessionId;
 
     public McpServer(Executor executor, string port, string secretKey)
     {
@@ -72,6 +71,7 @@ public sealed class McpServer : IDisposable
         {
             MyLog.Default.Error($"SeMcp: error stopping listener: {ex.Message}");
         }
+        cts.Dispose();
     }
 
     private async Task ListenLoop()
@@ -102,6 +102,13 @@ public sealed class McpServer : IDisposable
                 return;
             }
 
+            // Browsers always send Origin and forbid JS from forging it; native MCP clients don't. Reject browser-origin (CSRF) requests.
+            if (!string.IsNullOrEmpty(ctx.Request.Headers["Origin"]))
+            {
+                await Respond(ctx, 403, "Forbidden: browser origin not allowed");
+                return;
+            }
+
             if (secretKey.Length > 0)
             {
                 var auth = ctx.Request.Headers["Authorization"] ?? "";
@@ -112,20 +119,35 @@ public sealed class McpServer : IDisposable
                 }
             }
 
+            const int maxBody = 1_048_576;
             using var reader = new StreamReader(ctx.Request.InputStream, System.Text.Encoding.UTF8);
-            var body = await reader.ReadToEndAsync();
+            var buf = new char[maxBody + 1];
+            var len = await reader.ReadBlockAsync(buf, 0, buf.Length);
+            if (len > maxBody)
+            {
+                await Respond(ctx, 413, "Request too large");
+                return;
+            }
+            var body = new string(buf, 0, len);
 
             using var doc = JsonDocument.Parse(body);
             var root = doc.RootElement;
             var method = root.GetProperty("method").GetString();
             root.TryGetProperty("id", out var idEl);
+            var isNotification = method != null && method.StartsWith("notifications/");
+
+            if (!isNotification && idEl.ValueKind == JsonValueKind.Undefined)
+            {
+                await RespondJsonRpcError(ctx, "null", -32600, "Missing id for request");
+                return;
+            }
+
+            var rawId = idEl.ValueKind != JsonValueKind.Undefined ? idEl.GetRawText() : "null";
 
             switch (method)
             {
                 case "initialize":
-                    sessionId = Guid.NewGuid().ToString();
-                    ctx.Response.Headers["Mcp-Session-Id"] = sessionId;
-                    await RespondJsonRpc(ctx, idEl, JsonInitResult());
+                    await RespondJsonRpc(ctx, rawId, JsonInitResult());
                     break;
 
                 case "notifications/initialized":
@@ -133,11 +155,11 @@ public sealed class McpServer : IDisposable
                     break;
 
                 case "tools/list":
-                    await RespondJsonRpc(ctx, idEl, JsonToolsList());
+                    await RespondJsonRpc(ctx, rawId, JsonToolsList());
                     break;
 
                 case "tools/call":
-                    await HandleToolsCall(ctx, root, idEl);
+                    await HandleToolsCall(ctx, root, rawId);
                     break;
 
                 case "notifications/cancelled":
@@ -146,7 +168,7 @@ public sealed class McpServer : IDisposable
                     break;
 
                 default:
-                    await RespondJsonRpcError(ctx, idEl, -32601, $"Unknown method: {method}");
+                    await RespondJsonRpcError(ctx, rawId, -32601, $"Unknown method: {method}");
                     break;
             }
         }
@@ -161,11 +183,11 @@ public sealed class McpServer : IDisposable
         }
     }
 
-    private async Task HandleToolsCall(HttpListenerContext ctx, JsonElement root, JsonElement idEl)
+    private async Task HandleToolsCall(HttpListenerContext ctx, JsonElement root, string rawId)
     {
         if (!executor.Initialized)
         {
-            await RespondJsonRpcError(ctx, idEl, -32002,
+            await RespondJsonRpcError(ctx, rawId, -32002,
                 "Game is still loading, not all plugins have been initialized yet. Please retry shortly.");
             return;
         }
@@ -175,7 +197,7 @@ public sealed class McpServer : IDisposable
 
         if (toolName != "execute_code")
         {
-            await RespondJsonRpcError(ctx, idEl, -32602, $"Unknown tool: {toolName}");
+            await RespondJsonRpcError(ctx, rawId, -32602, $"Unknown tool: {toolName}");
             return;
         }
 
@@ -183,11 +205,12 @@ public sealed class McpServer : IDisposable
         var cancelSource = new CancellationTokenSource();
         var item = new WorkItem { Code = code, Cancel = cancelSource.Token };
 
-        pending.TryAdd(idEl.ToString(), cancelSource);
+        pending.TryAdd(rawId, cancelSource);
         executor.Enqueue(item);
 
         await item.Done.Task;
-        pending.TryRemove(idEl.ToString(), out _);
+        pending.TryRemove(rawId, out _);
+        cancelSource.Dispose();
 
         var isError = item.Error != null || item.WasCancelled;
         var text = item.WasCancelled
@@ -197,8 +220,7 @@ public sealed class McpServer : IDisposable
                 : item.Output;
 
         var result = JsonToolResult(text.Trim(), isError);
-        ctx.Response.Headers["Mcp-Session-Id"] = sessionId;
-        await RespondJsonRpc(ctx, idEl, result);
+        await RespondJsonRpc(ctx, rawId, result);
     }
 
     private void HandleCancel(JsonElement root)
@@ -225,19 +247,19 @@ public sealed class McpServer : IDisposable
         return $$"""{"content":[{"type":"text","text":"{{escaped}}"}],"isError":{{(isError ? "true" : "false")}}}""";
     }
 
-    private static async Task RespondJsonRpc(HttpListenerContext ctx, JsonElement id, string resultJson)
+    private static async Task RespondJsonRpc(HttpListenerContext ctx, string rawId, string resultJson)
     {
-        var json = $$"""{"jsonrpc":"2.0","id":{{id.GetRawText()}},"result":{{resultJson}}}""";
+        var json = $$"""{"jsonrpc":"2.0","id":{{rawId}},"result":{{resultJson}}}""";
         ctx.Response.ContentType = "application/json";
         ctx.Response.StatusCode = 200;
         using var w = new StreamWriter(ctx.Response.OutputStream);
         await w.WriteAsync(json);
     }
 
-    private static async Task RespondJsonRpcError(HttpListenerContext ctx, JsonElement id, int code, string message)
+    private static async Task RespondJsonRpcError(HttpListenerContext ctx, string rawId, int code, string message)
     {
         var escaped = JsonEncodedText.Encode(message);
-        var json = $$$"""{"jsonrpc":"2.0","id":{{{id.GetRawText()}}},"error":{"code":{{{code}}},"message":"{{{escaped}}}"}}""";
+        var json = $$$"""{"jsonrpc":"2.0","id":{{{rawId}}},"error":{"code":{{{code}}},"message":"{{{escaped}}}"}}""";
         ctx.Response.ContentType = "application/json";
         ctx.Response.StatusCode = 200;
         using var w = new StreamWriter(ctx.Response.OutputStream);

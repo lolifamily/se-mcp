@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Concurrent;
+using System.Diagnostics;
 using System.IO;
 using System.Reflection;
 using System.Threading;
@@ -24,6 +25,8 @@ public sealed class WorkItem
 
 public sealed class Executor
 {
+    private const int FrameTimeoutMs = 1000;
+
     public volatile bool Initialized;
 
     private readonly Compiler compiler = new();
@@ -41,6 +44,7 @@ public sealed class Executor
         public WorkItem Item;
         public IEnumerator<object> Coroutine;
         public StringWriter Writer;
+        public FieldInfo DeadlineField;
     }
 
     public void Enqueue(WorkItem item)
@@ -73,6 +77,7 @@ public sealed class Executor
             Start(pair.Item, pair.Result);
 
         var denied = CheckPermission();
+        var deadline = (object)(Stopwatch.GetTimestamp() + Stopwatch.Frequency * FrameTimeoutMs / 1000);
 
         for (var i = active.Count - 1; i >= 0; i--)
         {
@@ -94,6 +99,7 @@ public sealed class Executor
 
             try
             {
+                s.DeadlineField?.SetValue(null, deadline);
                 if (!s.Coroutine.MoveNext())
                 {
                     Complete(s);
@@ -146,7 +152,8 @@ public sealed class Executor
             {
                 Item = item,
                 Coroutine = run(writer).GetEnumerator(),
-                Writer = writer
+                Writer = writer,
+                DeadlineField = type.GetField("__Deadline__")
             });
         }
         catch (Exception ex)

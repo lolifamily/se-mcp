@@ -7,6 +7,8 @@ using System.Linq;
 using System.Reflection;
 using System.Text.RegularExpressions;
 using System.Threading;
+using Mono.Cecil;
+using Mono.Cecil.Cil;
 using VRage.Utils;
 
 namespace ClientPlugin;
@@ -129,6 +131,14 @@ using VRage.Serialization;
     private const string ClassPrefix = """
 public class __REPL__
 {
+    public static long __Deadline__;
+    static int __c__;
+    static void __Tick__()
+    {
+        if ((++__c__ & 0x3FF) != 0) return;
+        if (System.Diagnostics.Stopwatch.GetTimestamp() > __Deadline__)
+            throw new System.TimeoutException("Script exceeded 1s frame time limit");
+    }
     public static IEnumerable<object> Run(TextWriter Console)
     {
 
@@ -290,8 +300,9 @@ public class __REPL__
         }
 
         ms.Seek(0, SeekOrigin.Begin);
-        
-        return new CompilationResult(Assembly.Load(ms.ToArray()));
+        var raw = ms.ToArray();
+        raw = InjectTimeoutChecks(raw);
+        return new CompilationResult(Assembly.Load(raw));
     }
 
     private static (Assembly csharp, Assembly common) LoadRoslyn()
@@ -361,5 +372,35 @@ public class __REPL__
                     ? Activator.CreateInstance(parms[i].ParameterType) : null;
         }
         return args;
+    }
+
+    private static byte[] InjectTimeoutChecks(byte[] raw)
+    {
+        try
+        {
+            using var asm = AssemblyDefinition.ReadAssembly(new MemoryStream(raw));
+            var replType = asm.MainModule.Types.FirstOrDefault(t => t.Name == "__REPL__");
+            var tick = replType?.Methods.FirstOrDefault(m => m.Name == "__Tick__");
+            if (tick == null) return raw;
+
+            foreach (var nested in replType.NestedTypes)
+            {
+                var mn = nested.Methods.FirstOrDefault(m => m.Name == "MoveNext");
+                if (mn?.HasBody != true) continue;
+                var il = mn.Body.GetILProcessor();
+                foreach (var ins in mn.Body.Instructions.ToList())
+                    if (ins.Operand is Instruction t && t.Offset <= ins.Offset)
+                        il.InsertBefore(ins, il.Create(OpCodes.Call, tick));
+            }
+
+            var output = new MemoryStream();
+            asm.Write(output);
+            return output.ToArray();
+        }
+        catch (Exception ex)
+        {
+            MyLog.Default.Warning($"SeMcp: IL timeout injection failed: {ex.Message}");
+            return raw;
+        }
     }
 }
