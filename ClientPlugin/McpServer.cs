@@ -163,6 +163,13 @@ public sealed class McpServer : IDisposable
 
     private async Task HandleToolsCall(HttpListenerContext ctx, JsonElement root, JsonElement idEl)
     {
+        if (!executor.Initialized)
+        {
+            await RespondJsonRpcError(ctx, idEl, -32002,
+                "Game is still loading, not all plugins have been initialized yet. Please retry shortly.");
+            return;
+        }
+
         var p = root.GetProperty("params");
         var toolName = p.GetProperty("name").GetString();
 

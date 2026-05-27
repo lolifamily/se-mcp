@@ -42,6 +42,7 @@ public sealed class Compiler
     private readonly Type metaRefBase;
     private readonly List<object> references;
 
+    private readonly MethodInfo createFromFile;
     private readonly MethodInfo emit;
     private readonly PropertyInfo emitSuccess;
     private readonly PropertyInfo emitDiags;
@@ -166,7 +167,7 @@ public class __REPL__
         var parseOptsType = csharpAsm.GetType("Microsoft.CodeAnalysis.CSharp.CSharpParseOptions");
         var compOptsType = csharpAsm.GetType("Microsoft.CodeAnalysis.CSharp.CSharpCompilationOptions");
 
-        var createFromFile = metaRefBase.GetMethod("CreateFromFile",
+        createFromFile = metaRefBase.GetMethod("CreateFromFile",
             BindingFlags.Public | BindingFlags.Static, null,
             [typeof(string), metaRefPropsType, docProviderType], null);
 
@@ -209,10 +210,16 @@ public class __REPL__
         posLine = linePositionType.GetProperty("Line");
         posChar = linePositionType.GetProperty("Character");
 
-        // Re-resolve each unique name via Assembly.Load so CLR picks the version
-        // that runtime binding (probing paths + redirects) would actually use.
-        var seen = new HashSet<string>();
         references = [];
+    }
+
+    // Re-resolve each unique name via Assembly.Load so CLR picks the version
+    // that runtime binding (probing paths + redirects) would actually use.
+    // Deferred until first Update() so all plugin assemblies are loaded.
+    public void CollectReferences()
+    {
+        var seen = new HashSet<string>();
+        references.Clear();
         foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
         {
             if (asm.IsDynamic) continue;
@@ -233,7 +240,7 @@ public class __REPL__
             }
         }
 
-        MyLog.Default.WriteLine($"SeMcp: Roslyn {csharpAsm.GetName().Version}, {references.Count} references");
+        MyLog.Default.WriteLine($"SeMcp: {references.Count} references collected");
     }
 
     public CompilationResult Compile(string userCode)

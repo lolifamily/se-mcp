@@ -24,9 +24,17 @@ public sealed class WorkItem
 
 public sealed class Executor
 {
+    public volatile bool Initialized;
+
     private readonly Compiler compiler = new();
-    private readonly ConcurrentQueue<WorkItem> queue = new();
+    private readonly ConcurrentQueue<(WorkItem Item, CompilationResult Result)> compiled = new();
     private readonly List<ActiveScript> active = [];
+
+    public void Initialize()
+    {
+        compiler.CollectReferences();
+        Initialized = true;
+    }
 
     private sealed class ActiveScript
     {
@@ -37,13 +45,34 @@ public sealed class Executor
 
     public void Enqueue(WorkItem item)
     {
-        queue.Enqueue(item);
+        Task.Run(() =>
+        {
+            try
+            {
+                if (item.Cancel.IsCancellationRequested)
+                { item.WasCancelled = true; item.Done.TrySetResult(true); return; }
+
+                var denied = CheckPermission();
+                if (denied != null)
+                { item.Error = denied; item.Done.TrySetResult(true); return; }
+
+                var result = compiler.Compile(item.Code);
+                compiled.Enqueue((item, result));
+            }
+            catch (Exception ex)
+            {
+                item.Error = FormatException(ex);
+                item.Done.TrySetResult(true);
+            }
+        });
     }
 
     public void Tick()
     {
-        while (queue.TryDequeue(out var item))
-            Start(item);
+        while (compiled.TryDequeue(out var pair))
+            Start(pair.Item, pair.Result);
+
+        var denied = CheckPermission();
 
         for (var i = active.Count - 1; i >= 0; i--)
         {
@@ -52,6 +81,13 @@ public sealed class Executor
             if (s.Item.Cancel.IsCancellationRequested)
             {
                 Complete(s, cancelled: true);
+                active.RemoveAt(i);
+                continue;
+            }
+
+            if (denied != null)
+            {
+                Complete(s, error: denied);
                 active.RemoveAt(i);
                 continue;
             }
@@ -82,19 +118,8 @@ public sealed class Executor
             : "Multiplayer non-admin: code execution is disabled. You must be Admin or Owner to use SeMcp in multiplayer.";
     }
 
-    private void Start(WorkItem item)
+    private void Start(WorkItem item, CompilationResult result)
     {
-        var denied = CheckPermission();
-        if (denied != null)
-        {
-            item.Error = denied;
-            item.Done.TrySetResult(true);
-            return;
-        }
-
-        var writer = new StringWriter();
-        var result = compiler.Compile(item.Code);
-
         if (!result.Success)
         {
             item.Error = result.ErrorOutput;
@@ -115,6 +140,7 @@ public sealed class Executor
 
             var run = (Func<TextWriter, IEnumerable<object>>)Delegate.CreateDelegate(
                 typeof(Func<TextWriter, IEnumerable<object>>), method);
+            var writer = new StringWriter();
 
             active.Add(new ActiveScript
             {

@@ -39,7 +39,10 @@ public class Plugin : IPlugin
 
     public void Update()
     {
-        executor?.Tick();
+        if (executor == null) return;
+        if (!executor.Initialized)
+            executor.Initialize();
+        executor.Tick();
     }
 
     [UsedImplicitly]
