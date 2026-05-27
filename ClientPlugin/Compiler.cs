@@ -209,13 +209,20 @@ public class __REPL__
         posLine = linePositionType.GetProperty("Line");
         posChar = linePositionType.GetProperty("Character");
 
+        // Re-resolve each unique name via Assembly.Load so CLR picks the version
+        // that runtime binding (probing paths + redirects) would actually use.
+        var seen = new HashSet<string>();
         references = [];
         foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
         {
             if (asm.IsDynamic) continue;
             try
             {
-                var loc = asm.Location;
+                var name = asm.GetName().Name;
+                if (!seen.Add(name)) continue;
+
+                var resolved = Assembly.Load(name);
+                var loc = resolved.Location;
                 if (string.IsNullOrEmpty(loc)) continue;
                 if (Path.GetFileName(loc) == "VRage.Native.dll") continue;
                 references.Add(CallWithDefaults(createFromFile, null, loc));

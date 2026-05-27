@@ -12,10 +12,12 @@ An LLM like Claude can connect over HTTP and execute C# code directly in the run
 
 Features:
 - REPL-style execution: write function bodies, not boilerplate
+- Latest C# syntax support (powered by Roslyn 4.12)
+- All assemblies loaded by the game are available as references, including the full .NET Framework, game APIs, and plugin libraries
 - Multi-frame coroutines via yield return null
 - Parallel script execution
 - Console.WriteLine() output piped back to the LLM
-- Roslyn compilation with corrected error line numbers
+- Corrected error line numbers that map back to your input
 - Configurable port and optional secret key authentication
 - Multiplayer safety: requires Admin or Owner promote level to execute code
 
