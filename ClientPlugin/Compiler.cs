@@ -1,5 +1,7 @@
 using System;
+using System.Collections;
 using System.Collections.Generic;
+using System.ComponentModel;
 using System.IO;
 using System.Linq;
 using System.Reflection;
@@ -39,6 +41,17 @@ public sealed class Compiler
     private readonly Type syntaxTreeBase;
     private readonly Type metaRefBase;
     private readonly List<object> references;
+
+    private readonly MethodInfo emit;
+    private readonly PropertyInfo emitSuccess;
+    private readonly PropertyInfo emitDiags;
+    private readonly PropertyInfo diagLoc;
+    private readonly PropertyInfo diagId;
+    private readonly MethodInfo diagMsg;
+    private readonly MethodInfo locLineSpan;
+    private readonly PropertyInfo spanStart;
+    private readonly PropertyInfo posLine;
+    private readonly PropertyInfo posChar;
 
     private static readonly Regex SimpleUsing = new(@"^using\s+(static\s+)?[A-Za-z_][\w.]*\s*;$");
     private static readonly Regex AliasUsing = new(@"^using\s+[A-Za-z_]\w*\s*=\s*[A-Za-z_][\w.]*\s*;$");
@@ -135,30 +148,66 @@ public class __REPL__
 
         metaRefBase = commonAsm.GetType("Microsoft.CodeAnalysis.MetadataReference");
         syntaxTreeBase = commonAsm.GetType("Microsoft.CodeAnalysis.SyntaxTree");
+        var metaRefPropsType = commonAsm.GetType("Microsoft.CodeAnalysis.MetadataReferenceProperties");
+        var docProviderType = commonAsm.GetType("Microsoft.CodeAnalysis.DocumentationProvider");
+        var outputKindType = commonAsm.GetType("Microsoft.CodeAnalysis.OutputKind");
+        var docModeType = commonAsm.GetType("Microsoft.CodeAnalysis.DocumentationMode");
+        var srcKindType = commonAsm.GetType("Microsoft.CodeAnalysis.SourceCodeKind");
+        var compilationType = commonAsm.GetType("Microsoft.CodeAnalysis.Compilation");
+        var emitResultType = commonAsm.GetType("Microsoft.CodeAnalysis.Emit.EmitResult");
+        var diagnosticType = commonAsm.GetType("Microsoft.CodeAnalysis.Diagnostic");
+        var locationType = commonAsm.GetType("Microsoft.CodeAnalysis.Location");
+        var lineSpanType = commonAsm.GetType("Microsoft.CodeAnalysis.FileLinePositionSpan");
+        var linePositionType = commonAsm.GetType("Microsoft.CodeAnalysis.Text.LinePosition");
 
-        var createFromFile = metaRefBase.GetMethods(BindingFlags.Public | BindingFlags.Static)
-            .First(m => m.Name == "CreateFromFile" && m.GetParameters()[0].ParameterType == typeof(string));
-
-        parseText = csharpAsm.GetType("Microsoft.CodeAnalysis.CSharp.CSharpSyntaxTree")
-            .GetMethods(BindingFlags.Public | BindingFlags.Static)
-            .First(m => m.Name == "ParseText" && m.GetParameters()[0].ParameterType == typeof(string));
-
-        compilationCreate = csharpAsm.GetType("Microsoft.CodeAnalysis.CSharp.CSharpCompilation")
-            .GetMethods(BindingFlags.Public | BindingFlags.Static)
-            .First(m => m.Name == "Create" && m.GetParameters().Length == 4
-                        && m.GetParameters()[0].ParameterType == typeof(string));
-
+        var syntaxTreeCsharpType = csharpAsm.GetType("Microsoft.CodeAnalysis.CSharp.CSharpSyntaxTree");
+        var compilationCsharpType = csharpAsm.GetType("Microsoft.CodeAnalysis.CSharp.CSharpCompilation");
         var langVerType = csharpAsm.GetType("Microsoft.CodeAnalysis.CSharp.LanguageVersion");
         var parseOptsType = csharpAsm.GetType("Microsoft.CodeAnalysis.CSharp.CSharpParseOptions");
+        var compOptsType = csharpAsm.GetType("Microsoft.CodeAnalysis.CSharp.CSharpCompilationOptions");
+
+        var createFromFile = metaRefBase.GetMethod("CreateFromFile",
+            BindingFlags.Public | BindingFlags.Static, null,
+            [typeof(string), metaRefPropsType, docProviderType], null);
+
+        parseText = syntaxTreeCsharpType.GetMethod("ParseText",
+            BindingFlags.Public | BindingFlags.Static, null,
+            [typeof(string), parseOptsType, typeof(string),
+             typeof(System.Text.Encoding), typeof(CancellationToken)], null);
+
+        compilationCreate = compilationCsharpType.GetMethod("Create",
+            BindingFlags.Public | BindingFlags.Static, null,
+            [typeof(string), typeof(IEnumerable<>).MakeGenericType(syntaxTreeBase),
+             typeof(IEnumerable<>).MakeGenericType(metaRefBase), compOptsType], null);
+
         parseOptions = NewWithDefaults(
-            parseOptsType.GetConstructors().First(c => c.GetParameters()[0].ParameterType == langVerType),
+            parseOptsType.GetConstructor(
+                [langVerType, docModeType, srcKindType, typeof(IEnumerable<string>)]),
             langVerType.GetField("Latest").GetValue(null));
 
-        var outputKindType = commonAsm.GetType("Microsoft.CodeAnalysis.OutputKind");
-        var compOptsType = csharpAsm.GetType("Microsoft.CodeAnalysis.CSharp.CSharpCompilationOptions");
         compileOptions = NewWithDefaults(
-            compOptsType.GetConstructors().First(c => c.GetParameters()[0].ParameterType == outputKindType),
+            compOptsType.GetConstructors()
+                .Single(c => c.GetParameters()[0].ParameterType == outputKindType
+                    && c.GetCustomAttribute<EditorBrowsableAttribute>()?.State != EditorBrowsableState.Never
+                    && c.GetParameters().Skip(1).All(p => p.HasDefaultValue)),
             outputKindType.GetField("DynamicallyLinkedLibrary").GetValue(null));
+
+        emit = compilationType.GetMethods(BindingFlags.Public | BindingFlags.Instance)
+            .Single(m => m.Name == "Emit"
+                && m.GetParameters()[0].ParameterType == typeof(Stream)
+                && m.GetCustomAttribute<EditorBrowsableAttribute>()?.State != EditorBrowsableState.Never
+                && m.GetParameters().Skip(1).All(p => p.HasDefaultValue));
+
+        diagMsg = diagnosticType.GetMethod("GetMessage", [typeof(IFormatProvider)]);
+        locLineSpan = locationType.GetMethod("GetLineSpan", Type.EmptyTypes);
+
+        emitSuccess = emitResultType.GetProperty("Success");
+        emitDiags = emitResultType.GetProperty("Diagnostics");
+        diagLoc = diagnosticType.GetProperty("Location");
+        diagId = diagnosticType.GetProperty("Id");
+        spanStart = lineSpanType.GetProperty("StartLinePosition");
+        posLine = linePositionType.GetProperty("Line");
+        posChar = linePositionType.GetProperty("Character");
 
         references = [];
         foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
@@ -202,27 +251,32 @@ public class __REPL__
         for (var i = 0; i < references.Count; i++)
             refsArr.SetValue(references[i], i);
 
-        dynamic compilation = compilationCreate.Invoke(null, [assemblyName, treesArr, refsArr, compileOptions]);
+        var compilation = compilationCreate.Invoke(null, [assemblyName, treesArr, refsArr, compileOptions]);
 
         using var ms = new MemoryStream();
-        var emitResult = compilation.Emit(ms);
+        var emitResult = CallWithDefaults(emit, compilation, ms);
 
-        if (!(bool)emitResult.Success)
+        if (!(bool)emitSuccess.GetValue(emitResult))
         {
             var errors = new List<string>();
-            foreach (dynamic d in emitResult.Diagnostics)
+            foreach (var d in (IEnumerable)emitDiags.GetValue(emitResult))
             {
-                var span = d.Location.GetLineSpan();
-                var compiled = (int)span.StartLinePosition.Line;
-                var col = (int)span.StartLinePosition.Character;
+                var location = diagLoc.GetValue(d);
+                var span = locLineSpan.Invoke(location, null);
+                var startPos = spanStart.GetValue(span);
+                var compiled = (int)posLine.GetValue(startPos);
+                var col = (int)posChar.GetValue(startPos);
                 var offset = compiled >= bodyStart ? bodyOffset : DefaultUsingLineCount;
                 var line = Math.Max(1, compiled + 1 - offset);
-                errors.Add($"({line},{col + 1}): error {d.Id}: {d.GetMessage()}");
+                var id = (string)diagId.GetValue(d);
+                var message = (string)CallWithDefaults(diagMsg, d);
+                errors.Add($"({line},{col + 1}): error {id}: {message}");
             }
             return new CompilationResult(string.Join("\n", errors));
         }
 
         ms.Seek(0, SeekOrigin.Begin);
+        
         return new CompilationResult(Assembly.Load(ms.ToArray()));
     }
 
@@ -240,8 +294,8 @@ public class __REPL__
         }
 
         return (
-            FindLoaded("Microsoft.CodeAnalysis.CSharp"),
-            FindLoaded("Microsoft.CodeAnalysis"));
+            Assembly.Load("Microsoft.CodeAnalysis.CSharp"),
+            Assembly.Load("Microsoft.CodeAnalysis"));
     }
 
     private static AssemblyName MakeAssemblyName(string name, int major, int minor, int build, int rev)
@@ -250,9 +304,6 @@ public class __REPL__
         an.SetPublicKeyToken([0x31, 0xbf, 0x38, 0x56, 0xad, 0x36, 0x4e, 0x35]);
         return an;
     }
-
-    private static Assembly FindLoaded(string name) =>
-        AppDomain.CurrentDomain.GetAssemblies().First(a => a.GetName().Name == name);
 
     private static int FindUsingBoundary(string[] lines)
     {
@@ -276,26 +327,14 @@ public class __REPL__
         return SimpleUsing.IsMatch(effective) || AliasUsing.IsMatch(effective);
     }
 
-    private static object CallWithDefaults(MethodInfo method, object target, params object[] leading)
-    {
-        var parms = method.GetParameters();
-        var args = new object[parms.Length];
-        for (var i = 0; i < parms.Length; i++)
-        {
-            if (i < leading.Length)
-                args[i] = leading[i];
-            else if (parms[i].HasDefaultValue)
-                args[i] = parms[i].DefaultValue;
-            else
-                args[i] = parms[i].ParameterType.IsValueType
-                    ? Activator.CreateInstance(parms[i].ParameterType) : null;
-        }
-        return method.Invoke(target, args);
-    }
+    private static object CallWithDefaults(MethodInfo method, object target, params object[] leading) =>
+        method.Invoke(target, FillDefaults(method.GetParameters(), leading));
 
-    private static object NewWithDefaults(ConstructorInfo ctor, params object[] leading)
+    private static object NewWithDefaults(ConstructorInfo ctor, params object[] leading) =>
+        ctor.Invoke(FillDefaults(ctor.GetParameters(), leading));
+
+    private static object[] FillDefaults(ParameterInfo[] parms, object[] leading)
     {
-        var parms = ctor.GetParameters();
         var args = new object[parms.Length];
         for (var i = 0; i < parms.Length; i++)
         {
@@ -307,6 +346,6 @@ public class __REPL__
                 args[i] = parms[i].ParameterType.IsValueType
                     ? Activator.CreateInstance(parms[i].ParameterType) : null;
         }
-        return ctor.Invoke(args);
+        return args;
     }
 }
