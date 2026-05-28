@@ -17,6 +17,7 @@ public class Plugin : IPlugin
 {
     public const string Name = "SeMcp";
     internal static SettingsScreen SettingsDialog;
+    internal static bool RefreshSettings;
     private SettingsGenerator settingsGenerator;
     private Executor executor;
     private McpServer mcpServer;
@@ -47,6 +48,11 @@ public class Plugin : IPlugin
 
     public void Update()
     {
+        if (RefreshSettings)
+        {
+            RefreshSettings = false;
+            SettingsDialog?.RecreateControls(false);
+        }
         if (executor == null) return;
         if (!executor.Initialized)
             executor.Initialize();
