@@ -5,6 +5,7 @@ using System.ComponentModel;
 using System.IO;
 using System.Linq;
 using System.Reflection;
+using System.Runtime.CompilerServices;
 using System.Text.RegularExpressions;
 using System.Threading;
 using Mono.Cecil;
@@ -131,15 +132,7 @@ using VRage.Serialization;
     private const string ClassPrefix = """
 public class __REPL__
 {
-    public static long __Deadline__;
-    static int __c__;
-    static void __Tick__()
-    {
-        if ((++__c__ & 0x3FF) != 0) return;
-        if (System.Diagnostics.Stopwatch.GetTimestamp() > __Deadline__)
-            throw new System.TimeoutException("Script exceeded 1s frame time limit");
-    }
-    public static IEnumerable<object> Run(TextWriter Console)
+    public IEnumerable<object> Run(TextWriter Console)
     {
 
 """;
@@ -152,6 +145,8 @@ public class __REPL__
 
     private static readonly int DefaultUsingLineCount = DefaultUsings.Count(c => c == '\n');
     private static readonly int ClassPrefixLineCount = ClassPrefix.Count(c => c == '\n');
+    private static readonly MethodInfo GuardTickMethod = typeof(ScriptGuard).GetMethod(nameof(ScriptGuard.Tick));
+    private static readonly MethodInfo StackCheckMethod = typeof(RuntimeHelpers).GetMethod(nameof(RuntimeHelpers.EnsureSufficientExecutionStack));
 
     public Compiler()
     {
@@ -374,33 +369,42 @@ public class __REPL__
         return args;
     }
 
+    // Guard against accidental infinite loops and runaway recursion that would hang the game thread.
+    // Backward jumps get a time-based check (ScriptGuard.Tick); call/callvirt get a stack-space check
+    // (EnsureSufficientExecutionStack). Not a security boundary — token holders already have full RCE.
     private static byte[] InjectTimeoutChecks(byte[] raw)
     {
-        try
-        {
-            using var asm = AssemblyDefinition.ReadAssembly(new MemoryStream(raw));
-            var replType = asm.MainModule.Types.FirstOrDefault(t => t.Name == "__REPL__");
-            var tick = replType?.Methods.FirstOrDefault(m => m.Name == "__Tick__");
-            if (tick == null) return raw;
+        using var asm = AssemblyDefinition.ReadAssembly(new MemoryStream(raw));
+        var replType = asm.MainModule.Types.FirstOrDefault(t => t.Name == "__REPL__");
+        if (replType == null)
+            throw new InvalidOperationException("Compiled assembly missing __REPL__ type");
 
-            foreach (var nested in replType.NestedTypes)
+        var tickRef = asm.MainModule.ImportReference(GuardTickMethod);
+        var stackRef = asm.MainModule.ImportReference(StackCheckMethod);
+
+        var types = new Stack<TypeDefinition>();
+        types.Push(replType);
+        while (types.Count > 0)
+        {
+            var type = types.Pop();
+            foreach (var nested in type.NestedTypes)
+                types.Push(nested);
+            foreach (var method in type.Methods)
             {
-                var mn = nested.Methods.FirstOrDefault(m => m.Name == "MoveNext");
-                if (mn?.HasBody != true) continue;
-                var il = mn.Body.GetILProcessor();
-                foreach (var ins in mn.Body.Instructions.ToList())
+                if (!method.HasBody) continue;
+                var il = method.Body.GetILProcessor();
+                foreach (var ins in method.Body.Instructions.ToList())
+                {
                     if (ins.Operand is Instruction t && t.Offset <= ins.Offset)
-                        il.InsertBefore(ins, il.Create(OpCodes.Call, tick));
+                        il.InsertBefore(ins, il.Create(OpCodes.Call, tickRef));
+                    else if (ins.OpCode == OpCodes.Call || ins.OpCode == OpCodes.Callvirt)
+                        il.InsertBefore(ins, il.Create(OpCodes.Call, stackRef));
+                }
             }
+        }
 
-            var output = new MemoryStream();
-            asm.Write(output);
-            return output.ToArray();
-        }
-        catch (Exception ex)
-        {
-            MyLog.Default.Warning($"SeMcp: IL timeout injection failed: {ex.Message}");
-            return raw;
-        }
+        var output = new MemoryStream();
+        asm.Write(output);
+        return output.ToArray();
     }
 }

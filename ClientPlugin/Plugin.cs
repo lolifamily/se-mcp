@@ -16,7 +16,7 @@ namespace ClientPlugin;
 public class Plugin : IPlugin
 {
     public const string Name = "SeMcp";
-    internal static SettingsScreen SettingsDialog;
+    private static SettingsScreen _settingsDialog;
     internal static bool RefreshSettings;
     private SettingsGenerator settingsGenerator;
     private Executor executor;
@@ -36,14 +36,21 @@ public class Plugin : IPlugin
         mcpServer.Start();
 
         settingsGenerator = new SettingsGenerator();
-        SettingsDialog = settingsGenerator.Dialog;
+        _settingsDialog = settingsGenerator.Dialog;
     }
 
     public void Dispose()
     {
+        // Order matters: executor.Dispose() runs first to fulfill inflight WorkItem promises,
+        // letting HandleToolsCall wake up and write responses while the listener is still alive.
+        // The user-script cleanup that follows gives those responses time to flush out.
+        // The listener is intentionally NOT stopped first because HttpListener.Stop/Close also
+        // cuts off OutputStreams of inflight contexts, which would silence the shutdown responses.
+        // Late Enqueue calls that race with Dispose are handled by the double-check inside Enqueue.
+        executor?.Dispose();
         mcpServer?.Dispose();
-        mcpServer = null;
         executor = null;
+        mcpServer = null;
     }
 
     public void Update()
@@ -51,7 +58,7 @@ public class Plugin : IPlugin
         if (RefreshSettings)
         {
             RefreshSettings = false;
-            SettingsDialog?.RecreateControls(false);
+            _settingsDialog?.RecreateControls(false);
         }
         if (executor == null) return;
         if (!executor.Initialized)

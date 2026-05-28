@@ -13,11 +13,12 @@ public sealed class McpServer : IDisposable
 {
     private const int MaxPortRetries = 10;
 
+    private static readonly System.Text.Encoding Utf8NoBom = new System.Text.UTF8Encoding(false);
+
     private readonly Executor executor;
     private readonly int basePort;
     private HttpListener listener;
-    private readonly CancellationTokenSource cts = new();
-    private readonly ConcurrentDictionary<object, CancellationTokenSource> pending = new();
+    private readonly ConcurrentDictionary<string, CancellationTokenSource> pending = new();
 
     public McpServer(Executor executor, string port)
     {
@@ -38,7 +39,6 @@ public sealed class McpServer : IDisposable
                 Config.Current.BoundPort = port;
                 Task.Run(ListenLoop);
                 MyLog.Default.WriteLine($"SeMcp: listening on :{port}");
-                MyLog.Default.WriteLine($"SeMcp: connect URL: http://localhost:{port}/?token={Config.Current.SecretKey}");
                 return;
             }
             catch (HttpListenerException)
@@ -61,21 +61,19 @@ public sealed class McpServer : IDisposable
 
     public void Dispose()
     {
-        cts.Cancel();
         try
         {
-            listener.Stop();
+            listener?.Stop();
         }
         catch (Exception ex)
         {
             MyLog.Default.Error($"SeMcp: error stopping listener: {ex.Message}");
         }
-        cts.Dispose();
     }
 
     private async Task ListenLoop()
     {
-        while (!cts.IsCancellationRequested)
+        while (true)
         {
             try
             {
@@ -93,6 +91,7 @@ public sealed class McpServer : IDisposable
 
     private async Task HandleRequest(HttpListenerContext ctx)
     {
+        var rawId = "null";
         try
         {
             if (ctx.Request.HttpMethod != "POST")
@@ -125,36 +124,28 @@ public sealed class McpServer : IDisposable
             }
 
             var bearer = h?.StartsWith("Bearer ", StringComparison.Ordinal) == true ? h.Substring(7) : null;
-            if ((bearer ?? q) != Config.Current.SecretKey)
+            if (!ConstantTimeEquals(bearer ?? q, Config.Current.SecretKey))
             {
                 await Respond(ctx, 401, "Unauthorized");
                 return;
             }
 
-            const int maxBody = 1_048_576;
-            using var reader = new StreamReader(ctx.Request.InputStream, System.Text.Encoding.UTF8);
-            var buf = new char[maxBody + 1];
-            var len = await reader.ReadBlockAsync(buf, 0, buf.Length);
-            if (len > maxBody)
-            {
-                await Respond(ctx, 413, "Request too large");
-                return;
-            }
-            var body = new string(buf, 0, len);
-
-            using var doc = JsonDocument.Parse(body);
+            // No body size cap: auth grants execute_code (full RCE), so capping body size here would be security theater.
+            using var doc = await JsonDocument.ParseAsync(ctx.Request.InputStream);
             var root = doc.RootElement;
             var method = root.GetProperty("method").GetString();
             root.TryGetProperty("id", out var idEl);
             var isNotification = method != null && method.StartsWith("notifications/");
 
-            if (!isNotification && idEl.ValueKind == JsonValueKind.Undefined)
+            if (!isNotification && idEl.ValueKind != JsonValueKind.String
+                                && idEl.ValueKind != JsonValueKind.Number)
             {
-                await RespondJsonRpcError(ctx, "null", -32600, "Missing id for request");
+                await RespondJsonRpcError(ctx, "null", -32600,
+                    "Invalid Request: id must be a non-null string or number");
                 return;
             }
 
-            var rawId = idEl.ValueKind != JsonValueKind.Undefined ? idEl.GetRawText() : "null";
+            rawId = isNotification ? "null" : idEl.GetRawText();
 
             switch (method)
             {
@@ -186,12 +177,12 @@ public sealed class McpServer : IDisposable
         }
         catch (JsonException)
         {
-            await Respond(ctx, 400, "Invalid JSON");
+            await RespondJsonRpcError(ctx, "null", -32700, "Parse error");
         }
         catch (Exception ex)
         {
             MyLog.Default.Error($"SeMcp: request error: {ex}");
-            await Respond(ctx, 500, ex.Message);
+            await RespondJsonRpcError(ctx, rawId, -32603, "Internal error");
         }
     }
 
@@ -217,7 +208,14 @@ public sealed class McpServer : IDisposable
         var cancelSource = new CancellationTokenSource();
         var item = new WorkItem { Code = code, Cancel = cancelSource.Token };
 
-        pending.TryAdd(rawId, cancelSource);
+        // MCP requires id uniqueness per session; refuse rather than silently orphan the prior request.
+        if (!pending.TryAdd(rawId, cancelSource))
+        {
+            cancelSource.Dispose();
+            await RespondJsonRpcError(ctx, rawId, -32600,
+                "Invalid Request: request id already in-flight in this session");
+            return;
+        }
         executor.Enqueue(item);
 
         await item.Done.Task;
@@ -228,19 +226,25 @@ public sealed class McpServer : IDisposable
         var text = item.WasCancelled
             ? $"[cancelled]\n{item.Output}"
             : item.Error != null
-                ? $"{item.Output}\n[error]\n{item.Error}"
+                ? $"{item.Output}\n\n{item.Error}"
                 : item.Output;
 
-        var result = JsonToolResult(text.Trim(), isError);
-        await RespondJsonRpc(ctx, rawId, result);
+        try { await RespondJsonRpc(ctx, rawId, JsonToolResult(text.Trim(), isError)); }
+        catch (Exception ex) { MyLog.Default.Warning($"SeMcp: response flush failed (listener likely closed): {ex.Message}"); }
     }
 
     private void HandleCancel(JsonElement root)
     {
-        var p = root.GetProperty("params");
-        var reqId = p.GetProperty("requestId").ToString();
-        if (pending.TryGetValue(reqId, out var cancelSource))
-            cancelSource.Cancel();
+        // MCP spec: invalid cancellation notifications SHOULD be silently ignored.
+        try
+        {
+            if (!root.TryGetProperty("params", out var p)) return;
+            if (!p.TryGetProperty("requestId", out var rid)) return;
+            var reqId = rid.GetRawText();
+            if (pending.TryGetValue(reqId, out var cancelSource))
+                cancelSource.Cancel();
+        }
+        catch (ObjectDisposedException) { /* race with HandleToolsCall.Dispose() */ }
     }
 
     private static string JsonInitResult()
@@ -264,7 +268,7 @@ public sealed class McpServer : IDisposable
         var json = $$"""{"jsonrpc":"2.0","id":{{rawId}},"result":{{resultJson}}}""";
         ctx.Response.ContentType = "application/json";
         ctx.Response.StatusCode = 200;
-        using var w = new StreamWriter(ctx.Response.OutputStream);
+        using var w = new StreamWriter(ctx.Response.OutputStream, Utf8NoBom);
         await w.WriteAsync(json);
     }
 
@@ -274,7 +278,7 @@ public sealed class McpServer : IDisposable
         var json = $$$"""{"jsonrpc":"2.0","id":{{{rawId}}},"error":{"code":{{{code}}},"message":"{{{escaped}}}"}}""";
         ctx.Response.ContentType = "application/json";
         ctx.Response.StatusCode = 200;
-        using var w = new StreamWriter(ctx.Response.OutputStream);
+        using var w = new StreamWriter(ctx.Response.OutputStream, Utf8NoBom);
         await w.WriteAsync(json);
     }
 
@@ -282,7 +286,16 @@ public sealed class McpServer : IDisposable
     {
         ctx.Response.StatusCode = status;
         ctx.Response.ContentType = "text/plain";
-        using var w = new StreamWriter(ctx.Response.OutputStream);
+        using var w = new StreamWriter(ctx.Response.OutputStream, Utf8NoBom);
         await w.WriteAsync(body);
+    }
+
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoOptimization)]
+    private static bool ConstantTimeEquals(string a, string b)
+    {
+        if (a == null || b == null || a.Length != b.Length) return false;
+        var diff = 0;
+        for (var i = 0; i < a.Length; i++) diff |= a[i] ^ b[i];
+        return diff == 0;
     }
 }

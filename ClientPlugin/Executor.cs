@@ -9,6 +9,7 @@ using System.Collections.Generic;
 using Sandbox.ModAPI;
 using VRage.Game;
 using VRage.Game.ModAPI;
+using VRage.Utils;
 
 namespace ClientPlugin;
 
@@ -23,20 +24,36 @@ public sealed class WorkItem
     public bool WasCancelled;
 }
 
-public sealed class Executor
+public sealed class Executor : IDisposable
 {
     private const int FrameTimeoutMs = 1000;
+
+    private const string DenialMessage = "Multiplayer non-admin: code execution is disabled. You must be Admin or Owner to use SeMcp in multiplayer.";
+    private const string ShutdownMessage = "[server shutting down]";
 
     public volatile bool Initialized;
 
     private readonly Compiler compiler = new();
     private readonly ConcurrentQueue<(WorkItem Item, CompilationResult Result)> compiled = new();
     private readonly List<ActiveScript> active = [];
+    private readonly ConcurrentDictionary<WorkItem, byte> inflight = new();
+    private volatile bool denied;
+    private volatile bool disposed;
+
+    private static readonly Assembly PluginAssembly = typeof(ScriptGuard).Assembly;
 
     public void Initialize()
     {
         compiler.CollectReferences();
+        AppDomain.CurrentDomain.AssemblyResolve += ResolvePluginAssembly;
         Initialized = true;
+    }
+
+    private static Assembly ResolvePluginAssembly(object sender, ResolveEventArgs args)
+    {
+        return new AssemblyName(args.Name).Name == PluginAssembly.GetName().Name
+            ? PluginAssembly
+            : null;
     }
 
     private sealed class ActiveScript
@@ -44,29 +61,40 @@ public sealed class Executor
         public WorkItem Item;
         public IEnumerator<object> Coroutine;
         public StringWriter Writer;
-        public FieldInfo DeadlineField;
     }
 
     public void Enqueue(WorkItem item)
     {
+        if (disposed)
+        { CompleteItem(item, error: ShutdownMessage); return; }
+
+        if (item.Cancel.IsCancellationRequested)
+        { CompleteItem(item, cancelled: true); return; }
+
+        if (denied)
+        { CompleteItem(item, error: DenialMessage); return; }
+
+        inflight[item] = 0;
+
+        // Double-check disposed after adding to inflight. If Dispose ran in between
+        // the first check and the add, its drain loop may have missed this item;
+        // self-correct here so no WorkItem leaks past Dispose.
+        if (disposed)
+        {
+            CompleteItem(item, error: ShutdownMessage);
+            return;
+        }
+
         Task.Run(() =>
         {
             try
             {
-                if (item.Cancel.IsCancellationRequested)
-                { item.WasCancelled = true; item.Done.TrySetResult(true); return; }
-
-                var denied = CheckPermission();
-                if (denied != null)
-                { item.Error = denied; item.Done.TrySetResult(true); return; }
-
                 var result = compiler.Compile(item.Code);
                 compiled.Enqueue((item, result));
             }
             catch (Exception ex)
             {
-                item.Error = FormatException(ex);
-                item.Done.TrySetResult(true);
+                CompleteItem(item, error: FormatException(ex));
             }
         });
     }
@@ -76,8 +104,8 @@ public sealed class Executor
         while (compiled.TryDequeue(out var pair))
             Start(pair.Item, pair.Result);
 
-        var denied = CheckPermission();
-        var deadline = (object)(Stopwatch.GetTimestamp() + Stopwatch.Frequency * FrameTimeoutMs / 1000);
+        denied = IsDenied();
+        ScriptGuard.Deadline = Stopwatch.GetTimestamp() + Stopwatch.Frequency * FrameTimeoutMs / 1000;
 
         for (var i = active.Count - 1; i >= 0; i--)
         {
@@ -90,16 +118,15 @@ public sealed class Executor
                 continue;
             }
 
-            if (denied != null)
+            if (denied)
             {
-                Complete(s, error: denied);
+                Complete(s, error: DenialMessage);
                 active.RemoveAt(i);
                 continue;
             }
 
             try
             {
-                s.DeadlineField?.SetValue(null, deadline);
                 if (!s.Coroutine.MoveNext())
                 {
                     Complete(s);
@@ -114,22 +141,19 @@ public sealed class Executor
         }
     }
 
-    private static string CheckPermission()
+    private static bool IsDenied()
     {
         var session = MyAPIGateway.Session;
         if (session == null || session.OnlineMode == MyOnlineModeEnum.OFFLINE)
-            return null;
-        return session.PromoteLevel >= MyPromoteLevel.Admin
-            ? null
-            : "Multiplayer non-admin: code execution is disabled. You must be Admin or Owner to use SeMcp in multiplayer.";
+            return false;
+        return session.PromoteLevel < MyPromoteLevel.Admin;
     }
 
     private void Start(WorkItem item, CompilationResult result)
     {
         if (!result.Success)
         {
-            item.Error = result.ErrorOutput;
-            item.Done.TrySetResult(true);
+            CompleteItem(item, error: result.ErrorOutput);
             return;
         }
 
@@ -139,37 +163,76 @@ public sealed class Executor
             var method = type?.GetMethod("Run");
             if (method == null)
             {
-                item.Error = "Failed to find __REPL__.Run in compiled assembly";
-                item.Done.TrySetResult(true);
+                CompleteItem(item, error: "Failed to find __REPL__.Run in compiled assembly");
                 return;
             }
 
+            var instance = Activator.CreateInstance(type);
             var run = (Func<TextWriter, IEnumerable<object>>)Delegate.CreateDelegate(
-                typeof(Func<TextWriter, IEnumerable<object>>), method);
+                typeof(Func<TextWriter, IEnumerable<object>>), instance, method);
             var writer = new StringWriter();
 
             active.Add(new ActiveScript
             {
                 Item = item,
                 Coroutine = run(writer).GetEnumerator(),
-                Writer = writer,
-                DeadlineField = type.GetField("__Deadline__")
+                Writer = writer
             });
         }
         catch (Exception ex)
         {
-            item.Error = FormatException(ex);
-            item.Done.TrySetResult(true);
+            CompleteItem(item, error: FormatException(ex));
         }
     }
 
-    private static void Complete(ActiveScript s, string error = null, bool cancelled = false)
+    private void Complete(ActiveScript s, string error = null, bool cancelled = false)
     {
         s.Coroutine.Dispose();
         s.Item.Output = s.Writer.ToString();
-        s.Item.Error = error;
-        s.Item.WasCancelled = cancelled;
-        s.Item.Done.TrySetResult(true);
+        CompleteItem(s.Item, error, cancelled);
+    }
+
+    private void CompleteItem(WorkItem item, string error = null, bool cancelled = false)
+    {
+        item.Error = error;
+        item.WasCancelled = cancelled;
+        item.Done.TrySetResult(true);
+        inflight.TryRemove(item, out _);
+    }
+
+    public void Dispose()
+    {
+        if (disposed) return;
+        disposed = true;
+
+        // Capture partial output from running scripts before completing their promises,
+        // so HandleToolsCall sees the output that was produced before shutdown.
+        foreach (var s in active)
+            s.Item.Output = s.Writer?.ToString() ?? "";
+
+        // Step 1: fulfill all inflight promises so HandleToolsCall wakes up and starts writing responses.
+        // Snapshot keys to avoid mutating the collection while iterating.
+        // Items that race in via Enqueue after this point are handled by the double-check
+        // in Enqueue (it sees disposed=true after adding to inflight and self-completes).
+        foreach (var item in new List<WorkItem>(inflight.Keys))
+        {
+            item.Error = ShutdownMessage;
+            item.Done.TrySetResult(true);
+        }
+        inflight.Clear();
+
+        // Step 2: run cleanup of active scripts (user-script using/finally blocks).
+        // The time this takes incidentally gives the HTTP responses a window to flush out.
+        foreach (var s in active)
+        {
+            try { s.Coroutine?.Dispose(); }
+            catch (Exception ex) { MyLog.Default.Warning($"SeMcp: coroutine dispose failed: {ex.Message}"); }
+            try { s.Writer?.Dispose(); }
+            catch (Exception ex) { MyLog.Default.Warning($"SeMcp: writer dispose failed: {ex.Message}"); }
+        }
+        active.Clear();
+
+        AppDomain.CurrentDomain.AssemblyResolve -= ResolvePluginAssembly;
     }
 
     private static string FormatException(Exception ex)
