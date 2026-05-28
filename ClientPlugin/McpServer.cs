@@ -14,16 +14,14 @@ public sealed class McpServer : IDisposable
     private const int MaxPortRetries = 10;
 
     private readonly Executor executor;
-    private readonly string secretKey;
     private readonly int basePort;
     private HttpListener listener;
     private readonly CancellationTokenSource cts = new();
     private readonly ConcurrentDictionary<object, CancellationTokenSource> pending = new();
 
-    public McpServer(Executor executor, string port, string secretKey)
+    public McpServer(Executor executor, string port)
     {
         this.executor = executor;
-        this.secretKey = secretKey ?? "";
         basePort = int.TryParse(port, out var p) ? p : 9876;
     }
 
@@ -37,9 +35,10 @@ public sealed class McpServer : IDisposable
                 listener = new HttpListener();
                 listener.Prefixes.Add($"http://localhost:{port}/");
                 listener.Start();
+                Config.Current.BoundPort = port;
                 Task.Run(ListenLoop);
-                Config.Current.Status = $"listening on :{port}";
-                MyLog.Default.WriteLine($"SeMcp: {Config.Current.Status}");
+                MyLog.Default.WriteLine($"SeMcp: listening on :{port}");
+                MyLog.Default.WriteLine($"SeMcp: connect URL: http://localhost:{port}/?token={Config.Current.SecretKey}");
                 return;
             }
             catch (HttpListenerException)
@@ -50,14 +49,14 @@ public sealed class McpServer : IDisposable
             }
             catch (Exception ex)
             {
-                Config.Current.Status = $"failed: {ex.Message}";
-                MyLog.Default.Error($"SeMcp: {Config.Current.Status}");
+                Config.Current.Error = ex.Message;
+                MyLog.Default.Error($"SeMcp: {ex.Message}");
                 return;
             }
         }
 
-        Config.Current.Status = $"failed: ports {basePort}-{basePort + MaxPortRetries - 1} all in use";
-        MyLog.Default.Error($"SeMcp: {Config.Current.Status}");
+        Config.Current.Error = $"ports {basePort}-{basePort + MaxPortRetries - 1} all in use";
+        MyLog.Default.Error($"SeMcp: {Config.Current.Error}");
     }
 
     public void Dispose()
@@ -109,14 +108,27 @@ public sealed class McpServer : IDisposable
                 return;
             }
 
-            if (secretKey.Length > 0)
+            // Managed server don't always check host
+            if (ctx.Request.Headers["Host"] != $"localhost:{Config.Current.BoundPort}")
             {
-                var auth = ctx.Request.Headers["Authorization"] ?? "";
-                if (auth != $"Bearer {secretKey}")
-                {
-                    await Respond(ctx, 401, "Unauthorized");
-                    return;
-                }
+                await Respond(ctx, 403, "Forbidden: invalid host");
+                return;
+            }
+
+            var h = ctx.Request.Headers["Authorization"];
+            var q = ctx.Request.QueryString["token"];
+
+            if (h != null && q != null)
+            {
+                await Respond(ctx, 400, "invalid_request");
+                return;
+            }
+
+            var bearer = h?.StartsWith("Bearer ", StringComparison.Ordinal) == true ? h.Substring(7) : null;
+            if ((bearer ?? q) != Config.Current.SecretKey)
+            {
+                await Respond(ctx, 401, "Unauthorized");
+                return;
             }
 
             const int maxBody = 1_048_576;

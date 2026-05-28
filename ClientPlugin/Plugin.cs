@@ -16,6 +16,7 @@ namespace ClientPlugin;
 public class Plugin : IPlugin
 {
     public const string Name = "SeMcp";
+    internal static SettingsScreen SettingsDialog;
     private SettingsGenerator settingsGenerator;
     private Executor executor;
     private McpServer mcpServer;
@@ -23,11 +24,18 @@ public class Plugin : IPlugin
     [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
     public void Init(object gameInstance)
     {
+        if (string.IsNullOrEmpty(Config.Current.SecretKey))
+        {
+            Config.Current.SecretKey = Config.GenerateToken();
+            ConfigStorage.Save(Config.Current);
+        }
+
         executor = new Executor();
-        mcpServer = new McpServer(executor, Config.Current.Port, Config.Current.SecretKey);
+        mcpServer = new McpServer(executor, Config.Current.Port);
         mcpServer.Start();
 
         settingsGenerator = new SettingsGenerator();
+        SettingsDialog = settingsGenerator.Dialog;
     }
 
     public void Dispose()

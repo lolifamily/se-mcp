@@ -18,7 +18,7 @@ Features:
 - Parallel script execution
 - Console.WriteLine() output piped back to the LLM
 - Corrected error line numbers that map back to your input
-- Configurable port and optional secret key authentication
+- Configurable port and secret key authentication (auto-generated if not configured)
 - Multiplayer safety: requires Admin or Owner promote level to execute code
 
 Transport: MCP Streamable HTTP (not SSE). Configure your MCP client to POST JSON-RPC to http://localhost:9876/

@@ -1,3 +1,5 @@
+using System;
+using System.Security.Cryptography;
 using ClientPlugin.Settings;
 using ClientPlugin.Settings.Elements;
 using System.Collections.Generic;
@@ -5,19 +7,24 @@ using System.ComponentModel;
 using System.Runtime.CompilerServices;
 using System.Xml.Serialization;
 using JetBrains.Annotations;
+using VRage.Utils;
 
 namespace ClientPlugin;
 
 public class Config : INotifyPropertyChanged
 {
     [XmlIgnore]
-    public string Status;
+    public int BoundPort;
     [XmlIgnore]
-    public string Title => Status != null ? $"SeMcp — {Status}" : "SeMcp";
+    public string Error;
+    [XmlIgnore]
+    public string Title => BoundPort > 0  ? $"SeMcp — :{BoundPort}"
+                         : Error != null  ? $"SeMcp — {Error}"
+                         : "SeMcp — starting…";
 
-    [Separator("MCP Server (changes require restart)")]
+    [Separator("MCP Server (port change requires restart)")]
 
-    [Textbox(description: "HTTP port for the MCP server")]
+    [Textbox(description: "HTTP port for the MCP server (requires restart)")]
     public string Port
     {
         get;
@@ -25,13 +32,43 @@ public class Config : INotifyPropertyChanged
         set => SetField(ref field, value);
     } = "9876";
 
-    [Textbox(description: "Secret key for authentication (empty = no auth)")]
+    [Textbox(description: "Secret key (auto-generated if left empty)")]
     public string SecretKey
     {
         get;
         [UsedImplicitly]
-        set => SetField(ref field, value);
+        set
+        {
+            var generated = string.IsNullOrWhiteSpace(value);
+            SetField(ref field, generated ? GenerateToken() : value);
+            if (generated) Plugin.RefreshSettings = true;
+        }
     } = "";
+
+    [Button(label: "Regenerate Token", description: "Generate a new secret key (takes effect immediately)")]
+    [UsedImplicitly]
+    public static void RegenerateToken()
+    {
+        Current.SecretKey = GenerateToken();
+        ConfigStorage.Save(Current);
+        Plugin.RefreshSettings = true;
+    }
+
+    [Button(label: "Copy URL", description: "Copy MCP connection URL to clipboard")]
+    [UsedImplicitly]
+    public static void CopyUrl()
+    {
+        if (Current.BoundPort <= 0) return;
+        MyClipboardHelper.SetClipboard($"http://localhost:{Current.BoundPort}/?token={Current.SecretKey}");
+    }
+
+    internal static string GenerateToken()
+    {
+        var bytes = new byte[16];
+        using (var rng = new RNGCryptoServiceProvider())
+            rng.GetBytes(bytes);
+        return BitConverter.ToString(bytes).Replace("-", "").ToLowerInvariant();
+    }
 
     #region Property change notification boilerplate
 
