@@ -5,7 +5,6 @@ using System.ComponentModel;
 using System.IO;
 using System.Linq;
 using System.Reflection;
-using System.Runtime.CompilerServices;
 using System.Text.RegularExpressions;
 using System.Threading;
 using Mono.Cecil;
@@ -145,8 +144,9 @@ public class __REPL__
 
     private static readonly int DefaultUsingLineCount = DefaultUsings.Count(c => c == '\n');
     private static readonly int ClassPrefixLineCount = ClassPrefix.Count(c => c == '\n');
-    private static readonly MethodInfo GuardTickMethod = typeof(ScriptGuard).GetMethod(nameof(ScriptGuard.Tick));
-    private static readonly MethodInfo StackCheckMethod = typeof(RuntimeHelpers).GetMethod(nameof(RuntimeHelpers.EnsureSufficientExecutionStack));
+    private static readonly MethodInfo GuardBailMethod = typeof(ScriptGuard).GetMethod(nameof(ScriptGuard.Bail));
+    private static readonly FieldInfo GuardDeadField = typeof(ScriptGuard).GetField(nameof(ScriptGuard.Dead));
+    private static readonly MethodInfo StackCheckMethod = typeof(ScriptGuard).GetMethod(nameof(ScriptGuard.StackCheck));
 
     public Compiler()
     {
@@ -369,9 +369,20 @@ public class __REPL__
         return args;
     }
 
-    // Guard against accidental infinite loops and runaway recursion that would hang the game thread.
-    // Backward jumps get a time-based check (ScriptGuard.Tick); call/callvirt get a stack-space check
-    // (EnsureSufficientExecutionStack). Not a security boundary — token holders already have full RCE.
+    // Guard against accidental infinite loops and runaway recursion that would
+    // hang the game thread. Three injection points share ScriptGuard state
+    // (Dead flag set by a background 1s timer in Executor.Tick; StackBase
+    // captured per-script on first StackCheck):
+    //   - Exception handler entry:
+    //       catch → rewritten into a filter handler that rejects when Dead is
+    //         set. The filter runs in CLR's pass 1 (stackless virtual unwind),
+    //         so deep-recursion-plus-catch attacks unwind in constant stack.
+    //       finally / fault → Bail (filter is illegal here; no caught exception).
+    //   - Backward branches → Bail. Catches tight loops with no method calls.
+    //   - REPL / Delegate call sites → StackCheck + Bail. Catches recursion
+    //     by sampling SP; first call per script sets StackBase, subsequent
+    //     calls throw if SP descends past the budget.
+    // Not a security boundary — token holders already have full RCE.
     private static byte[] InjectTimeoutChecks(byte[] raw)
     {
         using var asm = AssemblyDefinition.ReadAssembly(new MemoryStream(raw));
@@ -379,7 +390,8 @@ public class __REPL__
         if (replType == null)
             throw new InvalidOperationException("Compiled assembly missing __REPL__ type");
 
-        var tickRef = asm.MainModule.ImportReference(GuardTickMethod);
+        var bailRef = asm.MainModule.ImportReference(GuardBailMethod);
+        var deadFieldRef = asm.MainModule.ImportReference(GuardDeadField);
         var stackRef = asm.MainModule.ImportReference(StackCheckMethod);
 
         var types = new Stack<TypeDefinition>();
@@ -393,12 +405,121 @@ public class __REPL__
             {
                 if (!method.HasBody) continue;
                 var il = method.Body.GetILProcessor();
-                foreach (var ins in method.Body.Instructions.ToList())
+
+                // Snapshot the original IL before we touch handlers. The
+                // backward-branch / call-site loop below iterates this snapshot,
+                // so it won't fall into the filter blocks we splice into catches.
+                var originalInstructions = method.Body.Instructions.ToList();
+
+                // Handler entries:
+                //  - Catch: rewrite into a filter handler. Filter runs in pass 1
+                //    (stackless virtual unwind); rejecting catches when Dead is
+                //    set costs constant stack regardless of recursion depth.
+                //    Previously tried throw-based Bail and `rethrow` opcode —
+                //    both cap at ~100 frames because nested ProcessClrException
+                //    routing in pass 1/2 is not actually stackless.
+                //  - Finally/Fault: `rethrow` / filter are illegal (no caught
+                //    exception in scope). Fall back to Bail. Not on the deep-
+                //    recursion attack surface.
+                //  - Existing Filter (user wrote `catch when`): skipped. Composing
+                //    filters is doable but messy — left as a documented gap,
+                //    matching SE's behaviour.
+                //  - Empty finally (HandlerStart == endfinally): skipped, no body.
+                //
+                // Filter IL layout (the filter block must physically precede the
+                // handler block per CIL III.1.6.1):
+                //   .filter {
+                //     isinst CatchType    ; entry stack [exc] → [exc-or-null]
+                //     brfalse reject      ; null → reject (consumes top)
+                //     ldsfld Dead
+                //     ldc.i4.0
+                //     ceq                 ; 1 if Dead==0 (accept), 0 otherwise
+                //     br endLabel
+                //   reject:
+                //     ldc.i4.0
+                //   endLabel:
+                //     endfilter           ; single exit; top-of-stack int32 = result
+                //   }
+                //   { stloc/pop; user catch body... }
+                foreach (var eh in method.Body.ExceptionHandlers)
                 {
+                    if (eh.HandlerType == ExceptionHandlerType.Filter) continue;
+                    if (eh.HandlerStart.OpCode == OpCodes.Endfinally) continue;
+
+                    if (eh.HandlerType != ExceptionHandlerType.Catch)
+                    {
+                        // Finally / Fault: keep Bail.
+                        il.InsertAfter(eh.HandlerStart, il.Create(OpCodes.Call, bailRef));
+                        continue;
+                    }
+
+                    // Single-endfilter exit. Three paths converge on it with an
+                    // int32 result (0=reject, non-zero=accept):
+                    //   accept  : isinst != null AND Dead == 0  →  push 1
+                    //   reject1 : isinst == null (wrong type)   →  push 0
+                    //   reject2 : isinst != null AND Dead != 0  →  push 0 (via ceq)
+                    var endLabel = il.Create(OpCodes.Endfilter);
+                    var rejectLabel = il.Create(OpCodes.Ldc_I4_0);
+                    var filterStart = il.Create(OpCodes.Isinst, eh.CatchType);
+                    var origHandlerStart = eh.HandlerStart;
+                    il.InsertBefore(origHandlerStart, filterStart);
+                    il.InsertBefore(origHandlerStart, il.Create(OpCodes.Brfalse, rejectLabel));
+                    il.InsertBefore(origHandlerStart, il.Create(OpCodes.Ldsfld, deadFieldRef));
+                    il.InsertBefore(origHandlerStart, il.Create(OpCodes.Ldc_I4_0));
+                    il.InsertBefore(origHandlerStart, il.Create(OpCodes.Ceq));               // 1 if Dead==0
+                    il.InsertBefore(origHandlerStart, il.Create(OpCodes.Br, endLabel));
+                    il.InsertBefore(origHandlerStart, rejectLabel);                          // ldc.i4.0
+                    il.InsertBefore(origHandlerStart, endLabel);                             // endfilter
+
+                    // Switch handler type and point FilterStart at the filter entry.
+                    // HandlerStart is unchanged (still the original Roslyn stloc/pop).
+                    // CatchType must be cleared (filter handlers don't carry a type).
+                    eh.HandlerType = ExceptionHandlerType.Filter;
+                    eh.FilterStart = filterStart;
+                    eh.CatchType = null;
+
+                    // Other handlers' TryEnd/HandlerEnd may have referenced
+                    // origHandlerStart (try-block end == catch-block start, etc).
+                    // Repoint them to filterStart so try/handler regions stay glued
+                    // together physically (CIL III.1.6.1 adjacency requirement).
+                    foreach (var any in method.Body.ExceptionHandlers)
+                    {
+                        if (any.TryEnd     == origHandlerStart) any.TryEnd     = filterStart;
+                        if (any.HandlerEnd == origHandlerStart) any.HandlerEnd = filterStart;
+                    }
+                }
+
+                foreach (var ins in originalInstructions)
+                {
+                    // Roslyn emits an unreachable br.s self-loop right after every
+                    // finally/fault handler as the leave-target placeholder
+                    // (dotnet/roslyn#51205). Injecting before it lands physically
+                    // inside the handler (HandlerEnd is exclusive) → InvalidProgram.
+                    if (method.Body.ExceptionHandlers.Any(eh =>
+                            eh.HandlerType is ExceptionHandlerType.Finally or ExceptionHandlerType.Fault
+                            && eh.HandlerEnd == ins))
+                        continue;
+
+                    // Backward branch: Bail only. Tight loops don't push frames,
+                    // SP unchanged.
                     if (ins.Operand is Instruction t && t.Offset <= ins.Offset)
-                        il.InsertBefore(ins, il.Create(OpCodes.Call, tickRef));
-                    else if (ins.OpCode == OpCodes.Call || ins.OpCode == OpCodes.Callvirt)
+                    {
+                        il.InsertBefore(ins, il.Create(OpCodes.Call, bailRef));
+                    }
+                    // REPL/Delegate call site: StackCheck + Bail. The callvirt
+                    // will push a new frame; check budget BEFORE the push so the
+                    // first call per script captures StackBase, and recursion
+                    // automatically catches itself as SP descends past budget.
+                    // Can't Resolve() to filter true delegates from MethodInfo —
+                    // Cecil reads from MemoryStream with no probing dirs.
+                    else if ((ins.OpCode == OpCodes.Call || ins.OpCode == OpCodes.Callvirt)
+                             && ins.Operand is MethodReference mr
+                             && (mr.DeclaringType.FullName.StartsWith("__REPL__")
+                                 || mr.Name == "Invoke"))
+                    {
                         il.InsertBefore(ins, il.Create(OpCodes.Call, stackRef));
+                        il.InsertBefore(ins, il.Create(OpCodes.Call, bailRef));
+                    }
                 }
             }
         }

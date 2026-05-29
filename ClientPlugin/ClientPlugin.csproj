@@ -5,6 +5,7 @@
     <RootNamespace>ClientPlugin</RootNamespace>
     <AssemblyName>SeMcp</AssemblyName>
     <LangVersion>14</LangVersion>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
 
     <!-- Ensure SDK generates assembly attributes (no need for AssemblyInfo) -->
     <GenerateAssemblyInfo>true</GenerateAssemblyInfo>

@@ -1,6 +1,5 @@
 using System;
 using System.Collections.Concurrent;
-using System.Diagnostics;
 using System.IO;
 using System.Reflection;
 using System.Threading;
@@ -37,6 +36,7 @@ public sealed class Executor : IDisposable
     private readonly ConcurrentQueue<(WorkItem Item, CompilationResult Result)> compiled = new();
     private readonly List<ActiveScript> active = [];
     private readonly ConcurrentDictionary<WorkItem, byte> inflight = new();
+    private int epoch;
     private volatile bool denied;
     private volatile bool disposed;
 
@@ -105,7 +105,21 @@ public sealed class Executor : IDisposable
             Start(pair.Item, pair.Result);
 
         denied = IsDenied();
-        ScriptGuard.Deadline = Stopwatch.GetTimestamp() + Stopwatch.Frequency * FrameTimeoutMs / 1000;
+
+        // Deadline timer: each Tick bumps `epoch` and fires a Task that flips
+        // Dead true after FrameTimeoutMs — but only if its captured epoch is
+        // still current. A later Tick increments epoch and silently invalidates
+        // any in-flight timer from a previous frame. If MoveNext stays in a hot
+        // loop with no backward branches (e.g. recursive lambda + catch), no
+        // later Tick runs and the timer fires, setting Dead. Catches that
+        // would otherwise swallow the bail are rejected by the filter handlers
+        // we splice in during compilation, so unwind reaches Executor.Tick.
+        var myEpoch = ++epoch;
+        ScriptGuard.Dead = false;
+        _ = Task.Delay(FrameTimeoutMs).ContinueWith(_ =>
+        {
+            if (Volatile.Read(ref epoch) == myEpoch) ScriptGuard.Dead = true;
+        });
 
         for (var i = active.Count - 1; i >= 0; i--)
         {
@@ -125,6 +139,8 @@ public sealed class Executor : IDisposable
                 continue;
             }
 
+            // Per-script stack budget: each script gets its own SP baseline.
+            ScriptGuard.StackBase = 0;
             try
             {
                 if (!s.Coroutine.MoveNext())
