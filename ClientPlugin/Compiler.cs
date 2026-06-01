@@ -43,6 +43,8 @@ public sealed class Compiler
     private readonly Type syntaxTreeBase;
     private readonly Type metaRefBase;
     private readonly List<object> references;
+    private readonly Dictionary<string, Assembly> resolveMap = new();
+    private ResolveEventHandler resolveHandler;
 
     private readonly MethodInfo createFromFile;
     private readonly MethodInfo emit;
@@ -221,31 +223,77 @@ public class __REPL__
     // Re-resolve each unique name via Assembly.Load so CLR picks the version
     // that runtime binding (probing paths + redirects) would actually use.
     // Deferred until first Update() so all plugin assemblies are loaded.
+    //
+    // Cached Pulsar GitHubPlugins are loaded via Assembly.LoadFile, placing
+    // them outside the default Load context. Assembly.Load(name) fails for
+    // their randomized names. We collect those into a separate bucket and
+    // pick the highest version per name, then register an AssemblyResolve
+    // handler so REPL code can find them at runtime.
     public void CollectReferences()
     {
-        var seen = new HashSet<string>();
         references.Clear();
+        resolveMap.Clear();
+
+        var loadContext = new Dictionary<string, string>();
+        var loadFile = new Dictionary<string, (Assembly asm, Version ver)>();
+
         foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
         {
             if (asm.IsDynamic) continue;
+            var name = asm.GetName().Name;
+            if (loadContext.ContainsKey(name)) continue;
+
             try
             {
-                var name = asm.GetName().Name;
-                if (!seen.Add(name)) continue;
-
-                var resolved = Assembly.Load(name);
-                var loc = resolved.Location;
-                if (string.IsNullOrEmpty(loc)) continue;
-                if (Path.GetFileName(loc) == "VRage.Native.dll") continue;
-                references.Add(CallWithDefaults(createFromFile, null, loc));
+                loadContext[name] = Assembly.Load(name).Location;
             }
-            catch (Exception ex)
+            catch
             {
-                MyLog.Default.WriteLine($"SeMcp: skipped reference {asm.GetName().Name}: {ex.Message}");
+                var loc = asm.Location;
+                if (string.IsNullOrEmpty(loc)) continue;
+                var ver = asm.GetName().Version ?? new Version(0, 0);
+                if (!loadFile.TryGetValue(name, out var prev) || ver > prev.ver)
+                    loadFile[name] = (asm, ver);
             }
         }
 
-        MyLog.Default.WriteLine($"SeMcp: {references.Count} references collected");
+        foreach (var (name, loc) in loadContext)
+        {
+            if (string.IsNullOrEmpty(loc)) continue;
+            if (Path.GetFileName(loc) == "VRage.Native.dll") continue;
+            try { references.Add(CallWithDefaults(createFromFile, null, loc)); }
+            catch (Exception ex) { MyLog.Default.WriteLine($"SeMcp: failed reference {name}: {ex.Message}"); }
+        }
+
+        foreach (var (name, (asm, _)) in loadFile)
+        {
+            var loc = asm.Location;
+            if (Path.GetFileName(loc) == "VRage.Native.dll") continue;
+            try
+            {
+                references.Add(CallWithDefaults(createFromFile, null, loc));
+                resolveMap[name] = asm;
+            }
+            catch (Exception ex) { MyLog.Default.WriteLine($"SeMcp: failed LoadFile reference {name}: {ex.Message}"); }
+        }
+
+        resolveHandler = (_, args) =>
+        {
+            if (args.RequestingAssembly?.GetName().Name?.StartsWith("__REPL__") != true)
+                return null;
+            resolveMap.TryGetValue(new AssemblyName(args.Name).Name, out var found);
+            return found;
+        };
+        AppDomain.CurrentDomain.AssemblyResolve += resolveHandler;
+
+        MyLog.Default.WriteLine($"SeMcp: {references.Count} references collected ({resolveMap.Count} LoadFile)");
+    }
+
+    public void UnregisterResolver()
+    {
+        if (resolveHandler == null) return;
+        AppDomain.CurrentDomain.AssemblyResolve -= resolveHandler;
+        resolveHandler = null;
     }
 
     public CompilationResult Compile(string userCode)

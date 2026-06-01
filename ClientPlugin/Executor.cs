@@ -249,6 +249,7 @@ public sealed class Executor : IDisposable
         active.Clear();
 
         AppDomain.CurrentDomain.AssemblyResolve -= ResolvePluginAssembly;
+        compiler.UnregisterResolver();
     }
 
     private static string FormatException(Exception ex)

@@ -45,7 +45,6 @@ public static class ScriptGuard
         var sp = (long)&marker;
         if (StackBase == 0) StackBase = sp;
         if (StackBase - sp <= StackBudgetBytes) return;
-        Dead = true;
         throw new ScriptStackException();
     }
 }
