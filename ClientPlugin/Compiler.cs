@@ -32,31 +32,46 @@ public sealed class CompilationResult
     }
 }
 
-public sealed class Compiler
+public sealed class Compiler(MethodInfo guardBail, MethodInfo guardStackCheck, FieldInfo guardDead)
 {
     private static int _counter;
 
-    private readonly MethodInfo parseText;
-    private readonly MethodInfo compilationCreate;
-    private readonly object parseOptions;
-    private readonly object compileOptions;
-    private readonly Type syntaxTreeBase;
-    private readonly Type metaRefBase;
-    private readonly List<object> references;
-    private readonly Dictionary<string, Assembly> resolveMap = new();
-    private ResolveEventHandler resolveHandler;
+    // Roslyn reflection cache — process-constant, populated by the static ctor.
+    // The same tokens for both executors; resolving them once instead of per-Compiler
+    // saves a redundant LoadRoslyn + dozens of reflection lookups at startup.
+    private static readonly MethodInfo ParseText;
+    private static readonly MethodInfo CompilationCreate;
+    private static readonly object ParseOptions;
+    private static readonly object CompileOptions;
+    private static readonly Type SyntaxTreeBase;
+    private static readonly Type MetaRefBase;
+    private static readonly MethodInfo CreateFromFile;
+    private static readonly MethodInfo Emit;
+    private static readonly PropertyInfo EmitSuccess;
+    private static readonly PropertyInfo EmitDiags;
+    private static readonly PropertyInfo DiagLoc;
+    private static readonly PropertyInfo DiagId;
+    private static readonly MethodInfo DiagMsg;
+    private static readonly MethodInfo LocLineSpan;
+    private static readonly PropertyInfo SpanStart;
+    private static readonly PropertyInfo PosLine;
+    private static readonly PropertyInfo PosChar;
 
-    private readonly MethodInfo createFromFile;
-    private readonly MethodInfo emit;
-    private readonly PropertyInfo emitSuccess;
-    private readonly PropertyInfo emitDiags;
-    private readonly PropertyInfo diagLoc;
-    private readonly PropertyInfo diagId;
-    private readonly MethodInfo diagMsg;
-    private readonly MethodInfo locLineSpan;
-    private readonly PropertyInfo spanStart;
-    private readonly PropertyInfo posLine;
-    private readonly PropertyInfo posChar;
+    // References + resolveMap + handler are process-wide: the AppDomain assembly
+    // set is identical for both executors, so duplicating the scan + per-file
+    // Mono.Cecil MetadataReference creation gives nothing back. Lifecycle is
+    // owned by Plugin (Update lazily inits on first call; Dispose releases).
+    // No lock: Plugin's main-thread Update/Dispose are the only writers. The
+    // memory-visibility chain to Compile (Task pool) goes through Executor's
+    // volatile Initialized flag, which is set AFTER InitShared returns.
+    private static bool _sharedInit;
+    private static readonly List<object> SharedReferences = [];
+    private static readonly Dictionary<string, Assembly> SharedResolveMap = new();
+    private static ResolveEventHandler _sharedHandler;
+
+    // Per-instance tokens — declared as primary constructor parameters above.
+    // ScriptGuard{Main,Render}'s Bail/StackCheck/Dead are the only thing that
+    // differs between the two Compiler instances.
 
     private static readonly Regex SimpleUsing = new(@"^using\s+(static\s+)?[A-Za-z_][\w.]*\s*;$");
     private static readonly Regex AliasUsing = new(@"^using\s+[A-Za-z_]\w*\s*=\s*[A-Za-z_][\w.]*\s*;$");
@@ -146,16 +161,13 @@ public class __REPL__
 
     private static readonly int DefaultUsingLineCount = DefaultUsings.Count(c => c == '\n');
     private static readonly int ClassPrefixLineCount = ClassPrefix.Count(c => c == '\n');
-    private static readonly MethodInfo GuardBailMethod = typeof(ScriptGuard).GetMethod(nameof(ScriptGuard.Bail));
-    private static readonly FieldInfo GuardDeadField = typeof(ScriptGuard).GetField(nameof(ScriptGuard.Dead));
-    private static readonly MethodInfo StackCheckMethod = typeof(ScriptGuard).GetMethod(nameof(ScriptGuard.StackCheck));
 
-    public Compiler()
+    static Compiler()
     {
         var (csharpAsm, commonAsm) = LoadRoslyn();
 
-        metaRefBase = commonAsm.GetType("Microsoft.CodeAnalysis.MetadataReference");
-        syntaxTreeBase = commonAsm.GetType("Microsoft.CodeAnalysis.SyntaxTree");
+        MetaRefBase = commonAsm.GetType("Microsoft.CodeAnalysis.MetadataReference");
+        SyntaxTreeBase = commonAsm.GetType("Microsoft.CodeAnalysis.SyntaxTree");
         var metaRefPropsType = commonAsm.GetType("Microsoft.CodeAnalysis.MetadataReferenceProperties");
         var docProviderType = commonAsm.GetType("Microsoft.CodeAnalysis.DocumentationProvider");
         var outputKindType = commonAsm.GetType("Microsoft.CodeAnalysis.OutputKind");
@@ -174,50 +186,48 @@ public class __REPL__
         var parseOptsType = csharpAsm.GetType("Microsoft.CodeAnalysis.CSharp.CSharpParseOptions");
         var compOptsType = csharpAsm.GetType("Microsoft.CodeAnalysis.CSharp.CSharpCompilationOptions");
 
-        createFromFile = metaRefBase.GetMethod("CreateFromFile",
+        CreateFromFile = MetaRefBase.GetMethod("CreateFromFile",
             BindingFlags.Public | BindingFlags.Static, null,
             [typeof(string), metaRefPropsType, docProviderType], null);
 
-        parseText = syntaxTreeCsharpType.GetMethod("ParseText",
+        ParseText = syntaxTreeCsharpType.GetMethod("ParseText",
             BindingFlags.Public | BindingFlags.Static, null,
             [typeof(string), parseOptsType, typeof(string),
              typeof(System.Text.Encoding), typeof(CancellationToken)], null);
 
-        compilationCreate = compilationCsharpType.GetMethod("Create",
+        CompilationCreate = compilationCsharpType.GetMethod("Create",
             BindingFlags.Public | BindingFlags.Static, null,
-            [typeof(string), typeof(IEnumerable<>).MakeGenericType(syntaxTreeBase),
-             typeof(IEnumerable<>).MakeGenericType(metaRefBase), compOptsType], null);
+            [typeof(string), typeof(IEnumerable<>).MakeGenericType(SyntaxTreeBase),
+             typeof(IEnumerable<>).MakeGenericType(MetaRefBase), compOptsType], null);
 
-        parseOptions = NewWithDefaults(
+        ParseOptions = NewWithDefaults(
             parseOptsType.GetConstructor(
                 [langVerType, docModeType, srcKindType, typeof(IEnumerable<string>)]),
             langVerType.GetField("Latest").GetValue(null));
 
-        compileOptions = NewWithDefaults(
+        CompileOptions = NewWithDefaults(
             compOptsType.GetConstructors()
                 .Single(c => c.GetParameters()[0].ParameterType == outputKindType
                     && c.GetCustomAttribute<EditorBrowsableAttribute>()?.State != EditorBrowsableState.Never
                     && c.GetParameters().Skip(1).All(p => p.HasDefaultValue)),
             outputKindType.GetField("DynamicallyLinkedLibrary").GetValue(null));
 
-        emit = compilationType.GetMethods(BindingFlags.Public | BindingFlags.Instance)
+        Emit = compilationType.GetMethods(BindingFlags.Public | BindingFlags.Instance)
             .Single(m => m.Name == "Emit"
                 && m.GetParameters()[0].ParameterType == typeof(Stream)
                 && m.GetCustomAttribute<EditorBrowsableAttribute>()?.State != EditorBrowsableState.Never
                 && m.GetParameters().Skip(1).All(p => p.HasDefaultValue));
 
-        diagMsg = diagnosticType.GetMethod("GetMessage", [typeof(IFormatProvider)]);
-        locLineSpan = locationType.GetMethod("GetLineSpan", Type.EmptyTypes);
+        DiagMsg = diagnosticType.GetMethod("GetMessage", [typeof(IFormatProvider)]);
+        LocLineSpan = locationType.GetMethod("GetLineSpan", Type.EmptyTypes);
 
-        emitSuccess = emitResultType.GetProperty("Success");
-        emitDiags = emitResultType.GetProperty("Diagnostics");
-        diagLoc = diagnosticType.GetProperty("Location");
-        diagId = diagnosticType.GetProperty("Id");
-        spanStart = lineSpanType.GetProperty("StartLinePosition");
-        posLine = linePositionType.GetProperty("Line");
-        posChar = linePositionType.GetProperty("Character");
-
-        references = [];
+        EmitSuccess = emitResultType.GetProperty("Success");
+        EmitDiags = emitResultType.GetProperty("Diagnostics");
+        DiagLoc = diagnosticType.GetProperty("Location");
+        DiagId = diagnosticType.GetProperty("Id");
+        SpanStart = lineSpanType.GetProperty("StartLinePosition");
+        PosLine = linePositionType.GetProperty("Line");
+        PosChar = linePositionType.GetProperty("Character");
     }
 
     // Re-resolve each unique name via Assembly.Load so CLR picks the version
@@ -229,10 +239,10 @@ public class __REPL__
     // their randomized names. We collect those into a separate bucket and
     // pick the highest version per name, then register an AssemblyResolve
     // handler so REPL code can find them at runtime.
-    public void CollectReferences()
+    public static void InitShared()
     {
-        references.Clear();
-        resolveMap.Clear();
+        if (_sharedInit) return;
+        _sharedInit = true;
 
         var loadContext = new Dictionary<string, string>();
         var loadFile = new Dictionary<string, (Assembly asm, Version ver)>();
@@ -261,7 +271,7 @@ public class __REPL__
         {
             if (string.IsNullOrEmpty(loc)) continue;
             if (Path.GetFileName(loc) == "VRage.Native.dll") continue;
-            try { references.Add(CallWithDefaults(createFromFile, null, loc)); }
+            try { SharedReferences.Add(CallWithDefaults(CreateFromFile, null, loc)); }
             catch (Exception ex) { MyLog.Default.WriteLine($"SeMcp: failed reference {name}: {ex.Message}"); }
         }
 
@@ -271,29 +281,35 @@ public class __REPL__
             if (Path.GetFileName(loc) == "VRage.Native.dll") continue;
             try
             {
-                references.Add(CallWithDefaults(createFromFile, null, loc));
-                resolveMap[name] = asm;
+                SharedReferences.Add(CallWithDefaults(CreateFromFile, null, loc));
+                SharedResolveMap[name] = asm;
             }
             catch (Exception ex) { MyLog.Default.WriteLine($"SeMcp: failed LoadFile reference {name}: {ex.Message}"); }
         }
 
-        resolveHandler = (_, args) =>
+        _sharedHandler = (_, args) =>
         {
             if (args.RequestingAssembly?.GetName().Name?.StartsWith("__REPL__") != true)
                 return null;
-            resolveMap.TryGetValue(new AssemblyName(args.Name).Name, out var found);
+            SharedResolveMap.TryGetValue(new AssemblyName(args.Name).Name, out var found);
             return found;
         };
-        AppDomain.CurrentDomain.AssemblyResolve += resolveHandler;
+        AppDomain.CurrentDomain.AssemblyResolve += _sharedHandler;
 
-        MyLog.Default.WriteLine($"SeMcp: {references.Count} references collected ({resolveMap.Count} LoadFile)");
+        MyLog.Default.WriteLine($"SeMcp: {SharedReferences.Count} references collected ({SharedResolveMap.Count} LoadFile)");
     }
 
-    public void UnregisterResolver()
+    public static void ReleaseShared()
     {
-        if (resolveHandler == null) return;
-        AppDomain.CurrentDomain.AssemblyResolve -= resolveHandler;
-        resolveHandler = null;
+        if (!_sharedInit) return;
+        if (_sharedHandler != null)
+        {
+            AppDomain.CurrentDomain.AssemblyResolve -= _sharedHandler;
+            _sharedHandler = null;
+        }
+        SharedReferences.Clear();
+        SharedResolveMap.Clear();
+        _sharedInit = false;
     }
 
     public CompilationResult Compile(string userCode)
@@ -309,34 +325,34 @@ public class __REPL__
         var bodyStart = bodyOffset + cut;
         var assemblyName = "__REPL__" + Interlocked.Increment(ref _counter);
 
-        var tree = CallWithDefaults(parseText, null, fullSource, parseOptions);
+        var tree = CallWithDefaults(ParseText, null, fullSource, ParseOptions);
 
-        var treesArr = Array.CreateInstance(syntaxTreeBase, 1);
+        var treesArr = Array.CreateInstance(SyntaxTreeBase, 1);
         treesArr.SetValue(tree, 0);
 
-        var refsArr = Array.CreateInstance(metaRefBase, references.Count);
-        for (var i = 0; i < references.Count; i++)
-            refsArr.SetValue(references[i], i);
+        var refsArr = Array.CreateInstance(MetaRefBase, SharedReferences.Count);
+        for (var i = 0; i < SharedReferences.Count; i++)
+            refsArr.SetValue(SharedReferences[i], i);
 
-        var compilation = compilationCreate.Invoke(null, [assemblyName, treesArr, refsArr, compileOptions]);
+        var compilation = CompilationCreate.Invoke(null, [assemblyName, treesArr, refsArr, CompileOptions]);
 
         using var ms = new MemoryStream();
-        var emitResult = CallWithDefaults(emit, compilation, ms);
+        var emitResult = CallWithDefaults(Emit, compilation, ms);
 
-        if (!(bool)emitSuccess.GetValue(emitResult))
+        if (!(bool)EmitSuccess.GetValue(emitResult))
         {
             var errors = new List<string>();
-            foreach (var d in (IEnumerable)emitDiags.GetValue(emitResult))
+            foreach (var d in (IEnumerable)EmitDiags.GetValue(emitResult))
             {
-                var location = diagLoc.GetValue(d);
-                var span = locLineSpan.Invoke(location, null);
-                var startPos = spanStart.GetValue(span);
-                var compiled = (int)posLine.GetValue(startPos);
-                var col = (int)posChar.GetValue(startPos);
+                var location = DiagLoc.GetValue(d);
+                var span = LocLineSpan.Invoke(location, null);
+                var startPos = SpanStart.GetValue(span);
+                var compiled = (int)PosLine.GetValue(startPos);
+                var col = (int)PosChar.GetValue(startPos);
                 var offset = compiled >= bodyStart ? bodyOffset : DefaultUsingLineCount;
                 var line = Math.Max(1, compiled + 1 - offset);
-                var id = (string)diagId.GetValue(d);
-                var message = (string)CallWithDefaults(diagMsg, d);
+                var id = (string)DiagId.GetValue(d);
+                var message = (string)CallWithDefaults(DiagMsg, d);
                 errors.Add($"({line},{col + 1}): error {id}: {message}");
             }
             return new CompilationResult(string.Join("\n", errors));
@@ -431,16 +447,16 @@ public class __REPL__
     //     by sampling SP; first call per script sets StackBase, subsequent
     //     calls throw if SP descends past the budget.
     // Not a security boundary — token holders already have full RCE.
-    private static byte[] InjectTimeoutChecks(byte[] raw)
+    private byte[] InjectTimeoutChecks(byte[] raw)
     {
         using var asm = AssemblyDefinition.ReadAssembly(new MemoryStream(raw));
         var replType = asm.MainModule.Types.FirstOrDefault(t => t.Name == "__REPL__");
         if (replType == null)
             throw new InvalidOperationException("Compiled assembly missing __REPL__ type");
 
-        var bailRef = asm.MainModule.ImportReference(GuardBailMethod);
-        var deadFieldRef = asm.MainModule.ImportReference(GuardDeadField);
-        var stackRef = asm.MainModule.ImportReference(StackCheckMethod);
+        var bailRef = asm.MainModule.ImportReference(guardBail);
+        var deadFieldRef = asm.MainModule.ImportReference(guardDead);
+        var stackRef = asm.MainModule.ImportReference(guardStackCheck);
 
         var types = new Stack<TypeDefinition>();
         types.Push(replType);
@@ -471,7 +487,7 @@ public class __REPL__
                 //    recursion attack surface.
                 //  - Existing Filter (user wrote `catch when`): skipped. Composing
                 //    filters is doable but messy — left as a documented gap,
-                //    matching SE's behaviour.
+                //    matching SE's behavior.
                 //  - Empty finally (HandlerStart == endfinally): skipped, no body.
                 //
                 // Filter IL layout (the filter block must physically precede the
@@ -527,7 +543,7 @@ public class __REPL__
                     eh.CatchType = null;
 
                     // Other handlers' TryEnd/HandlerEnd may have referenced
-                    // origHandlerStart (try-block end == catch-block start, etc).
+                    // origHandlerStart (try-block end == catch-block start, etc.).
                     // Repoint them to filterStart so try/handler regions stay glued
                     // together physically (CIL III.1.6.1 adjacency requirement).
                     foreach (var any in method.Body.ExceptionHandlers)

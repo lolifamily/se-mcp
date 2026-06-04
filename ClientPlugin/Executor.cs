@@ -23,16 +23,24 @@ public sealed class WorkItem
     public bool WasCancelled;
 }
 
-public sealed class Executor : IDisposable
+// guard{Bail,StackCheck,Dead}: pre-resolved MemberInfos from the ScriptGuard{Main,Render}
+// static class whose Bail/Dead/StackCheck get injected into compiled REPL bytecode.
+// Resolved once at type init (see ScriptGuardMain.BailMethod etc) instead of reflecting
+// per-compile. setDead writes that class's Dead flag from the Task pool deadline timer
+// (cross-thread, plain static volatile). resetStackBase writes the [ThreadStatic]
+// StackBase field from this Executor's Tick thread (lambda body is `stsfld`, hits the
+// calling thread's slot — so the reset lands on the same slot the script's StackCheck
+// will later read).
+public sealed class Executor(
+    MethodInfo guardBail, MethodInfo guardStackCheck, FieldInfo guardDead,
+    Action<bool> setDead, Action<long> resetStackBase, int frameTimeoutMs) : IDisposable
 {
-    private const int FrameTimeoutMs = 1000;
-
     private const string DenialMessage = "Multiplayer non-admin: code execution is disabled. You must be Admin or Owner to use SeMcp in multiplayer.";
     private const string ShutdownMessage = "[server shutting down]";
 
     public volatile bool Initialized;
 
-    private readonly Compiler compiler = new();
+    private readonly Compiler compiler = new(guardBail, guardStackCheck, guardDead);
     private readonly ConcurrentQueue<(WorkItem Item, CompilationResult Result)> compiled = new();
     private readonly List<ActiveScript> active = [];
     private readonly ConcurrentDictionary<WorkItem, byte> inflight = new();
@@ -40,20 +48,13 @@ public sealed class Executor : IDisposable
     private volatile bool denied;
     private volatile bool disposed;
 
-    private static readonly Assembly PluginAssembly = typeof(ScriptGuard).Assembly;
-
     public void Initialize()
     {
-        compiler.CollectReferences();
-        AppDomain.CurrentDomain.AssemblyResolve += ResolvePluginAssembly;
+        if (Initialized) return;
+        // Compiler.InitShared is process-wide and called by Plugin.Update before
+        // either Executor.Initialize. Nothing per-Executor needs to happen here
+        // beyond flipping the gate the McpServer reads.
         Initialized = true;
-    }
-
-    private static Assembly ResolvePluginAssembly(object sender, ResolveEventArgs args)
-    {
-        return new AssemblyName(args.Name).Name == PluginAssembly.GetName().Name
-            ? PluginAssembly
-            : null;
     }
 
     private sealed class ActiveScript
@@ -101,24 +102,48 @@ public sealed class Executor : IDisposable
 
     public void Tick()
     {
+        // Disposed: drain `active` here, because IEnumerator.Dispose() runs the
+        // script's finally blocks — and those blocks MUST execute on the same
+        // thread the script ran on. Dispose() is called from the main thread for
+        // both executors; if it touched the render Executor's `active`, every
+        // render-thread script's finally would suddenly run on the main thread,
+        // breaking user code that observed Thread.CurrentThread or held
+        // thread-affine D3D11 resources. So Dispose() never touches `active` —
+        // this Tick (= the script's owning thread) drains it. Tick is the sole
+        // writer of `active`, so no lock. Repeat disposed-path Ticks no-op.
+        if (disposed)
+        {
+            foreach (var s in active)
+            {
+                try { s.Coroutine?.Dispose(); }
+                catch (Exception ex) { MyLog.Default.Warning($"SeMcp: coroutine dispose failed: {ex.Message}"); }
+                try { s.Writer?.Dispose(); }
+                catch (Exception ex) { MyLog.Default.Warning($"SeMcp: writer dispose failed: {ex.Message}"); }
+            }
+            active.Clear();
+            return;
+        }
+
         while (compiled.TryDequeue(out var pair))
             Start(pair.Item, pair.Result);
 
         denied = IsDenied();
 
         // Deadline timer: each Tick bumps `epoch` and fires a Task that flips
-        // Dead true after FrameTimeoutMs — but only if its captured epoch is
+        // Dead true after frameTimeoutMs — but only if its captured epoch is
         // still current. A later Tick increments epoch and silently invalidates
         // any in-flight timer from a previous frame. If MoveNext stays in a hot
         // loop with no backward branches (e.g. recursive lambda + catch), no
         // later Tick runs and the timer fires, setting Dead. Catches that
         // would otherwise swallow the bail are rejected by the filter handlers
         // we splice in during compilation, so unwind reaches Executor.Tick.
+        // setDead writes from a Task pool worker — Dead must be plain volatile,
+        // not ThreadStatic, because the writer crosses thread.
         var myEpoch = ++epoch;
-        ScriptGuard.Dead = false;
-        _ = Task.Delay(FrameTimeoutMs).ContinueWith(_ =>
+        setDead(false);
+        _ = Task.Delay(frameTimeoutMs).ContinueWith(_ =>
         {
-            if (Volatile.Read(ref epoch) == myEpoch) ScriptGuard.Dead = true;
+            if (Volatile.Read(ref epoch) == myEpoch) setDead(true);
         });
 
         for (var i = active.Count - 1; i >= 0; i--)
@@ -140,7 +165,10 @@ public sealed class Executor : IDisposable
             }
 
             // Per-script stack budget: each script gets its own SP baseline.
-            ScriptGuard.StackBase = 0;
+            // StackBase is [ThreadStatic] on the guard class; this lambda's
+            // `stsfld` writes the slot belonging to this Tick's thread — same
+            // slot the script's StackCheck will read on the very next line.
+            resetStackBase(0);
             try
             {
                 if (!s.Coroutine.MoveNext())
@@ -221,13 +249,9 @@ public sealed class Executor : IDisposable
         if (disposed) return;
         disposed = true;
 
-        // Capture partial output from running scripts before completing their promises,
-        // so HandleToolsCall sees the output that was produced before shutdown.
-        foreach (var s in active)
-            s.Item.Output = s.Writer?.ToString() ?? "";
-
-        // Step 1: fulfill all inflight promises so HandleToolsCall wakes up and starts writing responses.
-        // Snapshot keys to avoid mutating the collection while iterating.
+        // Fulfill all inflight promises so HandleToolsCall wakes up and writes responses.
+        // ConcurrentDictionary snapshot is safe; TryRemove from a concurrent Complete()
+        // on the owner thread is idempotent against this Clear().
         // Items that race in via Enqueue after this point are handled by the double-check
         // in Enqueue (it sees disposed=true after adding to inflight and self-completes).
         foreach (var item in new List<WorkItem>(inflight.Keys))
@@ -237,19 +261,16 @@ public sealed class Executor : IDisposable
         }
         inflight.Clear();
 
-        // Step 2: run cleanup of active scripts (user-script using/finally blocks).
-        // The time this takes incidentally gives the HTTP responses a window to flush out.
-        foreach (var s in active)
-        {
-            try { s.Coroutine?.Dispose(); }
-            catch (Exception ex) { MyLog.Default.Warning($"SeMcp: coroutine dispose failed: {ex.Message}"); }
-            try { s.Writer?.Dispose(); }
-            catch (Exception ex) { MyLog.Default.Warning($"SeMcp: writer dispose failed: {ex.Message}"); }
-        }
-        active.Clear();
+        // `active` is owned by the Tick thread. Its drain happens on the next Tick
+        // (disposed branch). Caller must arrange one final Tick on the owner thread
+        // after Dispose: render Executor relies on the natural next-frame hook;
+        // main Executor must be ticked once from Plugin.Dispose since SE stops
+        // calling Update after dispose. Partial-output capture before promise
+        // fulfillment is dropped — it required reading Writer concurrently with
+        // a possibly-still-running script.
 
-        AppDomain.CurrentDomain.AssemblyResolve -= ResolvePluginAssembly;
-        compiler.UnregisterResolver();
+        // Compiler's shared state (references, resolve handler) is process-wide;
+        // it's released by Plugin.Dispose once both executors are torn down.
     }
 
     private static string FormatException(Exception ex)

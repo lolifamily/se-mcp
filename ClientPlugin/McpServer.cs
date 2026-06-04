@@ -15,14 +15,16 @@ public sealed class McpServer : IDisposable
 
     private static readonly System.Text.Encoding Utf8NoBom = new System.Text.UTF8Encoding(false);
 
-    private readonly Executor executor;
+    private readonly Executor mainExec;
+    private readonly Executor renderExec;
     private readonly int basePort;
     private HttpListener listener;
     private readonly ConcurrentDictionary<string, CancellationTokenSource> pending = new();
 
-    public McpServer(Executor executor, string port)
+    public McpServer(Executor mainExec, Executor renderExec, string port)
     {
-        this.executor = executor;
+        this.mainExec = mainExec;
+        this.renderExec = renderExec;
         basePort = int.TryParse(port, out var p) ? p : 9876;
     }
 
@@ -188,13 +190,6 @@ public sealed class McpServer : IDisposable
 
     private async Task HandleToolsCall(HttpListenerContext ctx, JsonElement root, string rawId)
     {
-        if (!executor.Initialized)
-        {
-            await RespondJsonRpcError(ctx, rawId, -32002,
-                "Game is still loading, not all plugins have been initialized yet. Please retry shortly.");
-            return;
-        }
-
         var p = root.GetProperty("params");
         var toolName = p.GetProperty("name").GetString();
 
@@ -204,7 +199,36 @@ public sealed class McpServer : IDisposable
             return;
         }
 
-        var code = p.GetProperty("arguments").GetProperty("code").GetString();
+        var args = p.GetProperty("arguments");
+        var code = args.GetProperty("code").GetString();
+
+        // target routes to one of the two execution lanes. Default "main" preserves
+        // pre-render-thread behavior. The string never enters WorkItem / Executor —
+        // it's resolved to a concrete Executor instance here and discarded.
+        string target = null;
+        if (args.TryGetProperty("target", out var tEl) && tEl.ValueKind == JsonValueKind.String)
+            target = tEl.GetString();
+
+        var executor = target switch
+        {
+            null or "" or "main" => mainExec,
+            "render" => renderExec,
+            _ => null
+        };
+        if (executor == null)
+        {
+            await RespondJsonRpcError(ctx, rawId, -32602,
+                $"Invalid params: target must be \"main\" or \"render\" (got \"{target}\")");
+            return;
+        }
+
+        if (!executor.Initialized)
+        {
+            await RespondJsonRpcError(ctx, rawId, -32002,
+                "Game is still loading, not all plugins have been initialized yet. Please retry shortly.");
+            return;
+        }
+
         var cancelSource = new CancellationTokenSource();
         var item = new WorkItem { Code = code, Cancel = cancelSource.Token };
 
@@ -254,7 +278,7 @@ public sealed class McpServer : IDisposable
 
     private static string JsonToolsList()
     {
-        return """{"tools":[{"name":"execute_code","description":"Execute C# code inside Space Engineers. Full .NET + game API access. Use Console.WriteLine() for output. Use yield return null to pause until next frame. In multiplayer, requires Admin or Owner promote level. ALWAYS use short type names. Pre-imported namespaces: System.*, VRage.*, VRageMath, Sandbox.*, SpaceEngineers.Game.*. Do NOT write fully qualified names like Sandbox.Game.World.MySession.Static or Sandbox.Game.Entities.MyCubeGrid — write MySession.Static, MyCubeGrid. Extra 'using' directives at the top of your code are supported. Only fall back to fully qualified names on ambiguous type errors.","inputSchema":{"type":"object","properties":{"code":{"type":"string","description":"C# code body. Using directives at the top are supported; no class/method wrapper needed."}},"required":["code"]}}]}""";
+        return """{"tools":[{"name":"execute_code","description":"Execute C# code inside Space Engineers. Full .NET + game API access. Use Console.WriteLine() for output. Use yield return null to pause until next frame. In multiplayer, requires Admin or Owner promote level. ALWAYS use short type names. Pre-imported namespaces: System.*, VRage.*, VRageMath, Sandbox.*, SpaceEngineers.Game.*. Do NOT write fully qualified names like Sandbox.Game.World.MySession.Static or Sandbox.Game.Entities.MyCubeGrid — write MySession.Static, MyCubeGrid. Extra 'using' directives at the top of your code are supported. Only fall back to fully qualified names on ambiguous type errors.","inputSchema":{"type":"object","properties":{"code":{"type":"string","description":"C# code body. Using directives at the top are supported; no class/method wrapper needed."},"target":{"type":"string","enum":["main","render"],"description":"Execution lane. \"main\" (default) runs in the game's main thread via IPlugin.Update — use this for MyAPIGateway / Session / Grid / Entity access. \"render\" runs in the render thread via a Harmony Postfix on MyRenderThread.RenderFrame — use ONLY to inspect other plugins' Harmony hooks that execute on the render thread (their __instance, captured locals, accumulated fields). Render-target scripts freeze one frame per step (~16ms); use yield return null to split work across frames. MyAPIGateway will assert-throw on render thread."}},"required":["code"]}}]}""";
     }
 
     private static string JsonToolResult(string text, bool isError)
