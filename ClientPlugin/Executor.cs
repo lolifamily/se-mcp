@@ -15,7 +15,12 @@ namespace ClientPlugin;
 public sealed class WorkItem
 {
     public string Code;
-    public readonly TaskCompletionSource<bool> Done = new();
+
+    // RunContinuationsAsynchronously is load-bearing: TrySetResult is called from
+    // the game's main/render thread (CompleteItem via Tick). Without it the awaiting
+    // HandleToolsCall continuation — JSON-escaping the full script output plus the
+    // HTTP response write — would run inlined on that game thread.
+    public readonly TaskCompletionSource<bool> Done = new(TaskCreationOptions.RunContinuationsAsynchronously);
     public CancellationToken Cancel;
 
     public string Output;
@@ -127,11 +132,25 @@ public sealed class Executor(
         while (compiled.TryDequeue(out var pair))
             Start(pair.Item, pair.Result);
 
+        // denied must refresh BEFORE the idle exit below: Enqueue's fast-reject
+        // reads it, and a denied-then-idle executor would otherwise never run a
+        // script again — nothing reaches `active`, every Tick exits early, and
+        // the stale true sticks forever (even back in single player). Two
+        // property reads, no allocation; fine to do every frame.
         denied = IsDenied();
 
-        // Deadline timer: each Tick bumps `epoch` and fires a Task that flips
-        // Dead true after frameTimeoutMs — but only if its captured epoch is
-        // still current. A later Tick increments epoch and silently invalidates
+        // Idle fast path. Everything below exists to police running scripts;
+        // with none, arming the deadline timer would just allocate a closure +
+        // ContinueWith + DelayPromise per frame, 60-240 Hz across two lanes,
+        // for nobody. A stale timer from the last active frame may still fire
+        // during idle and leave Dead set — harmless: the next active frame
+        // clears it via setDead(false) before any MoveNext runs.
+        if (active.Count == 0)
+            return;
+
+        // Deadline timer: each active Tick bumps `epoch` and fires a Task that
+        // flips Dead true after frameTimeoutMs — but only if its captured epoch
+        // is still current. A later Tick increments epoch and silently invalidates
         // any in-flight timer from a previous frame. If MoveNext stays in a hot
         // loop with no backward branches (e.g. recursive lambda + catch), no
         // later Tick runs and the timer fires, setting Dead. Catches that
@@ -139,7 +158,7 @@ public sealed class Executor(
         // we splice in during compilation, so unwind reaches Executor.Tick.
         // setDead writes from a Task pool worker — Dead must be plain volatile,
         // not ThreadStatic, because the writer crosses thread.
-        var myEpoch = ++epoch;
+        var myEpoch = Interlocked.Increment(ref epoch);
         setDead(false);
         _ = Task.Delay(frameTimeoutMs).ContinueWith(_ =>
         {

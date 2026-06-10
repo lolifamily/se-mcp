@@ -104,8 +104,12 @@ public class Plugin : IPlugin
         //             the hook stays in place so the drain has a chance to run;
         //             subsequent disposed-path Ticks are cheap no-ops.
         // McpServer is disposed last because HttpListener.Stop also cuts inflight
-        // response streams; pending Dispose() above already fulfilled their promises,
-        // and HandleToolsCall is now writing — give those writes a head start.
+        // response streams. The Dispose() calls above fulfilled all inflight
+        // promises, queueing each HandleToolsCall continuation (the response
+        // write) onto the thread pool — WorkItem.Done uses
+        // RunContinuationsAsynchronously. Stopping the listener last gives those
+        // writes a head start; any that lose the race are logged and dropped by
+        // HandleToolsCall's catch.
         RenderExecutor?.Dispose();
         MainExecutor?.Dispose();
         MainExecutor?.Tick();

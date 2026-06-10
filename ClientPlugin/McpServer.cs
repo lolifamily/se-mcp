@@ -132,12 +132,47 @@ public sealed class McpServer : IDisposable
                 return;
             }
 
+            // Session id namespaces the pending-request keys: official SDK clients all
+            // count JSON-RPC ids up from 0, so two clients (or one client restarted while
+            // an old script is still running) collide on ids as the norm, not the edge case.
+            // Required on every request except initialize (spec: 400 without it), but the
+            // VALUE is deliberately not validated against a table of issued ids — the
+            // spec's 404-on-unknown-session rule exists to force re-initialization when
+            // per-session server state is lost, and this server keeps none (responses pair
+            // via the HTTP context, the initialize result is a static constant, auth is
+            // the per-request Bearer token). Accepting any non-empty value means clients
+            // keep working across a plugin or game restart without a forced re-init.
+            // REVISIT if per-session state is ever added (SSE push, subscriptions,
+            // list_changed notifications) — at that point unknown ids must 404.
+            var sessionId = ctx.Request.Headers["Mcp-Session-Id"];
+
             // No body size cap: auth grants execute_code (full RCE), so capping body size here would be security theater.
             using var doc = await JsonDocument.ParseAsync(ctx.Request.InputStream);
             var root = doc.RootElement;
-            var method = root.GetProperty("method").GetString();
+
+            if (root.ValueKind != JsonValueKind.Object)
+            {
+                await RespondJsonRpcError(ctx, "null", -32600,
+                    "Invalid Request: expected a single JSON-RPC request object (batching not supported)");
+                return;
+            }
+
+            if (!root.TryGetProperty("method", out var methodEl) || methodEl.ValueKind != JsonValueKind.String)
+            {
+                await RespondJsonRpcError(ctx, "null", -32600,
+                    "Invalid Request: method must be a string");
+                return;
+            }
+
+            var method = methodEl.GetString()!; // ValueKind == String guarantees non-null
             root.TryGetProperty("id", out var idEl);
-            var isNotification = method != null && method.StartsWith("notifications/");
+            var isNotification = method.StartsWith("notifications/");
+
+            if (method != "initialize" && string.IsNullOrEmpty(sessionId))
+            {
+                await Respond(ctx, 400, "Bad Request: Mcp-Session-Id header required (initialize first)");
+                return;
+            }
 
             if (!isNotification && idEl.ValueKind != JsonValueKind.String
                                 && idEl.ValueKind != JsonValueKind.Number)
@@ -152,11 +187,16 @@ public sealed class McpServer : IDisposable
             switch (method)
             {
                 case "initialize":
+                    // Mint a fresh session id on every initialize; spec-compliant clients
+                    // MUST echo it on all subsequent requests. Headers must be set before
+                    // the body write below.
+                    ctx.Response.AddHeader("Mcp-Session-Id", Config.GenerateToken());
                     await RespondJsonRpc(ctx, rawId, JsonInitResult());
                     break;
 
                 case "notifications/initialized":
-                    await Respond(ctx, 200, "");
+                    // MCP Streamable HTTP: accepted notifications get 202 with no body.
+                    await Respond(ctx, 202, "");
                     break;
 
                 case "tools/list":
@@ -164,12 +204,12 @@ public sealed class McpServer : IDisposable
                     break;
 
                 case "tools/call":
-                    await HandleToolsCall(ctx, root, rawId);
+                    await HandleToolsCall(ctx, root, rawId, sessionId);
                     break;
 
                 case "notifications/cancelled":
-                    HandleCancel(root);
-                    await Respond(ctx, 200, "");
+                    HandleCancel(root, sessionId);
+                    await Respond(ctx, 202, "");
                     break;
 
                 default:
@@ -188,26 +228,48 @@ public sealed class McpServer : IDisposable
         }
     }
 
-    private async Task HandleToolsCall(HttpListenerContext ctx, JsonElement root, string rawId)
+    private async Task HandleToolsCall(HttpListenerContext ctx, JsonElement root, string rawId, string sessionId)
     {
-        var p = root.GetProperty("params");
-        var toolName = p.GetProperty("name").GetString();
+        // Shape checks return -32602 with a precise message; the generic catch in
+        // HandleRequest would mislabel them all as -32603 Internal error.
+        if (!root.TryGetProperty("params", out var p) || p.ValueKind != JsonValueKind.Object
+            || !p.TryGetProperty("name", out var nameEl) || nameEl.ValueKind != JsonValueKind.String)
+        {
+            await RespondJsonRpcError(ctx, rawId, -32602, "Invalid params: name must be a string");
+            return;
+        }
 
+        var toolName = nameEl.GetString();
         if (toolName != "execute_code")
         {
             await RespondJsonRpcError(ctx, rawId, -32602, $"Unknown tool: {toolName}");
             return;
         }
 
-        var args = p.GetProperty("arguments");
-        var code = args.GetProperty("code").GetString();
+        if (!p.TryGetProperty("arguments", out var args) || args.ValueKind != JsonValueKind.Object
+            || !args.TryGetProperty("code", out var codeEl) || codeEl.ValueKind != JsonValueKind.String)
+        {
+            await RespondJsonRpcError(ctx, rawId, -32602, "Invalid params: arguments.code must be a string");
+            return;
+        }
+
+        var code = codeEl.GetString();
 
         // target routes to one of the two execution lanes. Default "main" preserves
         // pre-render-thread behavior. The string never enters WorkItem / Executor —
         // it's resolved to a concrete Executor instance here and discarded.
+        // JSON null is treated as absent; any other non-string shape is rejected
+        // rather than silently falling back to "main".
         string target = null;
-        if (args.TryGetProperty("target", out var tEl) && tEl.ValueKind == JsonValueKind.String)
+        if (args.TryGetProperty("target", out var tEl) && tEl.ValueKind != JsonValueKind.Null)
+        {
+            if (tEl.ValueKind != JsonValueKind.String)
+            {
+                await RespondJsonRpcError(ctx, rawId, -32602, "Invalid params: target must be a string");
+                return;
+            }
             target = tEl.GetString();
+        }
 
         var executor = target switch
         {
@@ -232,8 +294,12 @@ public sealed class McpServer : IDisposable
         var cancelSource = new CancellationTokenSource();
         var item = new WorkItem { Code = code, Cancel = cancelSource.Token };
 
-        // MCP requires id uniqueness per session; refuse rather than silently orphan the prior request.
-        if (!pending.TryAdd(rawId, cancelSource))
+        // MCP requires id uniqueness per session; refuse rather than silently orphan the
+        // prior request. The session prefix scopes that uniqueness correctly: official
+        // SDK clients all count ids up from 0, so cross-client raw-id collisions are
+        // routine and must not be conflated.
+        var pendingKey = sessionId + ":" + rawId;
+        if (!pending.TryAdd(pendingKey, cancelSource))
         {
             cancelSource.Dispose();
             await RespondJsonRpcError(ctx, rawId, -32600,
@@ -243,7 +309,7 @@ public sealed class McpServer : IDisposable
         executor.Enqueue(item);
 
         await item.Done.Task;
-        pending.TryRemove(rawId, out _);
+        pending.TryRemove(pendingKey, out _);
         cancelSource.Dispose();
 
         var isError = item.Error != null || item.WasCancelled;
@@ -257,15 +323,16 @@ public sealed class McpServer : IDisposable
         catch (Exception ex) { MyLog.Default.Warning($"SeMcp: response flush failed (listener likely closed): {ex.Message}"); }
     }
 
-    private void HandleCancel(JsonElement root)
+    private void HandleCancel(JsonElement root, string sessionId)
     {
         // MCP spec: invalid cancellation notifications SHOULD be silently ignored.
+        // Session-scoped lookup: without the prefix, a client cancelling its own id=2
+        // could kill another client's in-flight id=2.
         try
         {
             if (!root.TryGetProperty("params", out var p)) return;
             if (!p.TryGetProperty("requestId", out var rid)) return;
-            var reqId = rid.GetRawText();
-            if (pending.TryGetValue(reqId, out var cancelSource))
+            if (pending.TryGetValue(sessionId + ":" + rid.GetRawText(), out var cancelSource))
                 cancelSource.Cancel();
         }
         catch (ObjectDisposedException) { /* race with HandleToolsCall.Dispose() */ }
