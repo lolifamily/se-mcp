@@ -20,12 +20,30 @@ namespace ClientPlugin.Patches;
 // MyRenderThread runs on the main thread; in that mode the main Executor is the
 // right one to tick and we'd otherwise double-tick scripts on a confused thread
 // identity. RenderSystemThread is null in sync mode.
+//
+// Initialize lives here, on the lane's own pump, NOT in Plugin.Update: the flag
+// means "this lane's pump is alive". In StartSync mode this hook never passes
+// the thread gate, so render-targeted requests keep getting -32002 from the
+// McpServer instead of compiling into a queue nothing ever drains; a patch
+// broken by a game update fails the same safe way. Until the lane is open,
+// early-exit — no Initialize, no Tick (nothing to drain either: the McpServer
+// gate keeps `active` empty before Initialized flips). The gate on
+// MainExecutor.Initialized is load-bearing: that volatile write — set AFTER
+// Compiler.InitShared returns on the main thread — is what publishes the
+// shared compiler references to this thread (see Compiler._sharedInit notes).
 [HarmonyPatch(typeof(MyRenderThread), "RenderFrame")]
 internal static class PatchRenderFrame
 {
     private static void Postfix()
     {
         if (Thread.CurrentThread != MyRenderProxy.RenderSystemThread) return;
-        Plugin.RenderExecutor?.Tick();
+        var exec = Plugin.RenderExecutor;
+        if (exec == null) return;
+        if (!exec.Initialized)
+        {
+            if (Plugin.MainExecutor?.Initialized != true) return;
+            exec.Initialize();
+        }
+        exec.Tick();
     }
 }

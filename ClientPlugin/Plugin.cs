@@ -30,7 +30,7 @@ public class Plugin : IPlugin
     // close over those classes' Dead / StackBase fields, and IL injection picks
     // the matching tokens at compile time.
     // ReSharper disable once InconsistentNaming
-    private static Executor MainExecutor;
+    internal static Executor MainExecutor;
     internal static Executor RenderExecutor;
 
     private McpServer mcpServer;
@@ -117,6 +117,11 @@ public class Plugin : IPlugin
         AppDomain.CurrentDomain.AssemblyResolve -= ResolvePluginAssembly;
         Compiler.ReleaseShared();
 
+        // Same ordering contract as the Executors above: fulfill the pending
+        // screenshot promise first so its HandleToolsCall continuation gets a
+        // chance to write the response before the listener is stopped.
+        ScreenshotService.Drain();
+
         mcpServer?.Dispose();
 
         MainExecutor = null;
@@ -132,14 +137,20 @@ public class Plugin : IPlugin
             RefreshSettings = false;
             _settingsDialog?.RecreateControls(false);
         }
-        // InitShared / Initialize are all self-guarded (return after the first
-        // call); cost on subsequent frames is a static-bool read each. The order
-        // matters: shared references must populate before either Executor exposes
-        // Initialized=true to the McpServer gate.
+        // InitShared / Initialize are self-guarded (return after the first call);
+        // cost on subsequent frames is a static-bool read each. Order matters:
+        // shared compiler references must populate before MainExecutor exposes
+        // Initialized=true to the McpServer gate — that volatile write is also
+        // what publishes them across threads (see Compiler._sharedInit notes).
+        // RenderExecutor.Initialize deliberately does NOT happen here: it lives
+        // in PatchRenderFrame on the render lane's own pump, so the flag means
+        // "this lane's pump is alive". In StartSync mode (RenderFrame never
+        // ticks the render lane) render-targeted requests then keep getting
+        // -32002 instead of compiling into a queue nothing ever drains.
         Compiler.InitShared();
         MainExecutor?.Initialize();
-        RenderExecutor?.Initialize();
         MainExecutor?.Tick();
+        ScreenshotService.Tick();
     }
 
     [UsedImplicitly]

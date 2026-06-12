@@ -240,48 +240,80 @@ public sealed class McpServer : IDisposable
         }
 
         var toolName = nameEl.GetString();
-        if (toolName != "execute_code")
-        {
-            await RespondJsonRpcError(ctx, rawId, -32602, $"Unknown tool: {toolName}");
-            return;
-        }
 
-        if (!p.TryGetProperty("arguments", out var args) || args.ValueKind != JsonValueKind.Object
-            || !args.TryGetProperty("code", out var codeEl) || codeEl.ValueKind != JsonValueKind.String)
-        {
-            await RespondJsonRpcError(ctx, rawId, -32602, "Invalid params: arguments.code must be a string");
-            return;
-        }
+        string code = null;
+        Executor executor;
+        var ignoreSprites = false;
+        var isScreenshot = false;
 
-        var code = codeEl.GetString();
-
-        // target routes to one of the two execution lanes. Default "main" preserves
-        // pre-render-thread behavior. The string never enters WorkItem / Executor —
-        // it's resolved to a concrete Executor instance here and discarded.
-        // JSON null is treated as absent; any other non-string shape is rejected
-        // rather than silently falling back to "main".
-        string target = null;
-        if (args.TryGetProperty("target", out var tEl) && tEl.ValueKind != JsonValueKind.Null)
+        switch (toolName)
         {
-            if (tEl.ValueKind != JsonValueKind.String)
+            case "execute_code":
             {
-                await RespondJsonRpcError(ctx, rawId, -32602, "Invalid params: target must be a string");
-                return;
-            }
-            target = tEl.GetString();
-        }
+                if (!p.TryGetProperty("arguments", out var args) || args.ValueKind != JsonValueKind.Object
+                    || !args.TryGetProperty("code", out var codeEl) || codeEl.ValueKind != JsonValueKind.String)
+                {
+                    await RespondJsonRpcError(ctx, rawId, -32602, "Invalid params: arguments.code must be a string");
+                    return;
+                }
 
-        var executor = target switch
-        {
-            null or "" or "main" => mainExec,
-            "render" => renderExec,
-            _ => null
-        };
-        if (executor == null)
-        {
-            await RespondJsonRpcError(ctx, rawId, -32602,
-                $"Invalid params: target must be \"main\" or \"render\" (got \"{target}\")");
-            return;
+                code = codeEl.GetString();
+
+                // target routes to one of the two execution lanes. Default "main" preserves
+                // pre-render-thread behavior. The string never enters WorkItem / Executor —
+                // it's resolved to a concrete Executor instance here and discarded.
+                // JSON null is treated as absent; any other non-string shape is rejected
+                // rather than silently falling back to "main".
+                string target = null;
+                if (args.TryGetProperty("target", out var tEl) && tEl.ValueKind != JsonValueKind.Null)
+                {
+                    if (tEl.ValueKind != JsonValueKind.String)
+                    {
+                        await RespondJsonRpcError(ctx, rawId, -32602, "Invalid params: target must be a string");
+                        return;
+                    }
+                    target = tEl.GetString();
+                }
+
+                executor = target switch
+                {
+                    null or "" or "main" => mainExec,
+                    "render" => renderExec,
+                    _ => null
+                };
+                if (executor == null)
+                {
+                    await RespondJsonRpcError(ctx, rawId, -32602,
+                        $"Invalid params: target must be \"main\" or \"render\" (got \"{target}\")");
+                    return;
+                }
+                break;
+            }
+
+            case "take_screenshot":
+                // Absent arguments / absent flag / JSON null stay lenient (the
+                // default: HUD included). A present ignore_sprites of any other
+                // shape is rejected — same rule as target above, no silent
+                // fallback. The executor is only borrowed for the Initialized
+                // gate below; ScreenshotService issues from Plugin.Update.
+                if (p.TryGetProperty("arguments", out var sArgs) && sArgs.ValueKind == JsonValueKind.Object
+                    && sArgs.TryGetProperty("ignore_sprites", out var sEl) && sEl.ValueKind != JsonValueKind.Null)
+                {
+                    if (sEl.ValueKind != JsonValueKind.True && sEl.ValueKind != JsonValueKind.False)
+                    {
+                        await RespondJsonRpcError(ctx, rawId, -32602,
+                            "Invalid params: ignore_sprites must be a boolean");
+                        return;
+                    }
+                    ignoreSprites = sEl.ValueKind == JsonValueKind.True;
+                }
+                executor = mainExec;
+                isScreenshot = true;
+                break;
+
+            default:
+                await RespondJsonRpcError(ctx, rawId, -32602, $"Unknown tool: {toolName}");
+                return;
         }
 
         if (!executor.Initialized)
@@ -306,20 +338,30 @@ public sealed class McpServer : IDisposable
                 "Invalid Request: request id already in-flight in this session");
             return;
         }
-        executor.Enqueue(item);
+
+        if (isScreenshot)
+            ScreenshotService.Begin(item, ignoreSprites);
+        else
+            executor.Enqueue(item);
 
         await item.Done.Task;
         pending.TryRemove(pendingKey, out _);
         cancelSource.Dispose();
 
+        // Screenshot success: item.Output is the saved file's path; read + base64
+        // happen here on the thread pool (Done uses RunContinuationsAsynchronously),
+        // off game threads. A failed read throws into HandleRequest's catch (-32603).
         var isError = item.Error != null || item.WasCancelled;
         var text = item.WasCancelled
             ? $"[cancelled]\n{item.Output}"
             : item.Error != null
                 ? $"{item.Output}\n\n{item.Error}"
                 : item.Output;
+        var resultJson = isScreenshot && !isError
+            ? JsonToolResultImage(File.ReadAllBytes(item.Output), item.Output)
+            : JsonToolResult(text.Trim(), isError);
 
-        try { await RespondJsonRpc(ctx, rawId, JsonToolResult(text.Trim(), isError)); }
+        try { await RespondJsonRpc(ctx, rawId, resultJson); }
         catch (Exception ex) { MyLog.Default.Warning($"SeMcp: response flush failed (listener likely closed): {ex.Message}"); }
     }
 
@@ -345,13 +387,23 @@ public sealed class McpServer : IDisposable
 
     private static string JsonToolsList()
     {
-        return """{"tools":[{"name":"execute_code","description":"Execute C# code inside Space Engineers. Full .NET + game API access. Use Console.WriteLine() for output. Use yield return null to pause until next frame. In multiplayer, requires Admin or Owner promote level. ALWAYS use short type names. Pre-imported namespaces: System.*, VRage.*, VRageMath, Sandbox.*, SpaceEngineers.Game.*. Do NOT write fully qualified names like Sandbox.Game.World.MySession.Static or Sandbox.Game.Entities.MyCubeGrid — write MySession.Static, MyCubeGrid. Extra 'using' directives at the top of your code are supported. Only fall back to fully qualified names on ambiguous type errors.","inputSchema":{"type":"object","properties":{"code":{"type":"string","description":"C# code body. Using directives at the top are supported; no class/method wrapper needed."},"target":{"type":"string","enum":["main","render"],"description":"Execution lane. \"main\" (default) runs in the game's main thread via IPlugin.Update — use this for MyAPIGateway / Session / Grid / Entity access. \"render\" runs in the render thread via a Harmony Postfix on MyRenderThread.RenderFrame — use ONLY to inspect other plugins' Harmony hooks that execute on the render thread (their __instance, captured locals, accumulated fields). Render-target scripts freeze one frame per step (~16ms); use yield return null to split work across frames. MyAPIGateway will assert-throw on render thread."}},"required":["code"]}}]}""";
+        return """{"tools":[{"name":"execute_code","description":"Execute C# code inside Space Engineers. Full .NET + game API access. Use Console.WriteLine() for output. Use yield return null to pause until next frame. In multiplayer, requires Admin or Owner promote level. ALWAYS use short type names. Pre-imported namespaces: System.*, VRage.*, VRageMath, Sandbox.*, SpaceEngineers.Game.*. Do NOT write fully qualified names like Sandbox.Game.World.MySession.Static or Sandbox.Game.Entities.MyCubeGrid — write MySession.Static, MyCubeGrid. Extra 'using' directives at the top of your code are supported. Only fall back to fully qualified names on ambiguous type errors.","inputSchema":{"type":"object","properties":{"code":{"type":"string","description":"C# code body. Using directives at the top are supported; no class/method wrapper needed."},"target":{"type":"string","enum":["main","render"],"description":"Execution lane. \"main\" (default) runs in the game's main thread via IPlugin.Update — use this for MyAPIGateway / Session / Grid / Entity access. \"render\" runs in the render thread via a Harmony Postfix on MyRenderThread.RenderFrame — use ONLY to inspect other plugins' Harmony hooks that execute on the render thread (their __instance, captured locals, accumulated fields). Render-target scripts freeze one frame per step (~16ms); use yield return null to split work across frames. MyAPIGateway will assert-throw on render thread."}},"required":["code"]}},{"name":"take_screenshot","description":"Capture the current game frame and return it as an image. Only one screenshot may be in flight at a time.","inputSchema":{"type":"object","properties":{"ignore_sprites":{"type":"boolean","description":"true = capture the 3D scene only, without HUD/GUI overlays. Default false (HUD included)."}}}}]}""";
     }
 
     private static string JsonToolResult(string text, bool isError)
     {
         var escaped = JsonEncodedText.Encode(text);
         return $$"""{"content":[{"type":"text","text":"{{escaped}}"}],"isError":{{(isError ? "true" : "false")}}}""";
+    }
+
+    private static string JsonToolResultImage(byte[] data, string savedPath)
+    {
+        // base64 is JSON-safe as-is; only the path needs escaping. The text block
+        // carries the on-disk location so the model can point the user at it (the
+        // directory doubles as a browsable screenshot history).
+        var b64 = Convert.ToBase64String(data);
+        var note = JsonEncodedText.Encode("saved to " + savedPath);
+        return $$"""{"content":[{"type":"image","data":"{{b64}}","mimeType":"image/jpeg"},{"type":"text","text":"{{note}}"}],"isError":false}""";
     }
 
     private static async Task RespondJsonRpc(HttpListenerContext ctx, string rawId, string resultJson)
