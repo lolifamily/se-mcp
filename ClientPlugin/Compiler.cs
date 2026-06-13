@@ -5,7 +5,6 @@ using System.ComponentModel;
 using System.IO;
 using System.Linq;
 using System.Reflection;
-using System.Text.RegularExpressions;
 using System.Threading;
 using Mono.Cecil;
 using Mono.Cecil.Cil;
@@ -72,9 +71,6 @@ public sealed class Compiler(MethodInfo guardBail, MethodInfo guardStackCheck, F
     // Per-instance tokens — declared as primary constructor parameters above.
     // ScriptGuard{Main,Render}'s Bail/StackCheck/Dead are the only thing that
     // differs between the two Compiler instances.
-
-    private static readonly Regex SimpleUsing = new(@"^using\s+(static\s+)?[A-Za-z_][\w.]*\s*;$");
-    private static readonly Regex AliasUsing = new(@"^using\s+[A-Za-z_]\w*\s*=\s*[A-Za-z_][\w.]*\s*;$");
 
     private const string DefaultUsings = """
 using System;
@@ -148,6 +144,10 @@ using VRage.Serialization;
     private const string ClassPrefix = """
 public class __REPL__
 {
+
+""";
+
+    private const string RunPrefix = """
     public IEnumerable<object> Run(TextWriter Console)
     {
 
@@ -161,6 +161,7 @@ public class __REPL__
 
     private static readonly int DefaultUsingLineCount = DefaultUsings.Count(c => c == '\n');
     private static readonly int ClassPrefixLineCount = ClassPrefix.Count(c => c == '\n');
+    private static readonly int RunPrefixLineCount = RunPrefix.Count(c => c == '\n');
 
     static Compiler()
     {
@@ -205,12 +206,20 @@ public class __REPL__
                 [langVerType, docModeType, srcKindType, typeof(IEnumerable<string>)]),
             langVerType.GetField("Latest").GetValue(null));
 
-        CompileOptions = NewWithDefaults(
+        var baseOptions = NewWithDefaults(
             compOptsType.GetConstructors()
                 .Single(c => c.GetParameters()[0].ParameterType == outputKindType
                     && c.GetCustomAttribute<EditorBrowsableAttribute>()?.State != EditorBrowsableState.Never
                     && c.GetParameters().Skip(1).All(p => p.HasDefaultValue)),
             outputKindType.GetField("DynamicallyLinkedLibrary").GetValue(null));
+
+        // allowUnsafe via the With API rather than a ctor argument: the ctor's
+        // optional-parameter list shifts across Roslyn versions, while
+        // WithAllowUnsafe(bool) is the same single overload on both load paths
+        // (game 2.9 and NuGet 4.12).
+        var withAllowUnsafe = compOptsType.GetMethod("WithAllowUnsafe", [typeof(bool)])
+            ?? throw new MissingMethodException(compOptsType.FullName, "WithAllowUnsafe");
+        CompileOptions = withAllowUnsafe.Invoke(baseOptions, [true]);
 
         Emit = compilationType.GetMethods(BindingFlags.Public | BindingFlags.Instance)
             .Single(m => m.Name == "Emit"
@@ -312,17 +321,31 @@ public class __REPL__
         _sharedInit = false;
     }
 
-    public CompilationResult Compile(string userCode)
+    // Three-segment input maps 1:1 to C# language layers:
+    //   usings    → compilation-unit-level `using X;` directives
+    //   classBody → members of the wrapper class (methods, fields, nested types,
+    //               [DllImport] P/Invoke — anything that can't go in a method body)
+    //   code      → statements inside the entry method's body
+    // McpServer validated that `code` is present; `classBody` and `usings` may be null.
+    public CompilationResult Compile(IReadOnlyList<string> usings, string classBody, string code)
     {
-        var lines = userCode.Split('\n');
-        var cut = FindUsingBoundary(lines);
+        classBody ??= "";
 
-        var userUsings = cut > 0 ? string.Join("\n", lines, 0, cut) + "\n" : "";
-        var userBody = string.Join("\n", lines, cut, lines.Length - cut) + "\n";
-        var preamble = DefaultUsings + userUsings + ClassPrefix;
-        var fullSource = preamble + userBody + ClassSuffix;
-        var bodyOffset = DefaultUsingLineCount + ClassPrefixLineCount;
-        var bodyStart = bodyOffset + cut;
+        var usingsBlock = usings == null ? "" : string.Concat(
+            usings.Where(u => !string.IsNullOrWhiteSpace(u))
+                  .Select(u => "using " + u.Trim() + ";\n"));
+
+        var fullSource = DefaultUsings + usingsBlock + ClassPrefix + classBody + RunPrefix + code + ClassSuffix;
+
+        // 0-based start lines into fullSource for each user segment. Diagnostics on
+        // wrapper lines (between user segments) are attributed to the nearest
+        // preceding user segment so the LLM knows which field to fix.
+        var usingsStart = DefaultUsingLineCount;
+        var usingsLines = usingsBlock.Count(c => c == '\n');
+        var classBodyStart = usingsStart + usingsLines + ClassPrefixLineCount;
+        var classBodyLines = classBody.Count(c => c == '\n');
+        var codeStart = classBodyStart + classBodyLines + RunPrefixLineCount;
+
         var assemblyName = "__REPL__" + Interlocked.Increment(ref _counter);
 
         var tree = CallWithDefaults(ParseText, null, fullSource, ParseOptions);
@@ -349,11 +372,33 @@ public class __REPL__
                 var startPos = SpanStart.GetValue(span);
                 var compiled = (int)PosLine.GetValue(startPos);
                 var col = (int)PosChar.GetValue(startPos);
-                var offset = compiled >= bodyStart ? bodyOffset : DefaultUsingLineCount;
-                var line = Math.Max(1, compiled + 1 - offset);
                 var id = (string)DiagId.GetValue(d);
                 var message = (string)CallWithDefaults(DiagMsg, d);
-                errors.Add($"({line},{col + 1}): error {id}: {message}");
+
+                string field;
+                int relLine;
+                if (compiled >= codeStart)
+                {
+                    field = "code";
+                    relLine = compiled - codeStart + 1;
+                }
+                else if (compiled >= classBodyStart)
+                {
+                    field = "class_body";
+                    relLine = Math.Max(1, compiled - classBodyStart + 1);
+                }
+                else if (compiled >= usingsStart)
+                {
+                    field = "usings";
+                    relLine = Math.Max(1, compiled - usingsStart + 1);
+                }
+                else
+                {
+                    field = "(internal)";
+                    relLine = compiled + 1;
+                }
+
+                errors.Add($"{field} ({relLine},{col + 1}): error {id}: {message}");
             }
             return new CompilationResult(string.Join("\n", errors));
         }
@@ -387,28 +432,6 @@ public class __REPL__
         var an = new AssemblyName(name) { Version = new Version(major, minor, build, rev) };
         an.SetPublicKeyToken([0x31, 0xbf, 0x38, 0x56, 0xad, 0x36, 0x4e, 0x35]);
         return an;
-    }
-
-    private static int FindUsingBoundary(string[] lines)
-    {
-        var boundary = 0;
-        for (var i = 0; i < lines.Length; i++)
-        {
-            var trimmed = lines[i].Trim();
-            if (string.IsNullOrWhiteSpace(trimmed) || trimmed.StartsWith("//"))
-                continue;
-            if (!IsUsingDirective(trimmed))
-                return boundary;
-            boundary = i + 1;
-        }
-        return boundary;
-    }
-
-    private static bool IsUsingDirective(string trimmedLine)
-    {
-        var idx = trimmedLine.IndexOf("//", StringComparison.Ordinal);
-        var effective = (idx >= 0 ? trimmedLine.Substring(0, idx) : trimmedLine).TrimEnd();
-        return SimpleUsing.IsMatch(effective) || AliasUsing.IsMatch(effective);
     }
 
     private static object CallWithDefaults(MethodInfo method, object target, params object[] leading) =>
@@ -468,6 +491,18 @@ public class __REPL__
             foreach (var method in type.Methods)
             {
                 if (!method.HasBody) continue;
+
+                // Widen every short-form branch (br.s/leave.s/brfalse.s, ...) to its long
+                // form BEFORE inserting anything. Roslyn packs iterator state machines with
+                // short branches whose 1-byte ±127 offset overflows once our guard calls
+                // bloat the stream — and Cecil does NOT widen an overflowed short branch on
+                // write: it emits a truncated offset that lands mid-instruction →
+                // InvalidProgramException at JIT time. Long forms carry a 4-byte offset that
+                // cannot overflow. (Mono.Cecil.Rocks.SimplifyMacros would do this, but Pulsar
+                // ships Mono.Cecil.dll WITHOUT Mono.Cecil.Rocks.dll, so we hand-roll the only
+                // macro that affects offset encoding — branches. See WidenShortBranches.)
+                WidenShortBranches(method.Body);
+
                 var il = method.Body.GetILProcessor();
 
                 // Snapshot the original IL before we touch handlers. The
@@ -566,6 +601,17 @@ public class __REPL__
 
                     // Backward branch: Bail only. Tight loops don't push frames,
                     // SP unchanged.
+                    //
+                    // Intentional: reading the stale .Offset here is SAFE in this pass.
+                    // Cecil fills Offset once at read and never updates it — but this pass
+                    // only INSERTS instructions (never removes or reorders), and both ins
+                    // and t come from the pre-rewrite snapshot, so their relative order is
+                    // preserved and the stale offsets stay monotonic. We only need "does t
+                    // come before ins?", which a monotonic snapshot answers correctly even
+                    // after SimplifyMacros widened the encodings. If this pass ever starts
+                    // removing or reordering instructions, this assumption breaks SILENTLY
+                    // (no exception, just a wrong verdict) — switch to comparing
+                    // body.Instructions.IndexOf(t) <= IndexOf(ins) at that point.
                     if (ins.Operand is Instruction t && t.Offset <= ins.Offset)
                     {
                         il.InsertBefore(ins, il.Create(OpCodes.Call, bailRef));
@@ -591,5 +637,43 @@ public class __REPL__
         var output = new MemoryStream();
         asm.Write(output);
         return output.ToArray();
+    }
+
+    // Short-form branch opcode → long-form. Mono.Cecil.Rocks.SimplifyMacros would do this
+    // (and widen all the other macros too), but Pulsar ships Mono.Cecil.dll WITHOUT
+    // Mono.Cecil.Rocks.dll — so we widen by hand the only macros whose encoding length
+    // depends on offset distance: branches. Long forms use a 4-byte offset that cannot
+    // overflow no matter how much injection bloats the method, which is the entire point.
+    // The other macros (ldarg.0, ldc.i4.0, ...) are fixed-length and irrelevant here, so we
+    // leave them untouched. We also skip the OptimizeMacros() re-pack: long-form IL is fully
+    // valid, the script assembly is single-use, and a few extra bytes per branch is nothing
+    // (the form is erased at JIT time anyway — RyuJIT picks its own native jump width).
+    private static readonly Dictionary<Code, OpCode> ShortBranchToLong = new()
+    {
+        { Code.Br_S, OpCodes.Br },
+        { Code.Brfalse_S, OpCodes.Brfalse },
+        { Code.Brtrue_S, OpCodes.Brtrue },
+        { Code.Beq_S, OpCodes.Beq },
+        { Code.Bge_S, OpCodes.Bge },
+        { Code.Bgt_S, OpCodes.Bgt },
+        { Code.Ble_S, OpCodes.Ble },
+        { Code.Blt_S, OpCodes.Blt },
+        { Code.Bne_Un_S, OpCodes.Bne_Un },
+        { Code.Bge_Un_S, OpCodes.Bge_Un },
+        { Code.Bgt_Un_S, OpCodes.Bgt_Un },
+        { Code.Ble_Un_S, OpCodes.Ble_Un },
+        { Code.Blt_Un_S, OpCodes.Blt_Un },
+        { Code.Leave_S, OpCodes.Leave }
+    };
+
+    private static void WidenShortBranches(Mono.Cecil.Cil.MethodBody body)
+    {
+        // A branch's Operand is an Instruction reference, untouched by the opcode swap —
+        // Cecil re-encodes the (now 4-byte) offset from that reference at write time.
+        // Swapping OpCode mutates a struct field in place; it doesn't add/remove
+        // instructions, so iterating Instructions while assigning is safe.
+        foreach (var ins in body.Instructions)
+            if (ShortBranchToLong.TryGetValue(ins.OpCode.Code, out var lng))
+                ins.OpCode = lng;
     }
 }

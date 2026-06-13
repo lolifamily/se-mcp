@@ -5,6 +5,7 @@ using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Collections.Concurrent;
+using System.Collections.Generic;
 using VRage.Utils;
 
 namespace ClientPlugin;
@@ -242,6 +243,8 @@ public sealed class McpServer : IDisposable
         var toolName = nameEl.GetString();
 
         string code = null;
+        string classBody = null;
+        List<string> usings = null;
         Executor executor;
         var ignoreSprites = false;
         var isScreenshot = false;
@@ -258,6 +261,37 @@ public sealed class McpServer : IDisposable
                 }
 
                 code = codeEl.GetString();
+
+                // class_body: optional string. JSON null treated as absent, same rule as target.
+                if (args.TryGetProperty("class_body", out var cbEl) && cbEl.ValueKind != JsonValueKind.Null)
+                {
+                    if (cbEl.ValueKind != JsonValueKind.String)
+                    {
+                        await RespondJsonRpcError(ctx, rawId, -32602, "Invalid params: class_body must be a string");
+                        return;
+                    }
+                    classBody = cbEl.GetString();
+                }
+
+                // usings: optional array of strings. Each item is a namespace path (no "using " prefix, no ";").
+                if (args.TryGetProperty("usings", out var uEl) && uEl.ValueKind != JsonValueKind.Null)
+                {
+                    if (uEl.ValueKind != JsonValueKind.Array)
+                    {
+                        await RespondJsonRpcError(ctx, rawId, -32602, "Invalid params: usings must be an array of strings");
+                        return;
+                    }
+                    usings = new List<string>(uEl.GetArrayLength());
+                    foreach (var el in uEl.EnumerateArray())
+                    {
+                        if (el.ValueKind != JsonValueKind.String)
+                        {
+                            await RespondJsonRpcError(ctx, rawId, -32602, "Invalid params: usings items must be strings");
+                            return;
+                        }
+                        usings.Add(el.GetString());
+                    }
+                }
 
                 // target routes to one of the two execution lanes. Default "main" preserves
                 // pre-render-thread behavior. The string never enters WorkItem / Executor —
@@ -324,7 +358,7 @@ public sealed class McpServer : IDisposable
         }
 
         var cancelSource = new CancellationTokenSource();
-        var item = new WorkItem { Code = code, Cancel = cancelSource.Token };
+        var item = new WorkItem { Usings = usings, ClassBody = classBody, Code = code, Cancel = cancelSource.Token };
 
         // MCP requires id uniqueness per session; refuse rather than silently orphan the
         // prior request. The session prefix scopes that uniqueness correctly: official
@@ -387,7 +421,7 @@ public sealed class McpServer : IDisposable
 
     private static string JsonToolsList()
     {
-        return """{"tools":[{"name":"execute_code","description":"Execute C# code inside Space Engineers. Full .NET + game API access. Use Console.WriteLine() for output. Use yield return null to pause until next frame. In multiplayer, requires Admin or Owner promote level. ALWAYS use short type names. Pre-imported namespaces: System.*, VRage.*, VRageMath, Sandbox.*, SpaceEngineers.Game.*. Do NOT write fully qualified names like Sandbox.Game.World.MySession.Static or Sandbox.Game.Entities.MyCubeGrid — write MySession.Static, MyCubeGrid. Extra 'using' directives at the top of your code are supported. Only fall back to fully qualified names on ambiguous type errors.","inputSchema":{"type":"object","properties":{"code":{"type":"string","description":"C# code body. Using directives at the top are supported; no class/method wrapper needed."},"target":{"type":"string","enum":["main","render"],"description":"Execution lane. \"main\" (default) runs in the game's main thread via IPlugin.Update — use this for MyAPIGateway / Session / Grid / Entity access. \"render\" runs in the render thread via a Harmony Postfix on MyRenderThread.RenderFrame — use ONLY to inspect other plugins' Harmony hooks that execute on the render thread (their __instance, captured locals, accumulated fields). Render-target scripts freeze one frame per step (~16ms); use yield return null to split work across frames. MyAPIGateway will assert-throw on render thread."}},"required":["code"]}},{"name":"take_screenshot","description":"Capture the current game frame and return it as an image. Only one screenshot may be in flight at a time.","inputSchema":{"type":"object","properties":{"ignore_sprites":{"type":"boolean","description":"true = capture the 3D scene only, without HUD/GUI overlays. Default false (HUD included)."}}}}]}""";
+        return """{"tools":[{"name":"execute_code","description":"Execute C# in Space Engineers. Full .NET + game API access. Three fields map 1:1 to C# language layers: `code` is the entry method body (statements only), `class_body` holds class-level declarations (methods/fields/nested types/[DllImport]), `usings` adds namespace imports. Pre-imported namespaces: System.*, VRage.*, VRageMath, Sandbox.*, SpaceEngineers.Game.*. ALWAYS use short type names like MySession.Static, MyCubeGrid — do NOT write fully qualified names like Sandbox.Game.World.MySession.Static. Multiplayer requires Admin or Owner promote level. Errors are reported as `<field> (line,col): error CSxxxx: msg` so you know which input field to fix.","inputSchema":{"type":"object","properties":{"code":{"type":"string","description":"Entry method body — STATEMENTS ONLY. Goes inside the wrapper Run() method. Use Console.WriteLine() for output. Use `yield return null` to pause until the next frame. Do NOT put `using` directives or class-level declarations here — use `usings` and `class_body` for those."},"class_body":{"type":"string","description":"OPTIONAL. Class-level declarations spliced into the wrapper class body alongside Run(): methods, fields, properties, nested types, [DllImport] P/Invoke. Use this when you need attributes that cannot go on statements (e.g. [DllImport]). Items declared here are referenced from `code` directly (same class). Most scripts leave this empty."},"usings":{"type":"array","items":{"type":"string"},"description":"OPTIONAL. Extra namespace imports beyond the defaults. Each item is a bare namespace path like \"System.Runtime.InteropServices\", an alias like \"IO = System.IO\", or \"static System.Math\". Do NOT include the `using` keyword or trailing semicolon — they are added automatically."},"target":{"type":"string","enum":["main","render"],"description":"Execution lane. \"main\" (default) runs in the game's main thread via IPlugin.Update — use this for MyAPIGateway / Session / Grid / Entity access. \"render\" runs in the render thread via a Harmony Postfix on MyRenderThread.RenderFrame — use ONLY to inspect other plugins' Harmony hooks that execute on the render thread (their __instance, captured locals, accumulated fields). Render-target scripts freeze one frame per step (~16ms); use yield return null to split work across frames. MyAPIGateway will assert-throw on render thread."}},"required":["code"]}},{"name":"take_screenshot","description":"Capture the current game frame and return it as an image. Only one screenshot may be in flight at a time.","inputSchema":{"type":"object","properties":{"ignore_sprites":{"type":"boolean","description":"true = capture the 3D scene only, without HUD/GUI overlays. Default false (HUD included)."}}}}]}""";
     }
 
     private static string JsonToolResult(string text, bool isError)

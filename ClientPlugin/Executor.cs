@@ -14,6 +14,8 @@ namespace ClientPlugin;
 
 public sealed class WorkItem
 {
+    public IReadOnlyList<string> Usings;
+    public string ClassBody;
     public string Code;
 
     // RunContinuationsAsynchronously is load-bearing: TrySetResult is called from
@@ -95,7 +97,7 @@ public sealed class Executor(
         {
             try
             {
-                var result = compiler.Compile(item.Code);
+                var result = compiler.Compile(item.Usings, item.ClassBody, item.Code);
                 compiled.Enqueue((item, result));
             }
             catch (Exception ex)
