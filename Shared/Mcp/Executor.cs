@@ -5,12 +5,9 @@ using System.Reflection;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Collections.Generic;
-using Sandbox.ModAPI;
-using VRage.Game;
-using VRage.Game.ModAPI;
-using VRage.Utils;
+using Shared.Plugin;
 
-namespace ClientPlugin;
+namespace Shared.Mcp;
 
 public sealed class WorkItem
 {
@@ -38,11 +35,18 @@ public sealed class WorkItem
 // StackBase field from this Executor's Tick thread (lambda body is `stsfld`, hits the
 // calling thread's slot — so the reset lands on the same slot the script's StackCheck
 // will later read).
+//
+// denialMessage: the user-facing reject text (Shared holds no SE business strings).
+// The denial gate itself lives on IPluginConfig.Denied — the owning Plugin.Update
+// refreshes it on the main thread once per frame (client checks SE Admin/Owner
+// level; server never writes, stays false). Executor reads Common.Config.Denied
+// directly; bool reads are atomic and one frame of staleness is fine.
 public sealed class Executor(
     MethodInfo guardBail, MethodInfo guardStackCheck, FieldInfo guardDead,
-    Action<bool> setDead, Action<long> resetStackBase, int frameTimeoutMs) : IDisposable
+    Action<bool> setDead, Action<long> resetStackBase,
+    string denialMessage,
+    int frameTimeoutMs) : IDisposable
 {
-    private const string DenialMessage = "Multiplayer non-admin: code execution is disabled. You must be Admin or Owner to use SeMcp in multiplayer.";
     private const string ShutdownMessage = "[server shutting down]";
 
     public volatile bool Initialized;
@@ -52,7 +56,6 @@ public sealed class Executor(
     private readonly List<ActiveScript> active = [];
     private readonly ConcurrentDictionary<WorkItem, byte> inflight = new();
     private int epoch;
-    private volatile bool denied;
     private volatile bool disposed;
 
     public void Initialize()
@@ -79,8 +82,8 @@ public sealed class Executor(
         if (item.Cancel.IsCancellationRequested)
         { CompleteItem(item, cancelled: true); return; }
 
-        if (denied)
-        { CompleteItem(item, error: DenialMessage); return; }
+        if (Common.Config.Denied)
+        { CompleteItem(item, error: denialMessage); return; }
 
         inflight[item] = 0;
 
@@ -123,9 +126,9 @@ public sealed class Executor(
             foreach (var s in active)
             {
                 try { s.Coroutine?.Dispose(); }
-                catch (Exception ex) { MyLog.Default.Warning($"SeMcp: coroutine dispose failed: {ex.Message}"); }
+                catch (Exception ex) { Common.Logger.Warning($"coroutine dispose failed: {ex.Message}"); }
                 try { s.Writer?.Dispose(); }
-                catch (Exception ex) { MyLog.Default.Warning($"SeMcp: writer dispose failed: {ex.Message}"); }
+                catch (Exception ex) { Common.Logger.Warning($"writer dispose failed: {ex.Message}"); }
             }
             active.Clear();
             return;
@@ -133,13 +136,6 @@ public sealed class Executor(
 
         while (compiled.TryDequeue(out var pair))
             Start(pair.Item, pair.Result);
-
-        // denied must refresh BEFORE the idle exit below: Enqueue's fast-reject
-        // reads it, and a denied-then-idle executor would otherwise never run a
-        // script again — nothing reaches `active`, every Tick exits early, and
-        // the stale true sticks forever (even back in single player). Two
-        // property reads, no allocation; fine to do every frame.
-        denied = IsDenied();
 
         // Idle fast path. Everything below exists to police running scripts;
         // with none, arming the deadline timer would just allocate a closure +
@@ -167,6 +163,11 @@ public sealed class Executor(
             if (Volatile.Read(ref epoch) == myEpoch) setDead(true);
         });
 
+        // Local snapshot for the for-loop: one IPluginConfig dispatch instead of N.
+        // Stale across the loop is fine — at worst one frame of running scripts gets
+        // through before next Tick aborts them.
+        var denied = Common.Config.Denied;
+
         for (var i = active.Count - 1; i >= 0; i--)
         {
             var s = active[i];
@@ -180,7 +181,7 @@ public sealed class Executor(
 
             if (denied)
             {
-                Complete(s, error: DenialMessage);
+                Complete(s, error: denialMessage);
                 active.RemoveAt(i);
                 continue;
             }
@@ -204,14 +205,6 @@ public sealed class Executor(
                 active.RemoveAt(i);
             }
         }
-    }
-
-    private static bool IsDenied()
-    {
-        var session = MyAPIGateway.Session;
-        if (session == null || session.OnlineMode == MyOnlineModeEnum.OFFLINE)
-            return false;
-        return session.PromoteLevel < MyPromoteLevel.Admin;
     }
 
     private void Start(WorkItem item, CompilationResult result)

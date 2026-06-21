@@ -23,31 +23,31 @@ if not exist "%SRCFILE%" (
 )
 
 REM Route by target framework:
-REM   net4x  (.NET Framework) -> Pulsar\Legacy\Local
-REM   others (.NET 5+)        -> Pulsar\Interim\Local (only if Pulsar\Interim exists)
-set "PULSAR=%AppData%\Pulsar"
+REM   net4x  (.NET Framework) -> Magnetar\Legacy\Local
+REM   others (.NET 5+)        -> Magnetar\Interim\Local (only if Magnetar\Interim exists)
+set "MAGNETAR=%AppData%\Magnetar"
 set "EDITION=Interim"
 echo(%TFM% | findstr /b /i "net4" >nul && set "EDITION=Legacy"
 if "%TFM%"=="" set "EDITION=Legacy"
 
 if /i "%EDITION%"=="Interim" (
-    REM Only deploy the .NET build when the Interim Pulsar edition is installed
-    if not exist "%PULSAR%\Interim" (
-        echo Pulsar Interim not installed, skipping %TFM% deploy: %PULSAR%\Interim
+    REM Only deploy the .NET build when the Interim Magnetar edition is installed
+    if not exist "%MAGNETAR%\Interim" (
+        echo Magnetar Interim not installed, skipping %TFM% deploy: %MAGNETAR%\Interim
         exit /b 0
     )
-    set "PLUGIN_DIR=%PULSAR%\Interim\Local"
+    set "PLUGIN_DIR=%MAGNETAR%\Interim\Local"
     if not exist "!PLUGIN_DIR!" mkdir "!PLUGIN_DIR!"
 ) else (
-    set "PLUGIN_DIR=%PULSAR%\Legacy\Local"
+    set "PLUGIN_DIR=%MAGNETAR%\Legacy\Local"
     if not exist "!PLUGIN_DIR!" (
         echo Missing Local plugin folder: !PLUGIN_DIR!
-        echo Pulsar not installed?
+        echo Magnetar not installed?
         exit /b 2
     )
 )
 
-REM Copy the plugin into the plugin directory, retrying if it is locked by a running game
+REM Copy the plugin into the plugin directory, retrying if it is locked by a running server
 echo Copying "%SRCFILE%" to "!PLUGIN_DIR!\"
 
 for /l %%i in (1, 1, 10) do (

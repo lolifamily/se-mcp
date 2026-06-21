@@ -1,32 +1,49 @@
 using System;
 using System.IO;
 using System.Net;
+using System.Text;
 using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
-using VRage.Utils;
+using Shared.Config;
+using Shared.Plugin;
 
-namespace ClientPlugin;
+namespace Shared.Mcp;
 
 public sealed class McpServer : IDisposable
 {
     private const int MaxPortRetries = 10;
 
-    private static readonly System.Text.Encoding Utf8NoBom = new System.Text.UTF8Encoding(false);
+    private static readonly Encoding Utf8NoBom = new UTF8Encoding(false);
 
-    private readonly Executor mainExec;
-    private readonly Executor renderExec;
+    private readonly IPluginConfig config;
+    private readonly Dictionary<string, ITool> tools;
+    // Pre-rendered {"tools":[...]} body. Tools are immutable after McpServer
+    // construction; building once at startup beats walking the list every
+    // tools/list call.
+    private readonly string toolsListJson;
     private readonly int basePort;
     private HttpListener listener;
     private readonly ConcurrentDictionary<string, CancellationTokenSource> pending = new();
 
-    public McpServer(Executor mainExec, Executor renderExec, string port)
+    public McpServer(IReadOnlyList<ITool> tools, IPluginConfig config)
     {
-        this.mainExec = mainExec;
-        this.renderExec = renderExec;
-        basePort = int.TryParse(port, out var p) ? p : 9876;
+        this.config = config;
+        this.tools = new Dictionary<string, ITool>(tools.Count);
+        var sb = new StringBuilder("""{"tools":[""");
+        for (var i = 0; i < tools.Count; i++)
+        {
+            var t = tools[i];
+            this.tools[t.Name] = t;
+            if (i > 0) sb.Append(',');
+            sb.Append(t.SchemaJson);
+        }
+        sb.Append("]}");
+        toolsListJson = sb.ToString();
+
+        basePort = int.TryParse(config.Port, out var p) ? p : 9876;
     }
 
     public void Start()
@@ -39,27 +56,27 @@ public sealed class McpServer : IDisposable
                 listener = new HttpListener();
                 listener.Prefixes.Add($"http://localhost:{port}/");
                 listener.Start();
-                Config.Current.BoundPort = port;
+                config.BoundPort = port;
                 Task.Run(ListenLoop);
-                MyLog.Default.WriteLine($"SeMcp: listening on :{port}");
+                Common.Logger.Info($"listening on :{port}");
                 return;
             }
             catch (HttpListenerException)
             {
-                MyLog.Default.Warning($"SeMcp: port {port} in use, trying next");
+                Common.Logger.Warning($"port {port} in use, trying next");
                 // ReSharper disable once EmptyGeneralCatchClause
                 try { listener.Close(); } catch { }
             }
             catch (Exception ex)
             {
-                Config.Current.Error = ex.Message;
-                MyLog.Default.Error($"SeMcp: {ex.Message}");
+                config.Error = ex.Message;
+                Common.Logger.Error(ex.Message);
                 return;
             }
         }
 
-        Config.Current.Error = $"ports {basePort}-{basePort + MaxPortRetries - 1} all in use";
-        MyLog.Default.Error($"SeMcp: {Config.Current.Error}");
+        config.Error = $"ports {basePort}-{basePort + MaxPortRetries - 1} all in use";
+        Common.Logger.Error(config.Error);
     }
 
     public void Dispose()
@@ -70,7 +87,7 @@ public sealed class McpServer : IDisposable
         }
         catch (Exception ex)
         {
-            MyLog.Default.Error($"SeMcp: error stopping listener: {ex.Message}");
+            Common.Logger.Error($"error stopping listener: {ex.Message}");
         }
     }
 
@@ -87,7 +104,7 @@ public sealed class McpServer : IDisposable
             catch (HttpListenerException) { break; }
             catch (Exception ex)
             {
-                MyLog.Default.Error($"SeMcp: listener error: {ex.Message}");
+                Common.Logger.Error($"listener error: {ex.Message}");
             }
         }
     }
@@ -111,7 +128,7 @@ public sealed class McpServer : IDisposable
             }
 
             // Managed server don't always check host
-            if (ctx.Request.Headers["Host"] != $"localhost:{Config.Current.BoundPort}")
+            if (ctx.Request.Headers["Host"] != $"localhost:{config.BoundPort}")
             {
                 await Respond(ctx, 403, "Forbidden: invalid host");
                 return;
@@ -127,7 +144,7 @@ public sealed class McpServer : IDisposable
             }
 
             var bearer = h?.StartsWith("Bearer ", StringComparison.Ordinal) == true ? h.Substring(7) : null;
-            if (!ConstantTimeEquals(bearer ?? q, Config.Current.SecretKey))
+            if (!ConstantTimeEquals(bearer ?? q, config.SecretKey))
             {
                 await Respond(ctx, 401, "Unauthorized");
                 return;
@@ -191,7 +208,7 @@ public sealed class McpServer : IDisposable
                     // Mint a fresh session id on every initialize; spec-compliant clients
                     // MUST echo it on all subsequent requests. Headers must be set before
                     // the body write below.
-                    ctx.Response.AddHeader("Mcp-Session-Id", Config.GenerateToken());
+                    ctx.Response.AddHeader("Mcp-Session-Id", TokenGenerator.Generate());
                     await RespondJsonRpc(ctx, rawId, JsonInitResult());
                     break;
 
@@ -201,7 +218,7 @@ public sealed class McpServer : IDisposable
                     break;
 
                 case "tools/list":
-                    await RespondJsonRpc(ctx, rawId, JsonToolsList());
+                    await RespondJsonRpc(ctx, rawId, toolsListJson);
                     break;
 
                 case "tools/call":
@@ -224,7 +241,7 @@ public sealed class McpServer : IDisposable
         }
         catch (Exception ex)
         {
-            MyLog.Default.Error($"SeMcp: request error: {ex}");
+            Common.Logger.Error(ex, "request error");
             await RespondJsonRpcError(ctx, rawId, -32603, "Internal error");
         }
     }
@@ -241,124 +258,27 @@ public sealed class McpServer : IDisposable
         }
 
         var toolName = nameEl.GetString();
-
-        string code = null;
-        string classBody = null;
-        List<string> usings = null;
-        Executor executor;
-        var ignoreSprites = false;
-        var isScreenshot = false;
-
-        switch (toolName)
+        if (toolName == null || !tools.TryGetValue(toolName, out var tool))
         {
-            case "execute_code":
-            {
-                if (!p.TryGetProperty("arguments", out var args) || args.ValueKind != JsonValueKind.Object
-                    || !args.TryGetProperty("code", out var codeEl) || codeEl.ValueKind != JsonValueKind.String)
-                {
-                    await RespondJsonRpcError(ctx, rawId, -32602, "Invalid params: arguments.code must be a string");
-                    return;
-                }
-
-                code = codeEl.GetString();
-
-                // class_body: optional string. JSON null treated as absent, same rule as target.
-                if (args.TryGetProperty("class_body", out var cbEl) && cbEl.ValueKind != JsonValueKind.Null)
-                {
-                    if (cbEl.ValueKind != JsonValueKind.String)
-                    {
-                        await RespondJsonRpcError(ctx, rawId, -32602, "Invalid params: class_body must be a string");
-                        return;
-                    }
-                    classBody = cbEl.GetString();
-                }
-
-                // usings: optional array of strings. Each item is a namespace path (no "using " prefix, no ";").
-                if (args.TryGetProperty("usings", out var uEl) && uEl.ValueKind != JsonValueKind.Null)
-                {
-                    if (uEl.ValueKind != JsonValueKind.Array)
-                    {
-                        await RespondJsonRpcError(ctx, rawId, -32602, "Invalid params: usings must be an array of strings");
-                        return;
-                    }
-                    usings = new List<string>(uEl.GetArrayLength());
-                    foreach (var el in uEl.EnumerateArray())
-                    {
-                        if (el.ValueKind != JsonValueKind.String)
-                        {
-                            await RespondJsonRpcError(ctx, rawId, -32602, "Invalid params: usings items must be strings");
-                            return;
-                        }
-                        usings.Add(el.GetString());
-                    }
-                }
-
-                // target routes to one of the two execution lanes. Default "main" preserves
-                // pre-render-thread behavior. The string never enters WorkItem / Executor —
-                // it's resolved to a concrete Executor instance here and discarded.
-                // JSON null is treated as absent; any other non-string shape is rejected
-                // rather than silently falling back to "main".
-                string target = null;
-                if (args.TryGetProperty("target", out var tEl) && tEl.ValueKind != JsonValueKind.Null)
-                {
-                    if (tEl.ValueKind != JsonValueKind.String)
-                    {
-                        await RespondJsonRpcError(ctx, rawId, -32602, "Invalid params: target must be a string");
-                        return;
-                    }
-                    target = tEl.GetString();
-                }
-
-                executor = target switch
-                {
-                    null or "" or "main" => mainExec,
-                    "render" => renderExec,
-                    _ => null
-                };
-                if (executor == null)
-                {
-                    await RespondJsonRpcError(ctx, rawId, -32602,
-                        $"Invalid params: target must be \"main\" or \"render\" (got \"{target}\")");
-                    return;
-                }
-                break;
-            }
-
-            case "take_screenshot":
-                // Absent arguments / absent flag / JSON null stay lenient (the
-                // default: HUD included). A present ignore_sprites of any other
-                // shape is rejected — same rule as target above, no silent
-                // fallback. The executor is only borrowed for the Initialized
-                // gate below; ScreenshotService issues from Plugin.Update.
-                if (p.TryGetProperty("arguments", out var sArgs) && sArgs.ValueKind == JsonValueKind.Object
-                    && sArgs.TryGetProperty("ignore_sprites", out var sEl) && sEl.ValueKind != JsonValueKind.Null)
-                {
-                    if (sEl.ValueKind != JsonValueKind.True && sEl.ValueKind != JsonValueKind.False)
-                    {
-                        await RespondJsonRpcError(ctx, rawId, -32602,
-                            "Invalid params: ignore_sprites must be a boolean");
-                        return;
-                    }
-                    ignoreSprites = sEl.ValueKind == JsonValueKind.True;
-                }
-                executor = mainExec;
-                isScreenshot = true;
-                break;
-
-            default:
-                await RespondJsonRpcError(ctx, rawId, -32602, $"Unknown tool: {toolName}");
-                return;
-        }
-
-        if (!executor.Initialized)
-        {
-            await RespondJsonRpcError(ctx, rawId, -32002,
-                "Game is still loading, not all plugins have been initialized yet. Please retry shortly.");
+            await RespondJsonRpcError(ctx, rawId, -32602, $"Unknown tool: {toolName}");
             return;
         }
 
+        // arguments may be absent (empty-arg tools); pass a default {} so TryDispatch
+        // can use the same lookups on every code path. ValueKind == Undefined when
+        // the property is absent — Json shows it as `default(JsonElement)`.
+        var hasArgs = p.TryGetProperty("arguments", out var args);
+        if (!hasArgs) args = default;
+
         var cancelSource = new CancellationTokenSource();
-        var item = new WorkItem { Usings = usings, ClassBody = classBody, Code = code, Cancel = cancelSource.Token };
+        var item = new WorkItem { Cancel = cancelSource.Token };
+
+        if (!tool.TryDispatch(args, item, out var errorCode, out var error))
+        {
+            cancelSource.Dispose();
+            await RespondJsonRpcError(ctx, rawId, errorCode, error);
+            return;
+        }
 
         // MCP requires id uniqueness per session; refuse rather than silently orphan the
         // prior request. The session prefix scopes that uniqueness correctly: official
@@ -373,11 +293,6 @@ public sealed class McpServer : IDisposable
             return;
         }
 
-        if (isScreenshot)
-            ScreenshotService.Begin(item, ignoreSprites);
-        else
-            executor.Enqueue(item);
-
         await item.Done.Task;
         pending.TryRemove(pendingKey, out _);
         cancelSource.Dispose();
@@ -391,12 +306,12 @@ public sealed class McpServer : IDisposable
             : item.Error != null
                 ? $"{item.Output}\n\n{item.Error}"
                 : item.Output;
-        var resultJson = isScreenshot && !isError
+        var resultJson = tool.ReturnsImage && !isError
             ? JsonToolResultImage(File.ReadAllBytes(item.Output), item.Output)
             : JsonToolResult(text.Trim(), isError);
 
         try { await RespondJsonRpc(ctx, rawId, resultJson); }
-        catch (Exception ex) { MyLog.Default.Warning($"SeMcp: response flush failed (listener likely closed): {ex.Message}"); }
+        catch (Exception ex) { Common.Logger.Warning($"response flush failed (listener likely closed): {ex.Message}"); }
     }
 
     private void HandleCancel(JsonElement root, string sessionId)
@@ -417,11 +332,6 @@ public sealed class McpServer : IDisposable
     private static string JsonInitResult()
     {
         return """{"protocolVersion":"2025-03-26","capabilities":{"tools":{}},"serverInfo":{"name":"SeMcp","version":"1.0.0"}}""";
-    }
-
-    private static string JsonToolsList()
-    {
-        return """{"tools":[{"name":"execute_code","description":"Execute C# in Space Engineers. Full .NET + game API access. Three fields map 1:1 to C# language layers: `code` is the entry method body (statements only), `class_body` holds class-level declarations (methods/fields/nested types/[DllImport]), `usings` adds namespace imports. Pre-imported namespaces: System.*, VRage.*, VRageMath, Sandbox.*, SpaceEngineers.Game.*. ALWAYS use short type names like MySession.Static, MyCubeGrid — do NOT write fully qualified names like Sandbox.Game.World.MySession.Static. Multiplayer requires Admin or Owner promote level. Errors are reported as `<field> (line,col): error CSxxxx: msg` so you know which input field to fix.","inputSchema":{"type":"object","properties":{"code":{"type":"string","description":"Entry method body — STATEMENTS ONLY. Goes inside the wrapper Run() method. Use Console.WriteLine() for output. Use `yield return null` to pause until the next frame. Do NOT put `using` directives or class-level declarations here — use `usings` and `class_body` for those."},"class_body":{"type":"string","description":"OPTIONAL. Class-level declarations spliced into the wrapper class body alongside Run(): methods, fields, properties, nested types, [DllImport] P/Invoke. Use this when you need attributes that cannot go on statements (e.g. [DllImport]). Items declared here are referenced from `code` directly (same class). Most scripts leave this empty."},"usings":{"type":"array","items":{"type":"string"},"description":"OPTIONAL. Extra namespace imports beyond the defaults. Each item is a bare namespace path like \"System.Runtime.InteropServices\", an alias like \"IO = System.IO\", or \"static System.Math\". Do NOT include the `using` keyword or trailing semicolon — they are added automatically."},"target":{"type":"string","enum":["main","render"],"description":"Execution lane. \"main\" (default) runs in the game's main thread via IPlugin.Update — use this for MyAPIGateway / Session / Grid / Entity access. \"render\" runs in the render thread via a Harmony Postfix on MyRenderThread.RenderFrame — use ONLY to inspect other plugins' Harmony hooks that execute on the render thread (their __instance, captured locals, accumulated fields). Render-target scripts freeze one frame per step (~16ms); use yield return null to split work across frames. MyAPIGateway will assert-throw on render thread."}},"required":["code"]}},{"name":"take_screenshot","description":"Capture the current game frame and return it as an image. Only one screenshot may be in flight at a time.","inputSchema":{"type":"object","properties":{"ignore_sprites":{"type":"boolean","description":"true = capture the 3D scene only, without HUD/GUI overlays. Default false (HUD included)."}}}}]}""";
     }
 
     private static string JsonToolResult(string text, bool isError)

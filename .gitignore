@@ -358,11 +358,14 @@ MigrationBackup/
 /Bin64/
 /Torch/
 
-# JetBrains Rider
+# JetBrains Rider project files
 /.idea/
-/.run/
 
 # Claude Code
 .claude
 
+# Local config copied from Directory.Build.props.template by setup.py
+/Directory.Build.props
+
 # Plugin specific
+*.il

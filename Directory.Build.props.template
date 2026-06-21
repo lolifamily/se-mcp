@@ -6,22 +6,22 @@
         <!-- Folder containing SpaceEngineers.exe.
              Fill the path between the tags to override; leave empty to use the
              platform-specific auto-detection below. -->
-        <Bin64>D:\Program Files (x86)\Steam\steamapps\common\SpaceEngineers\Bin64</Bin64>
+        <Bin64></Bin64>
 
         <!-- Folder containing the Pulsar installation (the directory that holds
              Libraries/Legacy/PluginSdk.dll). Fill the path between the tags to override;
              leave empty to use the platform-specific auto-detection below. -->
-        <Pulsar />
+        <Pulsar></Pulsar>
 
         <!-- Folder containing the Magnetar installation (the directory that holds
              Bin/PluginSdk.dll). Fill the path between the tags to override; leave
              empty to use the platform-specific auto-detection below. -->
-        <Magnetar />
+        <Magnetar></Magnetar>
 
         <!-- Folder containing SpaceEngineersDedicated.exe.
              Fill the path between the tags to override; leave empty to use the
              platform-specific auto-detection below. -->
-        <Dedicated64>D:\Program Files (x86)\Steam\steamapps\common\SpaceEngineersDedicatedServer\DedicatedServer64</Dedicated64>
+        <Dedicated64></Dedicated64>
     </PropertyGroup>
 
     <!-- User home, resolved once for the Linux auto-detection below -->

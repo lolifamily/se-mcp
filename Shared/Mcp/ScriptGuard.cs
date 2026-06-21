@@ -2,7 +2,7 @@ using System;
 using System.Reflection;
 using System.Runtime.CompilerServices;
 
-namespace ClientPlugin;
+namespace Shared.Mcp;
 
 public class ScriptTimeoutException()
     : Exception("Script killed: 1s/frame budget exhausted");

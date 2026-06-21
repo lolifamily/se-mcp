@@ -8,9 +8,9 @@ using System.Reflection;
 using System.Threading;
 using Mono.Cecil;
 using Mono.Cecil.Cil;
-using VRage.Utils;
+using Shared.Plugin;
 
-namespace ClientPlugin;
+namespace Shared.Mcp;
 
 public sealed class CompilationResult
 {
@@ -216,7 +216,7 @@ public class __REPL__
         // allowUnsafe via the With API rather than a ctor argument: the ctor's
         // optional-parameter list shifts across Roslyn versions, while
         // WithAllowUnsafe(bool) is the same single overload on both load paths
-        // (game 2.9 and NuGet 4.12).
+        // (game 2.9 and NuGet 5.0).
         var withAllowUnsafe = compOptsType.GetMethod("WithAllowUnsafe", [typeof(bool)])
             ?? throw new MissingMethodException(compOptsType.FullName, "WithAllowUnsafe");
         CompileOptions = withAllowUnsafe.Invoke(baseOptions, [true]);
@@ -281,7 +281,7 @@ public class __REPL__
             if (string.IsNullOrEmpty(loc)) continue;
             if (Path.GetFileName(loc) == "VRage.Native.dll") continue;
             try { SharedReferences.Add(CallWithDefaults(CreateFromFile, null, loc)); }
-            catch (Exception ex) { MyLog.Default.WriteLine($"SeMcp: failed reference {name}: {ex.Message}"); }
+            catch (Exception ex) { Common.Logger.Info($"failed reference {name}: {ex.Message}"); }
         }
 
         foreach (var (name, (asm, _)) in loadFile)
@@ -293,7 +293,7 @@ public class __REPL__
                 SharedReferences.Add(CallWithDefaults(CreateFromFile, null, loc));
                 SharedResolveMap[name] = asm;
             }
-            catch (Exception ex) { MyLog.Default.WriteLine($"SeMcp: failed LoadFile reference {name}: {ex.Message}"); }
+            catch (Exception ex) { Common.Logger.Info($"failed LoadFile reference {name}: {ex.Message}"); }
         }
 
         _sharedHandler = (_, args) =>
@@ -305,7 +305,7 @@ public class __REPL__
         };
         AppDomain.CurrentDomain.AssemblyResolve += _sharedHandler;
 
-        MyLog.Default.WriteLine($"SeMcp: {SharedReferences.Count} references collected ({SharedResolveMap.Count} LoadFile)");
+        Common.Logger.Info($"{SharedReferences.Count} references collected ({SharedResolveMap.Count} LoadFile)");
     }
 
     public static void ReleaseShared()
@@ -409,17 +409,28 @@ public class __REPL__
         return new CompilationResult(Assembly.Load(raw));
     }
 
+    // Strong-name MUST match what the per-plugin AssemblyResolver hands back. Pulsar/
+    // Magnetar declare Microsoft.CodeAnalysis.CSharp 5.0.0 in the plugin manifest, the
+    // resolver loads that into LibDir, and .NET Framework's CLR strictly enforces
+    // strong-name equality on AssemblyResolve returns (dotnet/runtime#101029) —
+    // requesting (4,12,0,0) here would let the resolver hand back its 5.0.0 dll, the
+    // CLR would reject it on the version mismatch with FileLoadException, we'd fall
+    // into the catch, and the short-name Assembly.Load fallback would hit whatever's
+    // already loaded in the default context — which on SE is the game's ancient
+    // Bin64 Roslyn (C# 7.x era). Microsoft Learn is explicit: already-loaded
+    // instances bind BEFORE the resolver. So pin to (5,0,0,0) to guarantee the
+    // resolver's 5.0.0 dll is what CLR accepts.
     private static (Assembly csharp, Assembly common) LoadRoslyn()
     {
         try
         {
-            var csharp = Assembly.Load(MakeAssemblyName("Microsoft.CodeAnalysis.CSharp", 4, 12, 0, 0));
-            var common = Assembly.Load(MakeAssemblyName("Microsoft.CodeAnalysis", 4, 12, 0, 0));
+            var csharp = Assembly.Load(MakeAssemblyName("Microsoft.CodeAnalysis.CSharp", 5, 0, 0, 0));
+            var common = Assembly.Load(MakeAssemblyName("Microsoft.CodeAnalysis", 5, 0, 0, 0));
             return (csharp, common);
         }
         catch (Exception ex)
         {
-            MyLog.Default.WriteLine($"SeMcp: NuGet Roslyn unavailable ({ex.GetType().Name}), using game Roslyn");
+            Common.Logger.Warning($"NuGet Roslyn unavailable ({ex.GetType().Name}), using game Roslyn");
         }
 
         return (
