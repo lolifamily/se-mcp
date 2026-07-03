@@ -346,5 +346,6 @@
     <PostBuildEvent>sh "$(MSBuildProjectDirectory)/Deploy.sh" "$(AssemblyName).dll" "$(MSBuildProjectDirectory)/$(OutputPath.Replace('\','/'))$(TargetFramework)" "$(TargetFramework)"</PostBuildEvent>
   </PropertyGroup>
 
-  <Import Project="..\Shared\Shared.projitems" Label="Shared" />
+  <Import Project="..\Shared\Core\Shared.Core.projitems" Label="Shared" />
+  <Import Project="..\Shared\Se1\Shared.Se1.projitems" Label="Shared" />
 </Project>

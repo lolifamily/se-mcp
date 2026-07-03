@@ -13,6 +13,7 @@ using Shared.Logging;
 using Shared.Mcp;
 using Shared.Patches;
 using Shared.Plugin;
+using Shared.Se1;
 using VRage.FileSystem;
 using VRage.Game;
 using VRage.Game.ModAPI;
@@ -143,7 +144,8 @@ public class Plugin : IPlugin, ICommonPlugin
             v => ScriptGuardMain.Dead = v,
             sp => ScriptGuardMain.StackBase = sp,
             DenialMessage,
-            frameTimeoutMs: 1000);
+            frameTimeoutMs: 1000,
+            defaultUsings: ScriptDefaults.Usings);
 
         RenderExecutor = new Executor(
             ScriptGuardRender.BailMethod,
@@ -152,7 +154,8 @@ public class Plugin : IPlugin, ICommonPlugin
             v => ScriptGuardRender.Dead = v,
             sp => ScriptGuardRender.StackBase = sp,
             DenialMessage,
-            frameTimeoutMs: 1000);
+            frameTimeoutMs: 1000,
+            defaultUsings: ScriptDefaults.Usings);
 
         var tools = new ITool[]
         {

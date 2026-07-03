@@ -45,13 +45,14 @@ public sealed class Executor(
     MethodInfo guardBail, MethodInfo guardStackCheck, FieldInfo guardDead,
     Action<bool> setDead, Action<long> resetStackBase,
     string denialMessage,
-    int frameTimeoutMs) : IDisposable
+    int frameTimeoutMs,
+    string defaultUsings) : IDisposable
 {
     private const string ShutdownMessage = "[server shutting down]";
 
     public volatile bool Initialized;
 
-    private readonly Compiler compiler = new(guardBail, guardStackCheck, guardDead);
+    private readonly Compiler compiler = new(guardBail, guardStackCheck, guardDead, defaultUsings);
     private readonly ConcurrentQueue<(WorkItem Item, CompilationResult Result)> compiled = new();
     private readonly List<ActiveScript> active = [];
     private readonly ConcurrentDictionary<WorkItem, byte> inflight = new();

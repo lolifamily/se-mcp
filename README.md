@@ -3,7 +3,7 @@
 Turn a running **Space Engineers** game — or a dedicated server — into an
 [MCP](https://modelcontextprotocol.io) server. An LLM connects over local HTTP
 and executes **C# directly inside the live engine**, with full .NET and game API
-access.
+access — right down to `internal` types and members.
 
 ---
 
@@ -125,8 +125,11 @@ public class __REPL__
 - A large set of namespaces (`System.*`, `VRageMath`, `VRage.*`, `Sandbox.*`,
   `SpaceEngineers.Game.*`, …) is **pre-imported**. Use short type names
   (`MySession.Static`, `MyCubeGrid`), not fully-qualified ones.
-- Compiled with **Roslyn 5.0** against **every loaded assembly** (.NET + game +
-  other plugins). `unsafe` and `[DllImport]` are allowed.
+- Compiled with **Roslyn 5.3** against **every loaded assembly** (.NET + game +
+  other plugins), with **ignore-accessibility** turned on: `internal` classes,
+  methods, fields and properties are callable **directly, no reflection** — this
+  works across the game's own assemblies *and* other loaded plugins (only truly
+  `private` members still need reflection). `unsafe` and `[DllImport]` are allowed.
 - Compile errors come back per field with corrected line numbers:
   `code (3,9): error CS0103: ...`.
 - Scripts are coroutines and **run in parallel**; each step is bounded by the
@@ -202,8 +205,13 @@ For anyone reading or extending the code:
   its own executor and `ScriptGuard`, so finally-blocks and thread-affine state
   stay on the right thread.
 - **`Compiler`** — drives Roslyn entirely through **reflection** (no compile-time
-  binding, so it works against both the game's ancient Roslyn and the NuGet 5.0
-  one), references every loaded assembly, then rewrites the emitted IL with
+  binding, so it works against both the game's ancient Roslyn and the NuGet 5.3
+  one), references every loaded assembly, and enables **ignore-accessibility** so
+  scripts can reach `internal` members: `MetadataImportOptions.Internal` +
+  `BinderFlags.IgnoreAccessibility` at compile time, plus an injected
+  `[assembly: IgnoresAccessChecksTo]` per referenced assembly at runtime (its
+  attribute is self-declared — source wins over the copies Harmony and other
+  plugins ship, so no ambiguity). It then rewrites the emitted IL with
   **Mono.Cecil** to inject the guard.
 - **`ScriptGuard`** — injected `Bail()` on backward branches and `catch`→filter
   rewrites (so a `catch` can't swallow the abort), plus a stack-depth `StackCheck`

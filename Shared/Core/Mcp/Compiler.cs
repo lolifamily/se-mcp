@@ -31,7 +31,7 @@ public sealed class CompilationResult
     }
 }
 
-public sealed class Compiler(MethodInfo guardBail, MethodInfo guardStackCheck, FieldInfo guardDead)
+public sealed class Compiler(MethodInfo guardBail, MethodInfo guardStackCheck, FieldInfo guardDead, string defaultUsings)
 {
     private static int _counter;
 
@@ -72,74 +72,11 @@ public sealed class Compiler(MethodInfo guardBail, MethodInfo guardStackCheck, F
     // ScriptGuard{Main,Render}'s Bail/StackCheck/Dead are the only thing that
     // differs between the two Compiler instances.
 
-    private const string DefaultUsings = """
-using System;
-using System.Collections;
-using System.Collections.Generic;
-using System.Collections.Concurrent;
-using System.Collections.Immutable;
-using System.Globalization;
-using System.IO;
-using System.Linq;
-using System.Text;
-using System.Text.RegularExpressions;
-using System.Reflection;
-using VRageMath;
-using VRage;
-using VRage.Utils;
-using VRage.Collections;
-using VRage.Library.Utils;
-using VRage.ObjectBuilders;
-using VRage.ModAPI;
-using VRage.Voxels;
-using VRage.Game;
-using VRage.Game.Entity;
-using VRage.Game.Components;
-using VRage.Game.Components.Interfaces;
-using VRage.Game.Definitions;
-using VRage.Game.ObjectBuilders;
-using VRage.Game.ObjectBuilders.Definitions;
-using VRage.Game.ObjectBuilders.ComponentSystem;
-using VRage.Game.GUI.TextPanel;
-using VRage.Game.Utils;
-using VRage.Game.ModAPI;
-using VRage.Game.ModAPI.Interfaces;
-using VRage.Game.ModAPI.Network;
-using VRage.Game.ModAPI.Ingame.Utilities;
-using VRage.Network;
-using Sandbox;
-using Sandbox.ModAPI;
-using Sandbox.ModAPI.Interfaces;
-using Sandbox.ModAPI.Interfaces.Terminal;
-using Sandbox.ModAPI.Weapons;
-using Sandbox.ModAPI.Contracts;
-using Sandbox.Game;
-using Sandbox.Game.Entities;
-using Sandbox.Game.Entities.Cube;
-using Sandbox.Game.Entities.Blocks;
-using Sandbox.Game.Entities.Character;
-using Sandbox.Game.EntityComponents;
-using Sandbox.Game.World;
-using Sandbox.Game.GameSystems;
-using Sandbox.Game.Gui;
-using Sandbox.Game.Lights;
-using Sandbox.Game.Multiplayer;
-using Sandbox.Game.Components;
-using Sandbox.Game.Weapons;
-using Sandbox.Game.SessionComponents;
-using Sandbox.Definitions;
-using Sandbox.Common.ObjectBuilders;
-using Sandbox.Common.ObjectBuilders.Definitions;
-using Sandbox.Engine.Physics;
-using Sandbox.Engine.Utils;
-using Sandbox.Engine.Multiplayer;
-using Sandbox.Engine.Platform;
-using SpaceEngineers.Game.ModAPI;
-using SpaceEngineers.Game.Entities.Blocks;
-using VRage.Input;
-using VRage.Serialization;
-
-""";
+    // Per-host default usings, injected via the constructor so Compiler stays
+    // host-agnostic. SE1's list lives in Shared.Se1.ScriptDefaults (shared by
+    // client + server); SE2's in Client2Plugin.ScriptDefaults. Captured from the
+    // primary-ctor parameter into an instance field.
+    private readonly string _defaultUsings = defaultUsings;
 
     private const string ClassPrefix = """
 public class __REPL__
@@ -159,7 +96,31 @@ public class __REPL__
 }
 """;
 
-    private static readonly int DefaultUsingLineCount = DefaultUsings.Count(c => c == '\n');
+    // The IgnoresAccessChecksToAttribute definition — its own compilation unit (own
+    // `using System;`, reads naturally). We DECLARE our own instead of `using` an
+    // existing one: MULTIPLE loaded assemblies ship this type (0Harmony AND third-party
+    // plugins like HdrRender), so `using` it is CS0433-ambiguous. A source-declared type
+    // wins over ANY number of imported same-name types (CS0436 warning, filtered out in
+    // Compile) — which is exactly why Roslyn/Orleans/etc. declare their own.
+    private const string IgnoresAccessAttrDef = """
+using System;
+
+namespace System.Runtime.CompilerServices
+{
+    [AttributeUsage(AttributeTargets.Assembly, AllowMultiple = true)]
+    public sealed class IgnoresAccessChecksToAttribute : Attribute
+    {
+        public IgnoresAccessChecksToAttribute(string assemblyName) { }
+    }
+}
+""";
+
+    // Two ignoreaccess trees (definition + [assembly:] usage), parsed once by InitShared
+    // and compiled alongside every user script.
+    private static object _iaAttrTree;
+    private static object _iaAssemblyTree;
+
+    private readonly int _defaultUsingLineCount = defaultUsings.Count(c => c == '\n');
     private static readonly int ClassPrefixLineCount = ClassPrefix.Count(c => c == '\n');
     private static readonly int RunPrefixLineCount = RunPrefix.Count(c => c == '\n');
 
@@ -216,10 +177,30 @@ public class __REPL__
         // allowUnsafe via the With API rather than a ctor argument: the ctor's
         // optional-parameter list shifts across Roslyn versions, while
         // WithAllowUnsafe(bool) is the same single overload on both load paths
-        // (game 2.9 and NuGet 5.0).
+        // (game 2.9 and NuGet 5.3).
         var withAllowUnsafe = compOptsType.GetMethod("WithAllowUnsafe", [typeof(bool)])
             ?? throw new MissingMethodException(compOptsType.FullName, "WithAllowUnsafe");
-        CompileOptions = withAllowUnsafe.Invoke(baseOptions, [true]);
+        var unsafeOptions = withAllowUnsafe.Invoke(baseOptions, [true]);
+
+        // ignoreaccess (compile-time half): let REPL scripts read the game's internal
+        // types/members. Verified end-to-end on Roslyn 5.3.0. Paired with the runtime
+        // [assembly: IgnoresAccessChecksTo] tree built in InitShared.
+        //   (1) MetadataImportOptions.Internal — import internal members from metadata
+        //       (default Public hides them). WithMetadataImportOptions is PUBLIC.
+        //   (2) TopLevelBinderFlags = BinderFlags.IgnoreAccessibility (1<<22) — skip
+        //       the CS0122 accessibility check. WithTopLevelBinderFlags is INTERNAL
+        //       (NonPublic lookup) — fragile if Roslyn renames it, pinned to 5.3.0.
+        var mioType = commonAsm.GetType("Microsoft.CodeAnalysis.MetadataImportOptions");
+        var withMetadataImport = compOptsType.GetMethod("WithMetadataImportOptions",
+            BindingFlags.Public | BindingFlags.Instance, null, [mioType], null)
+            ?? throw new MissingMethodException(compOptsType.FullName, "WithMetadataImportOptions");
+        var internalImport = withMetadataImport.Invoke(unsafeOptions, [Enum.Parse(mioType, "Internal")]);
+
+        var binderFlagsType = csharpAsm.GetType("Microsoft.CodeAnalysis.CSharp.BinderFlags");
+        var withTopLevelBinderFlags = compOptsType.GetMethod("WithTopLevelBinderFlags",
+            BindingFlags.NonPublic | BindingFlags.Instance, null, [binderFlagsType], null)
+            ?? throw new MissingMethodException(compOptsType.FullName, "WithTopLevelBinderFlags");
+        CompileOptions = withTopLevelBinderFlags.Invoke(internalImport, [Enum.Parse(binderFlagsType, "IgnoreAccessibility")]);
 
         Emit = compilationType.GetMethods(BindingFlags.Public | BindingFlags.Instance)
             .Single(m => m.Name == "Emit"
@@ -305,6 +286,24 @@ public class __REPL__
         };
         AppDomain.CurrentDomain.AssemblyResolve += _sharedHandler;
 
+        // ignoreaccess (runtime half): one [assembly: IgnoresAccessChecksTo(name)] for
+        // EVERY referenced assembly — game + BCL (loadContext) and other plugins
+        // (loadFile) alike, matching the SharedReferences set exactly. (Compile-time
+        // internal import is global anyway, so per-assembly runtime gating would only
+        // cause "compiles but MethodAccessException at run".) The [assembly:] usages bind
+        // to OUR source-declared attribute (wins over the Harmony/other-plugin copies),
+        // so no CS0433 no matter how many third-party plugins also declare it.
+        _iaAttrTree = CallWithDefaults(ParseText, null, IgnoresAccessAttrDef, ParseOptions);
+        // #pragma is lexically scoped to THIS tree only. This tree contains nothing but
+        // [assembly: IgnoresAccessChecksTo] lines, whose only CS0436 is our attribute vs
+        // the Harmony/other-plugin copies (source wins, harmless) — so this suppresses
+        // exactly that one, while the user's own script tree still reports its CS0436s.
+        var iaAssembly = "using System.Runtime.CompilerServices;\n"
+            + "#pragma warning disable CS0436\n"
+            + string.Concat(loadContext.Keys.Concat(loadFile.Keys).Distinct()
+                .Select(n => $"[assembly: IgnoresAccessChecksTo(\"{n}\")]\n"));
+        _iaAssemblyTree = CallWithDefaults(ParseText, null, iaAssembly, ParseOptions);
+
         Common.Logger.Info($"{SharedReferences.Count} references collected ({SharedResolveMap.Count} LoadFile)");
     }
 
@@ -335,12 +334,12 @@ public class __REPL__
             usings.Where(u => !string.IsNullOrWhiteSpace(u))
                   .Select(u => "using " + u.Trim() + ";\n"));
 
-        var fullSource = DefaultUsings + usingsBlock + ClassPrefix + classBody + RunPrefix + code + ClassSuffix;
+        var fullSource = _defaultUsings + usingsBlock + ClassPrefix + classBody + RunPrefix + code + ClassSuffix;
 
         // 0-based start lines into fullSource for each user segment. Diagnostics on
         // wrapper lines (between user segments) are attributed to the nearest
         // preceding user segment so the LLM knows which field to fix.
-        var usingsStart = DefaultUsingLineCount;
+        var usingsStart = _defaultUsingLineCount;
         var usingsLines = usingsBlock.Count(c => c == '\n');
         var classBodyStart = usingsStart + usingsLines + ClassPrefixLineCount;
         var classBodyLines = classBody.Count(c => c == '\n');
@@ -350,8 +349,13 @@ public class __REPL__
 
         var tree = CallWithDefaults(ParseText, null, fullSource, ParseOptions);
 
-        var treesArr = Array.CreateInstance(SyntaxTreeBase, 1);
+        // Three files: user script + ignoreaccess [assembly:] usages + our attribute
+        // definition. InitShared always runs before any Compile (McpServer gates on
+        // Initialized), so both ia trees are set.
+        var treesArr = Array.CreateInstance(SyntaxTreeBase, 3);
         treesArr.SetValue(tree, 0);
+        treesArr.SetValue(_iaAssemblyTree, 1);
+        treesArr.SetValue(_iaAttrTree, 2);
 
         var refsArr = Array.CreateInstance(MetaRefBase, SharedReferences.Count);
         for (var i = 0; i < SharedReferences.Count; i++)
@@ -410,22 +414,22 @@ public class __REPL__
     }
 
     // Strong-name MUST match what the per-plugin AssemblyResolver hands back. Pulsar/
-    // Magnetar declare Microsoft.CodeAnalysis.CSharp 5.0.0 in the plugin manifest, the
+    // Magnetar declare Microsoft.CodeAnalysis.CSharp 5.3.0 in the plugin manifest, the
     // resolver loads that into LibDir, and .NET Framework's CLR strictly enforces
     // strong-name equality on AssemblyResolve returns (dotnet/runtime#101029) —
-    // requesting (4,12,0,0) here would let the resolver hand back its 5.0.0 dll, the
+    // requesting (4,12,0,0) here would let the resolver hand back its 5.3.0 dll, the
     // CLR would reject it on the version mismatch with FileLoadException, we'd fall
     // into the catch, and the short-name Assembly.Load fallback would hit whatever's
     // already loaded in the default context — which on SE is the game's ancient
     // Bin64 Roslyn (C# 7.x era). Microsoft Learn is explicit: already-loaded
-    // instances bind BEFORE the resolver. So pin to (5,0,0,0) to guarantee the
-    // resolver's 5.0.0 dll is what CLR accepts.
+    // instances bind BEFORE the resolver. So pin to (5,3,0,0) to guarantee the
+    // resolver's 5.3.0 dll is what CLR accepts.
     private static (Assembly csharp, Assembly common) LoadRoslyn()
     {
         try
         {
-            var csharp = Assembly.Load(MakeAssemblyName("Microsoft.CodeAnalysis.CSharp", 5, 0, 0, 0));
-            var common = Assembly.Load(MakeAssemblyName("Microsoft.CodeAnalysis", 5, 0, 0, 0));
+            var csharp = Assembly.Load(MakeAssemblyName("Microsoft.CodeAnalysis.CSharp", 5, 3, 0, 0));
+            var common = Assembly.Load(MakeAssemblyName("Microsoft.CodeAnalysis", 5, 3, 0, 0));
             return (csharp, common);
         }
         catch (Exception ex)

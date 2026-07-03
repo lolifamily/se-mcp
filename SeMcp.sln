@@ -4,7 +4,9 @@ Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "ClientPlugin", "ClientPlugi
 EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "ServerPlugin", "ServerPlugin\ServerPlugin.csproj", "{1A2055DD-0F88-45FB-ADA4-ECE63398F83E}"
 EndProject
-Project("{D954291E-2A0B-460D-934E-DC6B0785DB48}") = "Shared", "Shared\Shared.shproj", "{7B3233A9-3383-4387-9EEB-C89831C7F08D}"
+Project("{D954291E-2A0B-460D-934E-DC6B0785DB48}") = "Shared.Core", "Shared\Core\Shared.Core.shproj", "{B555B795-C940-43A7-AFC2-04FB13B349A2}"
+EndProject
+Project("{D954291E-2A0B-460D-934E-DC6B0785DB48}") = "Shared.Se1", "Shared\Se1\Shared.Se1.shproj", "{8B56B730-1D43-46C2-8E9F-744A014BD095}"
 EndProject
 Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "Solution Items", "Solution Items", "{75919FCB-E258-4690-ABD5-44597B3D9D65}"
 	ProjectSection(SolutionItems) = preProject

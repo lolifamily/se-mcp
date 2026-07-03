@@ -6,6 +6,7 @@ using Shared.Config;
 using Shared.Logging;
 using Shared.Mcp;
 using Shared.Plugin;
+using Shared.Se1;
 using VRage.FileSystem;
 using VRage.Plugins;
 
@@ -86,7 +87,8 @@ public class Plugin : IPlugin, ICommonPlugin
             v => ScriptGuardMain.Dead = v,
             sp => ScriptGuardMain.StackBase = sp,
             denialMessage: "denied",
-            frameTimeoutMs: 1000);
+            frameTimeoutMs: 1000,
+            defaultUsings: ScriptDefaults.Usings);
 
         // mpAdminNote omitted: server has no MP admin gate, the schema
         // description stays free of the "Multiplayer requires Admin" line.
