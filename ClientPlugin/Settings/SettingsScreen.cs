@@ -53,7 +53,9 @@ internal class SettingsScreen : MyGuiScreenBase
 
     public override void OnRemoved()
     {
-        ConfigStorage.Save(Config.Current);
+        // Config persistence is fully owned by PersistentConfig (500ms auto-save on
+        // PropertyChanged + a synchronous final Save in Dispose). The old
+        // ConfigStorage.Save here was a redundant flush against a now-removed class.
         base.OnRemoved();
     }
 

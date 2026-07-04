@@ -1,5 +1,6 @@
 using System;
 using System.Diagnostics;
+using System.Globalization;
 using System.IO;
 using System.Threading;
 using Sandbox;
@@ -104,7 +105,9 @@ internal static class ScreenshotService
             {
                 var dir = Path.Combine(MyFileSystem.UserDataPath, "Screenshots", "SeMcp");
                 Directory.CreateDirectory(dir);
-                var path = Path.Combine(dir, DateTime.Now.ToString("yyyyMMdd-HHmmss-fff") + ".jpg");
+                // InvariantCulture: the numeric format emits native digits under
+                // fa-IR / ar-SA etc., which would mangle the filename — pin ASCII.
+                var path = Path.Combine(dir, DateTime.Now.ToString("yyyyMMdd-HHmmss-fff", CultureInfo.InvariantCulture) + ".jpg");
 
                 var screen = MySandboxGame.ScreenSize;
                 var pixels = (double)screen.X * screen.Y;

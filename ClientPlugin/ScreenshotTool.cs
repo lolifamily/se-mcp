@@ -16,10 +16,10 @@ public sealed class ScreenshotTool(Executor mainExec) : ITool
     public string SchemaJson =>
         """{"name":"take_screenshot","description":"Capture the current game frame and return it as an image. Only one screenshot may be in flight at a time.","inputSchema":{"type":"object","properties":{"ignore_sprites":{"type":"boolean","description":"true = capture the 3D scene only, without HUD/GUI overlays. Default false (HUD included)."}}}}""";
 
-    public bool TryDispatch(JsonElement arguments, WorkItem item, out int errorCode, out string error)
+    public bool TryDispatch(JsonElement arguments, WorkItem item, out int errorCode, out string errorMessage)
     {
         errorCode = 0;
-        error = null;
+        errorMessage =null;
 
         // Absent arguments / absent flag / JSON null stay lenient (the default:
         // HUD included). A present ignore_sprites of any other shape is rejected
@@ -32,7 +32,7 @@ public sealed class ScreenshotTool(Executor mainExec) : ITool
             if (sEl.ValueKind != JsonValueKind.True && sEl.ValueKind != JsonValueKind.False)
             {
                 errorCode = -32602;
-                error = "Invalid params: ignore_sprites must be a boolean";
+                errorMessage ="Invalid params: ignore_sprites must be a boolean";
                 return false;
             }
             ignoreSprites = sEl.ValueKind == JsonValueKind.True;
@@ -43,7 +43,7 @@ public sealed class ScreenshotTool(Executor mainExec) : ITool
         if (!mainExec.Initialized)
         {
             errorCode = -32002;
-            error = "Game is still loading, not all plugins have been initialized yet. Please retry shortly.";
+            errorMessage ="Game is still loading, not all plugins have been initialized yet. Please retry shortly.";
             return false;
         }
 

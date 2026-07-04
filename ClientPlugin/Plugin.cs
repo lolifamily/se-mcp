@@ -28,10 +28,9 @@ using VRage.Plugins;
 namespace ClientPlugin;
 
 // ReSharper disable once UnusedType.Global
-[UsedImplicitly]
-public class Plugin : IPlugin, ICommonPlugin
+public sealed class Plugin : IPlugin, ICommonPlugin
 {
-    public const string Name = "SeMcp";
+    private const string Name = "SeMcp";
 
     // Suffix added to the execute_code tool description (LLM-facing reminder).
     // The actual gate is the IsDenied lambda below — the description just primes
@@ -57,9 +56,8 @@ public class Plugin : IPlugin, ICommonPlugin
     // config?.Data because the wrapper is null before Init runs.
     public IPluginConfig Config => config?.Data;
     private PersistentConfig<Config> config;
-    // SeMcp 0.x kept its .cfg under UserDataPath\Storage\ (the legacy
-    // ConfigStorage convention); preserved here so existing users' stored tokens
-    // load unchanged.
+    // SeMcp 0.x kept its .cfg under UserDataPath\Storage\; preserved here so
+    // existing users' stored tokens load unchanged.
     private const string ConfigFileName = $"{Name}.cfg";
     private const string ConfigSubDir = "Storage";
 
@@ -182,58 +180,51 @@ public class Plugin : IPlugin, ICommonPlugin
 
     public void Dispose()
     {
-        try
-        {
-            // Executor.Dispose only sets `disposed` and fulfills inflight promises —
-            // it does NOT touch `active`. Coroutine cleanup must run on the thread
-            // that ran the script (finally blocks observe Thread.CurrentThread and
-            // hold thread-affine D3D11 state). So:
-            //   - Main:   we are on the main thread now. Dispose() then Tick() drains
-            //             active on this thread (the script's owning thread). After
-            //             Plugin.Dispose returns SE stops calling Update, so this is
-            //             the last chance.
-            //   - Render: setting disposed=true is enough. The next RenderFrame
-            //             Postfix hook drains active on the render thread (the
-            //             script's owning thread). harmony is NOT unpatched —
-            //             the hook stays in place so the drain has a chance to run;
-            //             subsequent disposed-path Ticks are cheap no-ops.
-            // McpServer is disposed last because HttpListener.Stop also cuts inflight
-            // response streams. The Dispose() calls above fulfilled all inflight
-            // promises, queueing each HandleToolsCall continuation (the response
-            // write) onto the thread pool — WorkItem.Done uses
-            // RunContinuationsAsynchronously. Stopping the listener last gives those
-            // writes a head start; any that lose the race are logged and dropped by
-            // HandleToolsCall's catch.
-            RenderExecutor?.Dispose();
-            MainExecutor?.Dispose();
-            MainExecutor?.Tick();
+        // Executor.Dispose only sets `disposed` and fulfills inflight promises —
+        // it does NOT touch `active`. Coroutine cleanup must run on the thread
+        // that ran the script (finally blocks observe Thread.CurrentThread and
+        // hold thread-affine D3D11 state). So:
+        //   - Main:   we are on the main thread now. Dispose() then Tick() drains
+        //             active on this thread (the script's owning thread). After
+        //             Plugin.Dispose returns SE stops calling Update, so this is
+        //             the last chance.
+        //   - Render: setting disposed=true is enough. The next RenderFrame
+        //             Postfix hook drains active on the render thread (the
+        //             script's owning thread). harmony is NOT unpatched —
+        //             the hook stays in place so the drain has a chance to run;
+        //             subsequent disposed-path Ticks are cheap no-ops.
+        // McpServer is disposed last because HttpListener.Stop also cuts inflight
+        // response streams. The Dispose() calls above fulfilled all inflight
+        // promises, queueing each HandleToolsCall continuation (the response
+        // write) onto the thread pool — WorkItem.Done uses
+        // RunContinuationsAsynchronously. Stopping the listener last gives those
+        // writes a head start; any that lose the race are logged and dropped by
+        // HandleToolsCall's catch.
+        RenderExecutor?.Dispose();
+        MainExecutor?.Dispose();
+        MainExecutor?.Tick();
 
-            AppDomain.CurrentDomain.AssemblyResolve -= ResolvePluginAssembly;
-            Compiler.ReleaseShared();
+        AppDomain.CurrentDomain.AssemblyResolve -= ResolvePluginAssembly;
+        Compiler.ReleaseShared();
 
-            // Same ordering contract as the Executors above: fulfill the pending
-            // screenshot promise first so its HandleToolsCall continuation gets a
-            // chance to write the response before the listener is stopped.
-            ScreenshotService.Drain();
+        // Same ordering contract as the Executors above: fulfill the pending
+        // screenshot promise first so its HandleToolsCall continuation gets a
+        // chance to write the response before the listener is stopped.
+        ScreenshotService.Drain();
 
-            mcpServer?.Dispose();
+        mcpServer?.Dispose();
 
-            // PersistentConfig owns a PropertyChanged subscription and a save
-            // timer. Dispose unsubscribes, releases the timer, and does one
-            // synchronous final Save() — covers any change made inside the
-            // last 500ms save window. Independent of listener / executor
-            // teardown, so ordering doesn't matter; placed last.
-            config?.Dispose();
+        // PersistentConfig owns a PropertyChanged subscription and a save
+        // timer. Dispose unsubscribes, releases the timer, and does one
+        // synchronous final Save() — covers any change made inside the
+        // last 500ms save window. Independent of listener / executor
+        // teardown, so ordering doesn't matter; placed last.
+        config?.Dispose();
 
-            MainExecutor = null;
-            RenderExecutor = null;
-            mcpServer = null;
-            config = null;
-        }
-        catch (Exception ex)
-        {
-            Log.Critical(ex, "Dispose failed");
-        }
+        MainExecutor = null;
+        RenderExecutor = null;
+        mcpServer = null;
+        config = null;
     }
 
     public void Update()

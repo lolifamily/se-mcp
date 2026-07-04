@@ -8,11 +8,11 @@ public interface IPluginConfig : INotifyPropertyChanged
     // - Port: HTTP port string from settings (may be missing/invalid; McpServer parses with fallback 9876).
     // - SecretKey: Bearer token; must be non-empty before Start (client seeds via TokenGenerator on first load).
     // - BoundPort: writable, set by McpServer after a successful Bind; Host-header check reads it back.
-    // - Error: writable, set by McpServer on bind failure for UI display.
+    // - ErrorMessage: writable, set by McpServer on bind failure for UI display.
     string Port { get; }
     string SecretKey { get; }
     int BoundPort { get; set; }
-    string Error { get; set; }
+    string ErrorMessage { get; set; }
 
     // Whether code execution should be denied. A plain stored bool, NOT a
     // computed property. The owner thread (client: Plugin.Update on main;

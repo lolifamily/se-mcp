@@ -28,5 +28,5 @@ public interface ITool
     //   true  — item has been Enqueue'd / Begin'd; caller awaits item.Done.
     //   false — errorCode + error are populated; caller emits a JSON-RPC error.
     // Pre-condition: item.Cancel is already set by the caller.
-    bool TryDispatch(JsonElement arguments, WorkItem item, out int errorCode, out string error);
+    bool TryDispatch(JsonElement arguments, WorkItem item, out int errorCode, out string errorMessage);
 }

@@ -72,12 +72,6 @@ public sealed class Compiler(MethodInfo guardBail, MethodInfo guardStackCheck, F
     // ScriptGuard{Main,Render}'s Bail/StackCheck/Dead are the only thing that
     // differs between the two Compiler instances.
 
-    // Per-host default usings, injected via the constructor so Compiler stays
-    // host-agnostic. SE1's list lives in Shared.Se1.ScriptDefaults (shared by
-    // client + server); SE2's in Client2Plugin.ScriptDefaults. Captured from the
-    // primary-ctor parameter into an instance field.
-    private readonly string _defaultUsings = defaultUsings;
-
     private const string ClassPrefix = """
 public class __REPL__
 {
@@ -120,7 +114,7 @@ namespace System.Runtime.CompilerServices
     private static object _iaAttrTree;
     private static object _iaAssemblyTree;
 
-    private readonly int _defaultUsingLineCount = defaultUsings.Count(c => c == '\n');
+    private readonly int defaultUsingLineCount = defaultUsings.Count(c => c == '\n');
     private static readonly int ClassPrefixLineCount = ClassPrefix.Count(c => c == '\n');
     private static readonly int RunPrefixLineCount = RunPrefix.Count(c => c == '\n');
 
@@ -241,7 +235,7 @@ namespace System.Runtime.CompilerServices
         {
             if (asm.IsDynamic) continue;
             var name = asm.GetName().Name;
-            if (loadContext.ContainsKey(name)) continue;
+            if (name == null || loadContext.ContainsKey(name)) continue;
 
             try
             {
@@ -279,10 +273,11 @@ namespace System.Runtime.CompilerServices
 
         _sharedHandler = (_, args) =>
         {
-            if (args.RequestingAssembly?.GetName().Name?.StartsWith("__REPL__") != true)
+            if (args.RequestingAssembly?.GetName().Name?.StartsWith("__REPL__", StringComparison.Ordinal) != true)
                 return null;
-            SharedResolveMap.TryGetValue(new AssemblyName(args.Name).Name, out var found);
-            return found;
+            return new AssemblyName(args.Name).Name is { } n && SharedResolveMap.TryGetValue(n, out var found)
+                ? found
+                : null;
         };
         AppDomain.CurrentDomain.AssemblyResolve += _sharedHandler;
 
@@ -334,14 +329,13 @@ namespace System.Runtime.CompilerServices
             usings.Where(u => !string.IsNullOrWhiteSpace(u))
                   .Select(u => "using " + u.Trim() + ";\n"));
 
-        var fullSource = _defaultUsings + usingsBlock + ClassPrefix + classBody + RunPrefix + code + ClassSuffix;
+        var fullSource = defaultUsings + usingsBlock + ClassPrefix + classBody + RunPrefix + code + ClassSuffix;
 
         // 0-based start lines into fullSource for each user segment. Diagnostics on
         // wrapper lines (between user segments) are attributed to the nearest
         // preceding user segment so the LLM knows which field to fix.
-        var usingsStart = _defaultUsingLineCount;
         var usingsLines = usingsBlock.Count(c => c == '\n');
-        var classBodyStart = usingsStart + usingsLines + ClassPrefixLineCount;
+        var classBodyStart = defaultUsingLineCount + usingsLines + ClassPrefixLineCount;
         var classBodyLines = classBody.Count(c => c == '\n');
         var codeStart = classBodyStart + classBodyLines + RunPrefixLineCount;
 
@@ -366,17 +360,17 @@ namespace System.Runtime.CompilerServices
         using var ms = new MemoryStream();
         var emitResult = CallWithDefaults(Emit, compilation, ms);
 
-        if (!(bool)EmitSuccess.GetValue(emitResult))
+        if (!(bool)EmitSuccess.GetValue(emitResult)!)
         {
             var errors = new List<string>();
-            foreach (var d in (IEnumerable)EmitDiags.GetValue(emitResult))
+            foreach (var d in (IEnumerable)EmitDiags.GetValue(emitResult)!)
             {
                 var location = DiagLoc.GetValue(d);
                 var span = LocLineSpan.Invoke(location, null);
                 var startPos = SpanStart.GetValue(span);
-                var compiled = (int)PosLine.GetValue(startPos);
-                var col = (int)PosChar.GetValue(startPos);
-                var id = (string)DiagId.GetValue(d);
+                var compiled = (int)PosLine.GetValue(startPos)!;
+                var col = (int)PosChar.GetValue(startPos)!;
+                var id = (string)DiagId.GetValue(d)!;
                 var message = (string)CallWithDefaults(DiagMsg, d);
 
                 string field;
@@ -391,10 +385,10 @@ namespace System.Runtime.CompilerServices
                     field = "class_body";
                     relLine = Math.Max(1, compiled - classBodyStart + 1);
                 }
-                else if (compiled >= usingsStart)
+                else if (compiled >= defaultUsingLineCount)
                 {
                     field = "usings";
-                    relLine = Math.Max(1, compiled - usingsStart + 1);
+                    relLine = Math.Max(1, compiled - defaultUsingLineCount + 1);
                 }
                 else
                 {
@@ -639,7 +633,7 @@ namespace System.Runtime.CompilerServices
                     // Cecil reads from MemoryStream with no probing dirs.
                     else if ((ins.OpCode == OpCodes.Call || ins.OpCode == OpCodes.Callvirt)
                              && ins.Operand is MethodReference mr
-                             && (mr.DeclaringType.FullName.StartsWith("__REPL__")
+                             && (mr.DeclaringType.FullName.StartsWith("__REPL__", StringComparison.Ordinal)
                                  || mr.Name == "Invoke"))
                     {
                         il.InsertBefore(ins, il.Create(OpCodes.Call, stackRef));

@@ -2,9 +2,12 @@ using System;
 using System.IO;
 using System.Reflection;
 using System.Runtime.CompilerServices;
+using HarmonyLib;
+using JetBrains.Annotations;
 using Shared.Config;
 using Shared.Logging;
 using Shared.Mcp;
+using Shared.Patches;
 using Shared.Plugin;
 using Shared.Se1;
 using VRage.FileSystem;
@@ -19,7 +22,7 @@ using VRage.Plugins;
 namespace ServerPlugin;
 
 // ReSharper disable once UnusedType.Global
-public class Plugin : IPlugin, ICommonPlugin
+public sealed class Plugin : IPlugin, ICommonPlugin
 {
     private const string Name = "SeMcp";
 
@@ -27,10 +30,12 @@ public class Plugin : IPlugin, ICommonPlugin
     private static readonly IPluginLogger Logger = new PluginLogger(Name);
 
     public IPluginConfig Config => config?.Data;
-    private PersistentConfig<PluginConfig> config;
-    // DS writes its .cfg directly under UserDataPath (no Storage/ subdir —
-    // ConfigStorage is a client-only artifact; the server has no Settings GUI
-    // and its file layout follows the template default).
+    private PersistentConfig<Config> config;
+
+    [UsedImplicitly]
+    public Config PluginConfig => config?.Data;
+    // DS writes its .cfg directly under UserDataPath (no Storage/ subdir; the
+    // server has no Settings GUI and its file layout follows the template default).
     private const string ConfigFileName = $"{Name}.cfg";
 
     // Single execution lane on DS: there's no render thread, no Patch_RenderFrame
@@ -61,7 +66,8 @@ public class Plugin : IPlugin, ICommonPlugin
         Log.Info("Loading");
 
         var configPath = Path.Combine(MyFileSystem.UserDataPath, ConfigFileName);
-        config = PersistentConfig<PluginConfig>.Load(Log, configPath);
+        config = PersistentConfig<Config>.Load(Log, configPath);
+        ServerPlugin.Config.Instance = config.Data;
 
         // Empty SecretKey on first launch → mint one through the setter; the
         // base setter auto-generates via TokenGenerator and fires PropertyChanged,
@@ -73,6 +79,16 @@ public class Plugin : IPlugin, ICommonPlugin
             config.Data.Port = "9000";
 
         Common.SetPlugin(this);
+
+        // Best-effort on DS. The only patch here is Patch_ConfigSchema, which
+        // just relabels one caption in the config-screen schema. The executor
+        // and McpServer started below are driven by the native IPlugin.Update
+        // pump, not by any patch — so if Magnetar's ConfigSchema shape shifts
+        // and PatchAll throws, the screen falls back to the default caption and
+        // core code-execution keeps working. A cosmetic patch must not take the
+        // plugin down with it: log and carry on.
+        if (!PatchHelpers.HarmonyPatchAll(Log, new Harmony(Name)))
+            Log.Warning("Config-schema patch failed; using default caption. Core MCP/code-execution unaffected.");
 
         // Single lane on DS. denyPolicy returns false unconditionally — the DS
         // already gates who can join the server; once a caller has the SeMcp
@@ -104,35 +120,29 @@ public class Plugin : IPlugin, ICommonPlugin
 
     public void Dispose()
     {
-        try
-        {
-            // Single lane: Dispose() sets `disposed` and fulfills inflight
-            // promises; Tick() then drains `active` on this thread (main).
-            // After Dispose returns SE stops calling Update — this is the
-            // last chance to run script finally blocks on the right thread.
-            _mainExecutor?.Dispose();
-            _mainExecutor?.Tick();
+        // Single lane: Dispose() sets `disposed` and fulfills inflight
+        // promises; Tick() then drains `active` on this thread (main).
+        // After Dispose returns SE stops calling Update — this is the
+        // last chance to run script finally blocks on the right thread.
+        _mainExecutor?.Dispose();
+        _mainExecutor?.Tick();
 
-            AppDomain.CurrentDomain.AssemblyResolve -= ResolvePluginAssembly;
-            Compiler.ReleaseShared();
+        AppDomain.CurrentDomain.AssemblyResolve -= ResolvePluginAssembly;
+        Compiler.ReleaseShared();
 
-            mcpServer?.Dispose();
+        mcpServer?.Dispose();
 
-            // PersistentConfig owns a PropertyChanged subscription and a save
-            // timer. Dispose unsubscribes, releases the timer, and does one
-            // synchronous final Save() — covers any change made inside the
-            // last 500ms save window. Independent of listener / executor
-            // teardown, so ordering doesn't matter; placed last.
-            config?.Dispose();
+        // PersistentConfig owns a PropertyChanged subscription and a save
+        // timer. Dispose unsubscribes, releases the timer, and does one
+        // synchronous final Save() — covers any change made inside the
+        // last 500ms save window. Independent of listener / executor
+        // teardown, so ordering doesn't matter; placed last.
+        config?.Dispose();
 
-            _mainExecutor = null;
-            mcpServer = null;
-            config = null;
-        }
-        catch (Exception ex)
-        {
-            Log.Critical(ex, "Dispose failed");
-        }
+        ServerPlugin.Config.Instance = null;
+        _mainExecutor = null;
+        mcpServer = null;
+        config = null;
     }
 
     public void Update()

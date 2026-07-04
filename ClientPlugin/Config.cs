@@ -7,7 +7,7 @@ using VRage.Utils;
 namespace ClientPlugin;
 
 // Client-side IPluginConfig: inherits Shared.Config.PluginConfig so the runtime
-// fields (Port / SecretKey / BoundPort / Error / Enabled) and the
+// fields (Port / SecretKey / BoundPort / ErrorMessage / Enabled) and the
 // INotifyPropertyChanged plumbing live in exactly one place. The subclass only
 // adds the things SE's GUI model forces to live here:
 //   - Settings GUI attributes ([Textbox] / [Separator] / [Button]) on the
@@ -17,20 +17,20 @@ namespace ClientPlugin;
 //   - The RefreshSettings hook on SecretKey auto-generation (client-only,
 //     re-renders the Settings dialog so the freshly-minted token visibly
 //     populates the Textbox).
-//   - Title — computed from BoundPort/Error, drives the Settings dialog header.
-//   - Static Default / Current — required by SE's SettingsGenerator framework,
-//     which dereferences Config.Current directly (SettingsGenerator.cs:48/114/115).
+//   - Title — computed from BoundPort/ErrorMessage, drives the Settings dialog header.
+//   - Static Current — required by SE's SettingsGenerator framework, which
+//     dereferences Config.Current directly (SettingsGenerator.cs:48/114/115).
 //   - Static [Button] RegenerateToken / CopyUrl actions.
 //
 // XmlSerializer descends through Config and picks up the base class's public
-// properties automatically; [XmlIgnore] on the base BoundPort / Error stays in
+// properties automatically; [XmlIgnore] on the base BoundPort / ErrorMessage stays in
 // effect. The .cfg root element stays <Config>, matching the SeMcp 0.x layout
 // so existing users' stored tokens load unchanged.
 public class Config : Shared.Config.PluginConfig
 {
     [XmlIgnore]
     public string Title => BoundPort > 0  ? $"SeMcp — :{BoundPort}"
-                         : Error != null  ? $"SeMcp — {Error}"
+                         : ErrorMessage != null  ? $"SeMcp — {ErrorMessage}"
                          : "SeMcp — starting…";
 
     [Separator("MCP Server (port change requires restart)")]
@@ -65,9 +65,8 @@ public class Config : Shared.Config.PluginConfig
     [UsedImplicitly]
     public static void RegenerateToken()
     {
-        // SecretKey setter fires PropertyChanged → PersistentConfig schedules the
-        // 500ms auto-save. No manual ConfigStorage.Save needed; SettingsScreen.OnRemoved
-        // will also fire one on close (same path, idempotent).
+        // SecretKey setter fires PropertyChanged → PersistentConfig schedules the 500ms
+        // auto-save (and a final synchronous Save in Dispose). No manual save needed.
         Current.SecretKey = TokenGenerator.Generate();
         Plugin.RefreshSettings = true;
     }
@@ -80,12 +79,8 @@ public class Config : Shared.Config.PluginConfig
         MyClipboardHelper.SetClipboard($"http://localhost:{Current.BoundPort}/?token={Current.SecretKey}");
     }
 
-    // Default is consumed by SettingsGenerator's reflection over property metadata
-    // (defaults, attribute lookup) — it never needs to be the live runtime config,
-    // just an instance of the right type. Current starts pointed at Default and is
-    // re-bound by Plugin.Init to the PersistentConfig wrapper's Data once that
-    // wrapper is loaded; setting it through the wrapper means GUI mutations route
-    // through the live config and trigger the 500ms auto-save.
-    public static readonly Config Default = new();
-    public static Config Current { get; internal set; } = Default;
+    // Current starts at a throwaway default instance and is re-bound by Plugin.Init to the
+    // PersistentConfig wrapper's Data once loaded; setting it through the wrapper means GUI
+    // mutations route through the live config and trigger the 500ms auto-save.
+    public static Config Current { get; internal set; } = new();
 }

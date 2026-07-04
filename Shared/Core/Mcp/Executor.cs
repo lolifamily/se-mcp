@@ -9,22 +9,29 @@ using Shared.Plugin;
 
 namespace Shared.Mcp;
 
+// Internal data carrier threaded through ITool.TryDispatch. The class stays public
+// because ITool.TryDispatch is a public interface method and can't take an internal
+// parameter (CS0051) — but the fields are internal: they're touched only within the
+// plugin assembly (Shared compiles into each plugin dll alongside the tools that use
+// them), never by user scripts (which only get a TextWriter) or external callers. So
+// there's no CA1051 "visible instance field" exposure, and no reason to wrap a pure
+// zero-logic DTO in properties.
 public sealed class WorkItem
 {
-    public IReadOnlyList<string> Usings;
-    public string ClassBody;
-    public string Code;
+    internal IReadOnlyList<string> Usings;
+    internal string ClassBody;
+    internal string Code;
 
     // RunContinuationsAsynchronously is load-bearing: TrySetResult is called from
     // the game's main/render thread (CompleteItem via Tick). Without it the awaiting
     // HandleToolsCall continuation — JSON-escaping the full script output plus the
     // HTTP response write — would run inlined on that game thread.
-    public readonly TaskCompletionSource<bool> Done = new(TaskCreationOptions.RunContinuationsAsynchronously);
-    public CancellationToken Cancel;
+    internal readonly TaskCompletionSource<bool> Done = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    internal CancellationToken Cancel;
 
-    public string Output;
-    public string Error;
-    public bool WasCancelled;
+    internal string Output;
+    internal string Error;
+    internal bool WasCancelled;
 }
 
 // guard{Bail,StackCheck,Dead}: pre-resolved MemberInfos from the ScriptGuard{Main,Render}
@@ -50,7 +57,7 @@ public sealed class Executor(
 {
     private const string ShutdownMessage = "[server shutting down]";
 
-    public volatile bool Initialized;
+    internal volatile bool Initialized;
 
     private readonly Compiler compiler = new(guardBail, guardStackCheck, guardDead, defaultUsings);
     private readonly ConcurrentQueue<(WorkItem Item, CompilationResult Result)> compiled = new();

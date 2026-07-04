@@ -69,14 +69,14 @@ public sealed class McpServer : IDisposable
             }
             catch (Exception ex)
             {
-                config.Error = ex.Message;
+                config.ErrorMessage = ex.Message;
                 Common.Logger.Error(ex.Message);
                 return;
             }
         }
 
-        config.Error = $"ports {basePort}-{basePort + MaxPortRetries - 1} all in use";
-        Common.Logger.Error(config.Error);
+        config.ErrorMessage = $"ports {basePort}-{basePort + MaxPortRetries - 1} all in use";
+        Common.Logger.Error(config.ErrorMessage);
     }
 
     public void Dispose()
@@ -143,7 +143,7 @@ public sealed class McpServer : IDisposable
                 return;
             }
 
-            var bearer = h?.StartsWith("Bearer ", StringComparison.Ordinal) == true ? h.Substring(7) : null;
+            var bearer = h?.StartsWith("Bearer ", StringComparison.Ordinal) == true ? h.Remove(0, 7) : null;
             if (!ConstantTimeEquals(bearer ?? q, config.SecretKey))
             {
                 await Respond(ctx, 401, "Unauthorized");
@@ -184,7 +184,7 @@ public sealed class McpServer : IDisposable
 
             var method = methodEl.GetString()!; // ValueKind == String guarantees non-null
             root.TryGetProperty("id", out var idEl);
-            var isNotification = method.StartsWith("notifications/");
+            var isNotification = method.StartsWith("notifications/", StringComparison.Ordinal);
 
             if (method != "initialize" && string.IsNullOrEmpty(sessionId))
             {

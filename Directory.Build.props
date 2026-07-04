@@ -22,6 +22,11 @@
              Fill the path between the tags to override; leave empty to use the
              platform-specific auto-detection below. -->
         <Dedicated64>D:\Program Files (x86)\Steam\steamapps\common\SpaceEngineersDedicatedServer\DedicatedServer64</Dedicated64>
+
+        <!-- Folder containing Game2.dll etc. (Space Engineers 2 client plugin,
+             Client2Plugin) — the SE2 counterpart of Bin64. Fill the path between
+             the tags to override; leave empty to use the auto-detection below. -->
+        <Game2>D:\Program Files (x86)\Steam\steamapps\common\SpaceEngineers2\Game2</Game2>
     </PropertyGroup>
 
     <!-- User home, resolved once for the Linux auto-detection below -->
@@ -100,5 +105,26 @@
         <Dedicated64 Condition=" '$(Dedicated64)' == '' AND '$(_UserHome)' != '' AND Exists('$(_UserHome)/.steam/steam/steamapps/common/SpaceEngineersDedicatedServer/DedicatedServer64') ">$(_UserHome)/.steam/steam/steamapps/common/SpaceEngineersDedicatedServer/DedicatedServer64</Dedicated64>
         <Dedicated64 Condition=" '$(Dedicated64)' == '' AND '$(_UserHome)' != '' AND Exists('$(_UserHome)/.local/share/Steam/steamapps/common/SpaceEngineersDedicatedServer/DedicatedServer64') ">$(_UserHome)/.local/share/Steam/steamapps/common/SpaceEngineersDedicatedServer/DedicatedServer64</Dedicated64>
         <Dedicated64 Condition=" '$(Dedicated64)' == '' AND '$(_UserHome)' != '' AND Exists('$(_UserHome)/.var/app/com.valvesoftware.Steam/.local/share/Steam/steamapps/common/SpaceEngineersDedicatedServer/DedicatedServer64') ">$(_UserHome)/.var/app/com.valvesoftware.Steam/.local/share/Steam/steamapps/common/SpaceEngineersDedicatedServer/DedicatedServer64</Dedicated64>
+    </PropertyGroup>
+
+    <!-- Auto-detect Game2 (Space Engineers 2, Steam app 1133870) when not explicitly set above -->
+    <PropertyGroup>
+        <!-- Windows: Steam App registry key -->
+        <_Se2InstallLocation Condition=" '$(Game2)' == '' AND $([MSBuild]::IsOSPlatform('Windows')) ">$(registry:HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\Steam App 1133870@InstallLocation)</_Se2InstallLocation>
+        <Game2 Condition=" '$(Game2)' == '' AND '$(_Se2InstallLocation)' != '' ">$(_Se2InstallLocation)\Game2</Game2>
+
+        <!-- Windows: standard Steam install path -->
+        <Game2 Condition=" '$(Game2)' == '' AND $([MSBuild]::IsOSPlatform('Windows')) AND Exists('C:\Program Files (x86)\Steam\steamapps\common\SpaceEngineers2\Game2') ">C:\Program Files (x86)\Steam\steamapps\common\SpaceEngineers2\Game2</Game2>
+
+        <!-- Linux: common Steam install locations under the user home -->
+        <Game2 Condition=" '$(Game2)' == '' AND '$(_UserHome)' != '' AND Exists('$(_UserHome)/.steam/steam/steamapps/common/SpaceEngineers2/Game2') ">$(_UserHome)/.steam/steam/steamapps/common/SpaceEngineers2/Game2</Game2>
+        <Game2 Condition=" '$(Game2)' == '' AND '$(_UserHome)' != '' AND Exists('$(_UserHome)/.local/share/Steam/steamapps/common/SpaceEngineers2/Game2') ">$(_UserHome)/.local/share/Steam/steamapps/common/SpaceEngineers2/Game2</Game2>
+    </PropertyGroup>
+
+    <!-- SE2 (Client2Plugin) local deployment target: Pulsar Modern's Local folder.
+         SE1 deploys via each project's Deploy.bat PostBuildEvent; SE2's csproj
+         DeployPlugin target copies the built DLL to $(LocalDeploymentDir). -->
+    <PropertyGroup>
+        <LocalDeploymentDir Condition=" '$(LocalDeploymentDir)' == '' AND '$(Pulsar)' != '' ">$(Pulsar)\Modern\Local</LocalDeploymentDir>
     </PropertyGroup>
 </Project>

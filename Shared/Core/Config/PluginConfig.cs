@@ -18,9 +18,8 @@ namespace Shared.Config;
 //   - Client: PersistentConfig<Config> too — same 500ms auto-save. Edits
 //             commit on PropertyChanged, NOT at OK-button time, so SE GUI's
 //             "Cancel to discard" semantics do not hold here. Accepted to
-//             share one persistence model with Server. SettingsScreen.OnRemoved
-//             still calls ConfigStorage.Save as a redundant final flush
-//             (harmless: same file, same XmlSerializer<Config>).
+//             share one persistence model with Server. (A final synchronous
+//             Save in PersistentConfig.Dispose covers the last 500ms window.)
 //             The ClientPlugin.Config subclass keeps the SEMCP-legacy storage
 //             path (MyFileSystem.UserDataPath\Storage\SeMcp.cfg) for back-compat
 //             with existing SeMcp users' stored tokens, AND attaches the
@@ -59,11 +58,10 @@ public class PluginConfig : IPluginConfig
         set => SetValue(ref field, value);
     } = "";
 
-    // Empty SecretKey → mint a fresh token through this setter. Server: the
-    // PersistentConfig auto-save tick (500ms) flushes the generated token to
-    // disk; subsequent restarts keep it. Client: ConfigStorage.Save runs after
-    // Plugin.Init; same effect. virtual for the GUI attribute + RefreshSettings
-    // trigger on the client subclass.
+    // Empty SecretKey → mint a fresh token through this setter. The PersistentConfig
+    // auto-save tick (500ms) flushes the generated token to disk; subsequent restarts
+    // keep it (both hosts). virtual for the GUI attribute + RefreshSettings trigger on
+    // the client subclass.
     public virtual string SecretKey
     {
         get;
@@ -75,11 +73,11 @@ public class PluginConfig : IPluginConfig
     } = "";
 
     // Runtime-only — never persisted. BoundPort is what McpServer actually bound
-    // (basePort..basePort+retries-1); Error captures bind failure for UI display.
+    // (basePort..basePort+retries-1); ErrorMessage captures bind failure for UI display.
     // Denied is refreshed each frame by the owner-thread Update on hosts that
     // gate execution (client SE Admin check); server never writes it, stays false.
     [XmlIgnore] public int BoundPort { get; set; }
-    [XmlIgnore] public string Error { get; set; }
+    [XmlIgnore] public string ErrorMessage { get; set; }
 
     // Volatile.Read/Write on the field-backed property: main thread (client
     // Plugin.Update) writes, render thread (RenderExecutor.Tick) reads. bool

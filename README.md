@@ -1,9 +1,10 @@
 # SeMcp
 
-Turn a running **Space Engineers** game — or a dedicated server — into an
-[MCP](https://modelcontextprotocol.io) server. An LLM connects over local HTTP
-and executes **C# directly inside the live engine**, with full .NET and game API
-access — right down to `internal` types and members.
+Turn a running **Space Engineers** game into an
+[MCP](https://modelcontextprotocol.io) server — **SE1 (client or dedicated
+server) and SE2 (client)**. An LLM connects over local HTTP and executes **C#
+directly inside the live engine**, with full .NET and game API access — right
+down to `internal` types and members.
 
 ---
 
@@ -17,7 +18,8 @@ access — right down to `internal` types and members.
 > - **Never** port-forward the listener or expose it past `localhost`.
 > - The server binds `127.0.0.1` only, rejects browser-origin (CSRF) and
 >   foreign `Host` headers, and uses constant-time token comparison. In
->   multiplayer the client additionally requires **Admin/Owner** promote level.
+>   multiplayer the client additionally gates execution (SE1: **Admin/Owner**
+>   promote level; SE2: **host / local-server** sessions only).
 > - The per-script watchdog (1 s/frame, 700 KB stack) exists to stop runaway
 >   loops from hanging the game thread. **It is not a security boundary** — a
 >   token holder already has full RCE.
@@ -39,14 +41,23 @@ access — right down to `internal` types and members.
         ┌─────┴───────────────┐
         ▼                     ▼
     main lane             render lane                ← client only
-    IPlugin.Update        Harmony postfix on
-    (game / API state)    MyRenderThread.RenderFrame
+    per-frame pump        postfix on the render
+    (game / API state)    thread (hook per host)
 ```
 
-Two hosts share one MCP core (`Shared`): **`ClientPlugin`** (loaded by Pulsar,
-in-game) and **`ServerPlugin`** (loaded by Magnetar, dedicated server). Code runs
-on the game's **main** thread (`IPlugin.Update`) or, on the client, on the
-**render** thread (a Harmony postfix on `MyRenderThread.RenderFrame`).
+Three hosts share one MCP core (`Shared`): SE1 **`ClientPlugin`** (Pulsar,
+in-game), SE1 **`ServerPlugin`** (Magnetar, dedicated server), and SE2
+**`Client2Plugin`** (Pulsar Modern, in-game — ships as `SeMcp2`). Code runs on the
+game's **main** thread or, on either client, on the **render** thread. The
+per-frame pump differs by host:
+
+- **main lane** — SE1 client `IPlugin.Update`, SE1 server `Update`; SE2 a Harmony
+  postfix on `VRageCore.Update`.
+- **render lane** (client only) — SE1 a Harmony postfix on
+  `MyRenderThread.RenderFrame`; SE2 on `Render12EngineComponent.RenderFrame`.
+
+`execute_code` works on all three; `take_screenshot` and the render lane are
+client-only.
 
 ## Connecting
 
@@ -54,10 +65,12 @@ On first launch the plugin auto-generates a token. Where to find it and the URL:
 
 - **Client** — open the in-game settings dialog and click **Copy URL**. You get
   `http://localhost:9876/?token=<token>` on the clipboard. (Default port
-  `9876`; if taken it climbs `9876→9885` — the live port shows in the dialog
-  title and the log line `listening on :<port>`.)
-- **Server** — no GUI. The token lives in `<UserDataPath>/SeMcp.cfg`. Default
-  port `9000`; same `9000→9009` climb if taken, with the bound port in the log.
+  `9876`, or `6789` on the SE2 client; if taken it climbs `9876→9885` — the live
+  port shows in the dialog title and the log line `listening on :<port>`.)
+- **Server** — on Quasar-managed servers, open the **Plugin configuration** page
+  to view the token and edit the port. Standalone servers without Quasar can read
+  the token from `<UserDataPath>/SeMcp.cfg`. Default port `9000`; same
+  `9000→9009` climb if taken, with the bound port in the log.
 
 > Use `localhost`, **not** `127.0.0.1` — the `Host` header is checked and a
 > mismatch returns `403`.
@@ -122,9 +135,10 @@ public class __REPL__
 | `usings`     | no       | Extra namespace imports — bare paths like `"System.Runtime.InteropServices"`, no `using` keyword, no `;`.   |
 | `target`     | no       | `"main"` (default) or `"render"` (client only).                                                             |
 
-- A large set of namespaces (`System.*`, `VRageMath`, `VRage.*`, `Sandbox.*`,
-  `SpaceEngineers.Game.*`, …) is **pre-imported**. Use short type names
-  (`MySession.Static`, `MyCubeGrid`), not fully-qualified ones.
+- A large set of namespaces is **pre-imported** — SE1: `System.*`, `VRageMath`,
+  `VRage.*`, `Sandbox.*`, `SpaceEngineers.Game.*`; SE2: `System.*`,
+  `Keen.VRage.*`, `Keen.Game2.*`. Use short type names (SE1 `MySession.Static`,
+  SE2 `GameAppComponent`), not fully-qualified ones.
 - Compiled with **Roslyn 5.3** against **every loaded assembly** (.NET + game +
   other plugins), with **ignore-accessibility** turned on: `internal` classes,
   methods, fields and properties are callable **directly, no reflection** — this
@@ -143,6 +157,15 @@ Read game state on the main thread:
 var s = MyAPIGateway.Session;
 Console.WriteLine($"World: {s.Name}");
 Console.WriteLine($"You are at: {s.Player?.GetPosition()}");
+```
+
+The same on **SE2** — the API root is `GameAppComponent`, reached through the
+engine singleton, not `MyAPIGateway`:
+
+```csharp
+var engine = Singleton<VRageCore>.Instance.Engine;
+var session = engine.Get<GameAppComponent>().ClientSession;
+Console.WriteLine($"in a session: {session != null}");
 ```
 
 P/Invoke via `class_body` + `usings` (`usings: ["System.Runtime.InteropServices"]`):
@@ -169,29 +192,34 @@ Console.WriteLine("done");
 ```
 
 > The `render` target runs on the render thread — use it **only** to inspect
-> other plugins' Harmony hooks that execute there. `MyAPIGateway` asserts off the
-> main thread.
+> other plugins' Harmony hooks that execute there. The game API (SE1
+> `MyAPIGateway`, SE2 session / scene access) asserts off the main thread.
 
-The client also exposes **`take_screenshot`** (captures the current frame as an
+Both clients also expose **`take_screenshot`** (captures the current frame as an
 image; optional `ignore_sprites` to drop the HUD). Full parameters are in the
 tool's `inputSchema`.
 
 ## Client vs. server
 
-|                   | Client (Pulsar)                    | Server (Magnetar)            |
-|-------------------|------------------------------------|------------------------------|
-| Default port      | `9876` (retries `9876–9885`)       | `9000` (retries `9000–9009`) |
-| `render` lane     | ✅                                  | ❌                            |
-| `take_screenshot` | ✅                                  | ❌                            |
-| Multiplayer gate  | Admin/Owner required               | none — token is full access  |
-| Settings GUI      | ✅                                  | ❌ (edit the `.cfg`)          |
-| Config file       | `<UserDataPath>/Storage/SeMcp.cfg` | `<UserDataPath>/SeMcp.cfg`   |
+|                   | SE1 client (Pulsar)                | SE1 server (Magnetar)        | SE2 client (Pulsar Modern)      |
+|-------------------|------------------------------------|------------------------------|---------------------------------|
+| Default port      | `9876` (`9876–9885`)               | `9000` (`9000–9009`)         | `6789` (`6789–6798`)            |
+| `render` lane     | ✅                                  | ❌                            | ✅                               |
+| `take_screenshot` | ✅                                  | ❌                            | ✅                               |
+| Multiplayer gate  | Admin/Owner required               | none — token is full access  | host / local-server only¹       |
+| Settings GUI      | ✅ (MyGui)                          | ✅ (Quasar Plugin config)     | ✅ (Avalonia)                    |
+| Config file       | `<UserDataPath>/Storage/SeMcp.cfg` | `<UserDataPath>/SeMcp.cfg`   | Pulsar `Data\SeMcp2\SeMcp2.cfg` |
+| API root          | `MyAPIGateway` / `MySession`       | same                         | `GameAppComponent` (`Keen.*`)   |
+
+¹ SE2 has no multiplayer yet; the gate pre-emptively blocks a pure client (one with
+no local authoritative server), so in practice it only ever runs single-player today.
 
 ## Configuration
 
-`Port` and `SecretKey` persist to the `.cfg` (auto-saved). On the client both are
-editable in the settings dialog, with **Regenerate Token** and **Copy URL**
-buttons; the server is file-only. **Changing the port requires a restart.**
+`Port` and `SecretKey` persist to the `.cfg` (auto-saved). On either client both are
+editable in the settings dialog, with **Regenerate Token** and **Copy URL** buttons;
+on the server they are editable through Quasar's **Plugin configuration** page.
+**Changing the port requires a restart.**
 
 ## How it works
 

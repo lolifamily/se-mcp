@@ -27,6 +27,7 @@
     <Compile Include="$(MSBuildThisFileDirectory)Tools\CodeChange.cs" />
     <Compile Include="$(MSBuildThisFileDirectory)Tools\EnsureCode.cs" />
     <Compile Include="$(MSBuildThisFileDirectory)Tools\Hashing.cs" />
+    <Compile Include="$(MSBuildThisFileDirectory)Tools\UsedImplicitlyAttribute.cs" />
   </ItemGroup>
   <ItemGroup>
     <Content Include="$(MSBuildThisFileDirectory)..\..\README.md">

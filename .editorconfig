@@ -4,3 +4,11 @@ resharper_loop_can_be_converted_to_query_highlighting = none
 resharper_loop_can_be_partly_converted_to_query_highlighting = none
 resharper_foreach_can_be_converted_to_query_using_another_get_enumerator_highlighting = none
 resharper_foreach_can_be_partly_converted_to_query_using_another_get_enumerator_highlighting = none
+
+# Harmony patch params use __/___ prefixes (__result, __instance, __state,
+# ___privateField) — that's Harmony's injection contract, renaming breaks it.
+# Allow those prefixes for parameters, but ONLY under any Patches/ folder, so the
+# rest of the tree keeps strict camelCase. One path-glob section here covers all
+# three plugins' Patches/ dirs from a single file (vs. one .editorconfig each).
+[**/Patches/**.cs]
+resharper_csharp_naming_rule.parameters = aaBb, __+aaBb, ___+aaBb
