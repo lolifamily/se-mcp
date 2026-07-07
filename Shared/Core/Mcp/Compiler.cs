@@ -254,7 +254,8 @@ namespace System.Runtime.CompilerServices
         foreach (var (name, loc) in loadContext)
         {
             if (string.IsNullOrEmpty(loc)) continue;
-            if (Path.GetFileName(loc) == "VRage.Native.dll") continue;
+            if (Path.GetFileName(loc) == "VRage.Native.dll"
+                || Path.GetFileName(loc).StartsWith("Mono.Cecil", StringComparison.Ordinal)) continue;
             try { SharedReferences.Add(CallWithDefaults(CreateFromFile, null, loc)); }
             catch (Exception ex) { Common.Logger.Info($"failed reference {name}: {ex.Message}"); }
         }
@@ -262,7 +263,8 @@ namespace System.Runtime.CompilerServices
         foreach (var (name, (asm, _)) in loadFile)
         {
             var loc = asm.Location;
-            if (Path.GetFileName(loc) == "VRage.Native.dll") continue;
+            if (Path.GetFileName(loc) == "VRage.Native.dll"
+                || Path.GetFileName(loc).StartsWith("Mono.Cecil", StringComparison.Ordinal)) continue;
             try
             {
                 SharedReferences.Add(CallWithDefaults(CreateFromFile, null, loc));

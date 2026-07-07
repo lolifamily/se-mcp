@@ -2,6 +2,7 @@ using System.Collections.Generic;
 using System.Xml.Serialization;
 using Keen.VRage.Core.Input;
 using Keen.VRage.Input;
+using Keen.VRage.Library.Localization;
 
 namespace Client2Plugin.Settings.Tools;
 
@@ -33,7 +34,7 @@ public struct Binding
         if (!IsBound)
             return "None";
 
-        var toInputControl = ToInputControl(new InputActionDefinition("binding", InputType.Digital));
+        var toInputControl = ToInputControl(new InputActionDefinition(LocKey.FromString("binding"), InputType.Digital));
         return toInputControl?.GuiString ?? $"VK {Vk}";
     }
 

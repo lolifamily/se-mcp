@@ -4,7 +4,7 @@ using System.Reflection;
 using Client2Plugin.Settings;
 using Client2Plugin.Tools;
 using HarmonyLib;
-using Keen.Game2.Game.Plugins;
+using Keen.VRage.Core.Plugins;
 using Shared.Config;
 using Shared.Logging;
 using Shared.Mcp;

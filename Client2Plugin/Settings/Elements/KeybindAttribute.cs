@@ -8,6 +8,7 @@ using Keen.Game2.Client.UI.Library.Dialogs.InputCompositionDialog;
 using Keen.VRage.Core.Input;
 using Keen.VRage.Input;
 using Keen.VRage.Library.Diagnostics;
+using Keen.VRage.Library.Localization;
 
 namespace Client2Plugin.Settings.Elements;
 
@@ -63,7 +64,7 @@ internal class KeybindAttribute : Attribute, IElement
 
         // Build a throwaway action definition: the composition dialog uses it only for
         // input-type validation and display formatting.
-        var action = new InputActionDefinition(label, InputType.Digital);
+        var action = new InputActionDefinition(LocKey.FromString(label), InputType.Digital);
         var currentControl = ((Binding)getter()).ToInputControl(action);
 
         var dialog = new InputCompositionDialogViewModel(
