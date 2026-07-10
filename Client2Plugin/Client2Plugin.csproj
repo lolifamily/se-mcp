@@ -32,26 +32,22 @@
     <ItemGroup>
       <PackageReference Include="Lib.Harmony" Version="2.4.2" />
       <PackageReference Include="Mono.Cecil" Version="0.11.6" />
-      <!-- Uncomment to enable publicizer support
       <PackageReference Include="Krafs.Publicizer" Version="2.3.0">
         <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
         <PrivateAssets>all</PrivateAssets>
       </PackageReference>
-      -->
     </ItemGroup>
 
-    <!-- Uncomment to enable publicizer support
     <PropertyGroup>
       <PublicizerClearCacheOnClean>true</PublicizerClearCacheOnClean>
       <PublicizerRuntimeStrategies>Unsafe;IgnoresAccessChecksTo</PublicizerRuntimeStrategies>
       <PublicizerLogFilePath>$(MSBuildProjectDirectory)\$(OutputPath)Krafs.Publicizer.log</PublicizerLogFilePath>
     </PropertyGroup>
-    
+
     <ItemGroup>
-      <Publicize Include="Game2.Game"/>
-      <Publicize Include="Game2.Client"/>
+      <!-- GameAppComponent (SessionGate's deny-gate probe) is internal in SpaceEngineers2.dll -->
+      <Publicize Include="SpaceEngineers2"/>
     </ItemGroup>
-    -->
 
     <ItemGroup>
       <Reference Include="Avalonia.Base"><HintPath>$(Game2)\Avalonia.Base.dll</HintPath><Private>false</Private></Reference>
