@@ -12,6 +12,12 @@ using Shared.Patches;
 using Shared.Plugin;
 using Shared.Se2;
 
+// Define assembly version when compiled by Pulsar
+#if !DEV_BUILD
+[assembly: AssemblyVersion("2.0.0.0")]
+[assembly: AssemblyFileVersion("2.0.0.0")]
+#endif
+
 namespace Client2Plugin;
 
 // SE2 client plugin entry point. Unlike SE1 (IPlugin.Init(gameInstance) + per-frame
@@ -108,13 +114,13 @@ public sealed class Plugin : IPlugin, IDisposable, ICommonPlugin
 
         // Two lanes, each bound to its own ScriptGuard (Shared/Core). Identical to SE1's wiring.
         MainExecutor = new Executor(
-            ScriptGuardMain.BailMethod, ScriptGuardMain.StackCheckMethod, ScriptGuardMain.DeadField,
-            v => ScriptGuardMain.Dead = v, sp => ScriptGuardMain.StackBase = sp,
+            ScriptGuardMain.BailMethod, ScriptGuardMain.StackCheckMethod, ScriptGuardMain.KillIdField,
+            v => ScriptGuardMain.KillId = v, sp => ScriptGuardMain.StackBase = sp,
             DenialMessage, frameTimeoutMs: 1000, defaultUsings: ScriptDefaults.Usings);
 
         RenderExecutor = new Executor(
-            ScriptGuardRender.BailMethod, ScriptGuardRender.StackCheckMethod, ScriptGuardRender.DeadField,
-            v => ScriptGuardRender.Dead = v, sp => ScriptGuardRender.StackBase = sp,
+            ScriptGuardRender.BailMethod, ScriptGuardRender.StackCheckMethod, ScriptGuardRender.KillIdField,
+            v => ScriptGuardRender.KillId = v, sp => ScriptGuardRender.StackBase = sp,
             DenialMessage, frameTimeoutMs: 1000, defaultUsings: ScriptDefaults.Usings);
 
         var tools = new ITool[]

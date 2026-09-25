@@ -144,9 +144,10 @@ public sealed class McpServer : IDisposable
             }
 
             var bearer = h?.StartsWith("Bearer ", StringComparison.Ordinal) == true ? h.Remove(0, 7) : null;
+            // Not 401: that makes MCP clients probe for OAuth, pointless with a static token.
             if (!ConstantTimeEquals(bearer ?? q, config.SecretKey))
             {
-                await Respond(ctx, 401, "Unauthorized");
+                await Respond(ctx, 403, "Forbidden: invalid token");
                 return;
             }
 
@@ -217,6 +218,10 @@ public sealed class McpServer : IDisposable
                     await Respond(ctx, 202, "");
                     break;
 
+                case "ping":
+                    await RespondJsonRpc(ctx, rawId, "{}");
+                    break;
+
                 case "tools/list":
                     await RespondJsonRpc(ctx, rawId, toolsListJson);
                     break;
@@ -270,45 +275,45 @@ public sealed class McpServer : IDisposable
         var hasArgs = p.TryGetProperty("arguments", out var args);
         if (!hasArgs) args = default;
 
-        var cancelSource = new CancellationTokenSource();
-        var item = new WorkItem { Cancel = cancelSource.Token };
-
-        if (!tool.TryDispatch(args, item, out var errorCode, out var error))
-        {
-            cancelSource.Dispose();
-            await RespondJsonRpcError(ctx, rawId, errorCode, error);
-            return;
-        }
-
         // MCP requires id uniqueness per session; refuse rather than silently orphan the
         // prior request. The session prefix scopes that uniqueness correctly: official
         // SDK clients all count ids up from 0, so cross-client raw-id collisions are
-        // routine and must not be conflated.
+        // routine and must not be conflated. Claimed before TryDispatch: dispatching is
+        // the side effect, and a refused duplicate must not have it.
         var pendingKey = sessionId + ":" + rawId;
+        using var cancelSource = new CancellationTokenSource();
         if (!pending.TryAdd(pendingKey, cancelSource))
         {
-            cancelSource.Dispose();
             await RespondJsonRpcError(ctx, rawId, -32600,
                 "Invalid Request: request id already in-flight in this session");
             return;
         }
 
-        await item.Done.Task;
-        pending.TryRemove(pendingKey, out _);
-        cancelSource.Dispose();
+        var item = new WorkItem { Cancel = cancelSource.Token };
+        try
+        {
+            if (!tool.TryDispatch(args, item, out var errorCode, out var error))
+            {
+                await RespondJsonRpcError(ctx, rawId, errorCode, error);
+                return;
+            }
+            await item.Done.Task;
+        }
+        finally
+        {
+            pending.TryRemove(pendingKey, out _);
+        }
 
         // Screenshot success: item.Output is the saved file's path; read + base64
         // happen here on the thread pool (Done uses RunContinuationsAsynchronously),
         // off game threads. A failed read throws into HandleRequest's catch (-32603).
+        // Every text result is the output, then how the run ended — a cancel included,
+        // as its last line (ScriptRender.Combine).
         var isError = item.Error != null || item.WasCancelled;
-        var text = item.WasCancelled
-            ? $"[cancelled]\n{item.Output}"
-            : item.Error != null
-                ? $"{item.Output}\n\n{item.Error}"
-                : item.Output;
+        var tail = item.WasCancelled ? "(cancelled)" : item.Error;
         var resultJson = tool.ReturnsImage && !isError
             ? JsonToolResultImage(File.ReadAllBytes(item.Output), item.Output)
-            : JsonToolResult(text.Trim(), isError);
+            : JsonToolResult(ScriptRender.Combine(item.Output, tail), isError);
 
         try { await RespondJsonRpc(ctx, rawId, resultJson); }
         catch (Exception ex) { Common.Logger.Warning($"response flush failed (listener likely closed): {ex.Message}"); }
@@ -331,7 +336,7 @@ public sealed class McpServer : IDisposable
 
     private static string JsonInitResult()
     {
-        return """{"protocolVersion":"2025-03-26","capabilities":{"tools":{}},"serverInfo":{"name":"SeMcp","version":"1.0.0"}}""";
+        return """{"protocolVersion":"2025-03-26","capabilities":{"tools":{}},"serverInfo":{"name":"SeMcp","version":"2.0.0"}}""";
     }
 
     private static string JsonToolResult(string text, bool isError)

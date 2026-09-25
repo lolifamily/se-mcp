@@ -17,9 +17,11 @@
     <Compile Include="$(MSBuildThisFileDirectory)Mcp\Compiler.cs" />
     <Compile Include="$(MSBuildThisFileDirectory)Mcp\ExecuteCodeTool.cs" />
     <Compile Include="$(MSBuildThisFileDirectory)Mcp\Executor.cs" />
+    <Compile Include="$(MSBuildThisFileDirectory)Mcp\FrameWatchdog.cs" />
     <Compile Include="$(MSBuildThisFileDirectory)Mcp\ITool.cs" />
     <Compile Include="$(MSBuildThisFileDirectory)Mcp\McpServer.cs" />
     <Compile Include="$(MSBuildThisFileDirectory)Mcp\ScriptGuard.cs" />
+    <Compile Include="$(MSBuildThisFileDirectory)Mcp\ScriptRender.cs" />
     <Compile Include="$(MSBuildThisFileDirectory)Mcp\TokenGenerator.cs" />
     <Compile Include="$(MSBuildThisFileDirectory)Patches\PatchHelpers.cs" />
     <Compile Include="$(MSBuildThisFileDirectory)Plugin\Common.cs" />

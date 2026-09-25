@@ -21,8 +21,8 @@ using VRage.Plugins;
 
 // Define assembly version when compiled by Pulsar
 #if !DEV_BUILD
-[assembly: AssemblyVersion("1.0.0.0")]
-[assembly: AssemblyFileVersion("1.0.0.0")]
+[assembly: AssemblyVersion("2.0.0.0")]
+[assembly: AssemblyFileVersion("2.0.0.0")]
 #endif
 
 namespace ClientPlugin;
@@ -70,7 +70,7 @@ public sealed class Plugin : IPlugin, ICommonPlugin
     //   Render — ticked from Patch_RenderFrame's Postfix on SE's render thread,
     //            for inspecting plugin Harmony hooks that run there.
     // Each binds to its own ScriptGuard{Main,Render} static class — the lambdas
-    // close over those classes' Dead / StackBase fields, and IL injection picks
+    // close over those classes' KillId / StackBase fields, and IL injection picks
     // the matching tokens at compile time.
     // ReSharper disable once InconsistentNaming
     internal static Executor MainExecutor;
@@ -138,8 +138,8 @@ public sealed class Plugin : IPlugin, ICommonPlugin
         MainExecutor = new Executor(
             ScriptGuardMain.BailMethod,
             ScriptGuardMain.StackCheckMethod,
-            ScriptGuardMain.DeadField,
-            v => ScriptGuardMain.Dead = v,
+            ScriptGuardMain.KillIdField,
+            v => ScriptGuardMain.KillId = v,
             sp => ScriptGuardMain.StackBase = sp,
             DenialMessage,
             frameTimeoutMs: 1000,
@@ -148,8 +148,8 @@ public sealed class Plugin : IPlugin, ICommonPlugin
         RenderExecutor = new Executor(
             ScriptGuardRender.BailMethod,
             ScriptGuardRender.StackCheckMethod,
-            ScriptGuardRender.DeadField,
-            v => ScriptGuardRender.Dead = v,
+            ScriptGuardRender.KillIdField,
+            v => ScriptGuardRender.KillId = v,
             sp => ScriptGuardRender.StackBase = sp,
             DenialMessage,
             frameTimeoutMs: 1000,

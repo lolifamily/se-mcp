@@ -139,15 +139,18 @@ public class __REPL__
   `VRage.*`, `Sandbox.*`, `SpaceEngineers.Game.*`; SE2: `System.*`,
   `Keen.VRage.*`, `Keen.Game2.*`. Use short type names (SE1 `MySession.Static`,
   SE2 `GameAppComponent`), not fully-qualified ones.
-- Compiled with **Roslyn 5.3** against **every loaded assembly** (.NET + game +
+- Compiled with **Roslyn 5.9** against **every loaded assembly** (.NET + game +
   other plugins), with **ignore-accessibility** turned on: `internal` classes,
   methods, fields and properties are callable **directly, no reflection** — this
   works across the game's own assemblies *and* other loaded plugins (only truly
   `private` members still need reflection). `unsafe` and `[DllImport]` are allowed.
 - Compile errors come back per field with corrected line numbers:
-  `code (3,9): error CS0103: ...`.
+  `code(3,9): error CS0103: ...`.
 - Scripts are coroutines and **run in parallel**; each step is bounded by the
-  watchdog above.
+  watchdog above. The 1 s is **one budget per frame, shared** by every script
+  stepped in it: the script running when it runs out is killed (the report says
+  how long its own step took, so a bystander can be told from the culprit), and
+  scripts whose turn comes after that end with a *retry* error instead.
 
 **Examples**
 
@@ -233,7 +236,7 @@ For anyone reading or extending the code:
   its own executor and `ScriptGuard`, so finally-blocks and thread-affine state
   stay on the right thread.
 - **`Compiler`** — drives Roslyn entirely through **reflection** (no compile-time
-  binding, so it works against both the game's ancient Roslyn and the NuGet 5.3
+  binding, so it works against both the game's ancient Roslyn and the NuGet 5.9
   one), references every loaded assembly, and enables **ignore-accessibility** so
   scripts can reach `internal` members: `MetadataImportOptions.Internal` +
   `BinderFlags.IgnoreAccessibility` at compile time, plus an injected
@@ -243,8 +246,10 @@ For anyone reading or extending the code:
   **Mono.Cecil** to inject the guard.
 - **`ScriptGuard`** — injected `Bail()` on backward branches and `catch`→filter
   rewrites (so a `catch` can't swallow the abort), plus a stack-depth `StackCheck`
-  at call sites. A background 1 s timer sets the `Dead` flag the injected checks
-  read.
+  at call sites. Each script bakes its own id into those checks; when a frame's
+  1 s budget runs out, the lane's `FrameWatchdog` raises the id of the script on
+  the stack (`KillId`), so only that script is aborted — never another script,
+  and never the Harmony patches or handlers an earlier script left behind.
 
 ## License
 

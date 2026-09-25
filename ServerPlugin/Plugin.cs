@@ -15,8 +15,8 @@ using VRage.Plugins;
 
 // Define assembly version when compiled by Magnetar
 #if !DEV_BUILD
-[assembly: AssemblyVersion("1.0.0.0")]
-[assembly: AssemblyFileVersion("1.0.0.0")]
+[assembly: AssemblyVersion("2.0.0.0")]
+[assembly: AssemblyFileVersion("2.0.0.0")]
 #endif
 
 namespace ServerPlugin;
@@ -99,8 +99,8 @@ public sealed class Plugin : IPlugin, ICommonPlugin
         _mainExecutor = new Executor(
             ScriptGuardMain.BailMethod,
             ScriptGuardMain.StackCheckMethod,
-            ScriptGuardMain.DeadField,
-            v => ScriptGuardMain.Dead = v,
+            ScriptGuardMain.KillIdField,
+            v => ScriptGuardMain.KillId = v,
             sp => ScriptGuardMain.StackBase = sp,
             denialMessage: "denied",
             frameTimeoutMs: 1000,

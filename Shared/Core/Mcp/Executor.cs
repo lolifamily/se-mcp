@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Concurrent;
+using System.Diagnostics;
 using System.IO;
 using System.Reflection;
 using System.Threading;
@@ -34,14 +35,14 @@ public sealed class WorkItem
     internal bool WasCancelled;
 }
 
-// guard{Bail,StackCheck,Dead}: pre-resolved MemberInfos from the ScriptGuard{Main,Render}
-// static class whose Bail/Dead/StackCheck get injected into compiled REPL bytecode.
+// guard{Bail,StackCheck,KillId}: pre-resolved MemberInfos from the ScriptGuard{Main,Render}
+// static class whose Bail/KillId/StackCheck get injected into compiled REPL bytecode.
 // Resolved once at type init (see ScriptGuardMain.BailMethod etc) instead of reflecting
-// per-compile. setDead writes that class's Dead flag from the Task pool deadline timer
-// (cross-thread, plain static volatile). resetStackBase writes the [ThreadStatic]
-// StackBase field from this Executor's Tick thread (lambda body is `stsfld`, hits the
-// calling thread's slot — so the reset lands on the same slot the script's StackCheck
-// will later read).
+// per-compile. setKillId writes that class's KillId for this lane's FrameWatchdog, from
+// the Tick thread and from the watchdog's timer thread (cross-thread, plain static
+// volatile). resetStackBase writes the [ThreadStatic] StackBase field from this
+// Executor's Tick thread (lambda body is `stsfld`, hits the calling thread's slot — so
+// the reset lands on the same slot the script's StackCheck will later read).
 //
 // denialMessage: the user-facing reject text (Shared holds no SE business strings).
 // The denial gate itself lives on IPluginConfig.Denied — the owning Plugin.Update
@@ -49,21 +50,32 @@ public sealed class WorkItem
 // level; server never writes, stays false). Executor reads Common.Config.Denied
 // directly; bool reads are atomic and one frame of staleness is fine.
 public sealed class Executor(
-    MethodInfo guardBail, MethodInfo guardStackCheck, FieldInfo guardDead,
-    Action<bool> setDead, Action<long> resetStackBase,
+    MethodInfo guardBail, MethodInfo guardStackCheck, FieldInfo guardKillId,
+    Action<int> setKillId, Action<long> resetStackBase,
     string denialMessage,
     int frameTimeoutMs,
     string defaultUsings) : IDisposable
 {
     private const string ShutdownMessage = "[server shutting down]";
 
+    // Ends a script the pump reached after the frame's budget was already spent. Its own
+    // code never ran this frame, so it must not read the offender's "split the work" advice.
+    private const string SpentBeforeTurnMessage =
+        "Script killed: frame budget spent by other scripts before its turn — retry";
+
+    // First line of the report on a script that ended in an exception. It follows the script's own
+    // output (ScriptRender.Combine), so it has to say where that output stops and what went wrong.
+    // Compile errors need none: each diagnostic names its field.
+    private const string StartFailedLabel = "script failed to start:\n";
+    private const string ThrewLabel = "script threw:\n";
+
     internal volatile bool Initialized;
 
-    private readonly Compiler compiler = new(guardBail, guardStackCheck, guardDead, defaultUsings);
+    private readonly Compiler compiler = new(guardBail, guardStackCheck, guardKillId, defaultUsings);
+    private readonly FrameWatchdog watchdog = new(setKillId, frameTimeoutMs);
     private readonly ConcurrentQueue<(WorkItem Item, CompilationResult Result)> compiled = new();
     private readonly List<ActiveScript> active = [];
     private readonly ConcurrentDictionary<WorkItem, byte> inflight = new();
-    private int epoch;
     private volatile bool disposed;
 
     public void Initialize()
@@ -77,6 +89,7 @@ public sealed class Executor(
 
     private sealed class ActiveScript
     {
+        public int Id; // CompilationResult.ScriptId — what its injected checks answer to
         public WorkItem Item;
         public IEnumerator<object> Coroutine;
         public StringWriter Writer;
@@ -113,7 +126,7 @@ public sealed class Executor(
             }
             catch (Exception ex)
             {
-                CompleteItem(item, error: FormatException(ex));
+                CompleteItem(item, error: StartFailedLabel + ScriptRender.Stack(ex));
             }
         });
     }
@@ -146,31 +159,34 @@ public sealed class Executor(
             Start(pair.Item, pair.Result);
 
         // Idle fast path. Everything below exists to police running scripts;
-        // with none, arming the deadline timer would just allocate a closure +
-        // ContinueWith + DelayPromise per frame, 60-240 Hz across two lanes,
-        // for nobody. A stale timer from the last active frame may still fire
-        // during idle and leave Dead set — harmless: the next active frame
-        // clears it via setDead(false) before any MoveNext runs.
+        // with none, arming the watchdog would just allocate a timer per frame,
+        // 60-240 Hz across two lanes, for nobody. Nothing is left standing
+        // meanwhile: the last active frame disarmed on its way out, so code a
+        // finished script left behind (Harmony patches, event handlers) never
+        // meets a kill while the lane idles.
         if (active.Count == 0)
             return;
 
-        // Deadline timer: each active Tick bumps `epoch` and fires a Task that
-        // flips Dead true after frameTimeoutMs — but only if its captured epoch
-        // is still current. A later Tick increments epoch and silently invalidates
-        // any in-flight timer from a previous frame. If MoveNext stays in a hot
-        // loop with no backward branches (e.g. recursive lambda + catch), no
-        // later Tick runs and the timer fires, setting Dead. Catches that
-        // would otherwise swallow the bail are rejected by the filter handlers
-        // we splice in during compilation, so unwind reaches Executor.Tick.
-        // setDead writes from a Task pool worker — Dead must be plain volatile,
-        // not ThreadStatic, because the writer crosses thread.
-        var myEpoch = Interlocked.Increment(ref epoch);
-        setDead(false);
-        _ = Task.Delay(frameTimeoutMs).ContinueWith(_ =>
+        // One budget per frame, shared by every script StepAll steps: they run
+        // serially on this thread, so their combined time is what freezes it.
+        // If a step overruns, no later Tick comes to stop it — the watchdog's
+        // timer thread raises the id of the script on the stack instead; that
+        // script's injected checks throw on it, and its catch filters refuse
+        // while it is being killed, so the unwind reaches StepAll. Begin/End
+        // pair in a finally, so no Tick leaves its frame armed.
+        watchdog.BeginFrame();
+        try
         {
-            if (Volatile.Read(ref epoch) == myEpoch) setDead(true);
-        });
+            StepAll();
+        }
+        finally
+        {
+            watchdog.EndFrame();
+        }
+    }
 
+    private void StepAll()
+    {
         // Local snapshot for the for-loop: one IPluginConfig dispatch instead of N.
         // Stale across the loop is fine — at worst one frame of running scripts gets
         // through before next Tick aborts them.
@@ -194,24 +210,50 @@ public sealed class Executor(
                 continue;
             }
 
+            // Budget already spent, so this script gets no step this frame. End
+            // it rather than defer it: a skipped frame would silently gap a
+            // cross-frame series, and a loud failure beats a silent gap.
+            if (watchdog.Tripped)
+            {
+                Complete(s, error: SpentBeforeTurnMessage);
+                active.RemoveAt(i);
+                continue;
+            }
+
             // Per-script stack budget: each script gets its own SP baseline.
             // StackBase is [ThreadStatic] on the guard class; this lambda's
             // `stsfld` writes the slot belonging to this Tick's thread — same
             // slot the script's StackCheck will read on the very next line.
             resetStackBase(0);
+            var startedAt = Stopwatch.GetTimestamp();
+            var more = false;
+            Exception thrown = null;
+            watchdog.EnterStep(s.Id);
             try
             {
-                if (!s.Coroutine.MoveNext())
-                {
-                    Complete(s);
-                    active.RemoveAt(i);
-                }
+                more = s.Coroutine.MoveNext();
             }
             catch (Exception ex)
             {
-                Complete(s, error: FormatException(ex));
-                active.RemoveAt(i);
+                thrown = ex;
             }
+            finally
+            {
+                watchdog.ExitStep();
+            }
+
+            // Tripped now but not at the check above: the budget ran out during
+            // this step, which ends as a timeout whatever it did — threw, or
+            // returned because a blocking call gave its checks nowhere to fire or
+            // a `catch when` swallowed the kill. A normal result would be the one
+            // answer that leaves the caller no way to learn the frame stood frozen.
+            var error = watchdog.Tripped ? TimeoutReport(startedAt, thrown)
+                : thrown != null ? ThrewLabel + ScriptRender.Stack(thrown)
+                : null;
+            if (error == null && more)
+                continue;
+            Complete(s, error);
+            active.RemoveAt(i);
         }
     }
 
@@ -236,10 +278,12 @@ public sealed class Executor(
             var instance = Activator.CreateInstance(type);
             var run = (Func<TextWriter, IEnumerable<object>>)Delegate.CreateDelegate(
                 typeof(Func<TextWriter, IEnumerable<object>>), instance, method);
-            var writer = new StringWriter();
+            // \n, not the platform's \r\n: the text goes to a model, and ScriptRender joins on \n.
+            var writer = new StringWriter { NewLine = "\n" };
 
             active.Add(new ActiveScript
             {
+                Id = result.ScriptId,
                 Item = item,
                 Coroutine = run(writer).GetEnumerator(),
                 Writer = writer
@@ -247,7 +291,7 @@ public sealed class Executor(
         }
         catch (Exception ex)
         {
-            CompleteItem(item, error: FormatException(ex));
+            CompleteItem(item, error: StartFailedLabel + ScriptRender.Stack(ex));
         }
     }
 
@@ -295,10 +339,21 @@ public sealed class Executor(
         // it's released by Plugin.Dispose once both executors are torn down.
     }
 
-    private static string FormatException(Exception ex)
+    // The step's own duration is what tells a victim from the offender: the budget is shared by
+    // every script stepped in the frame, so a small value means another script spent it and this
+    // one merely happened to be on the stack when it ran out.
+    //
+    // `thrown` came after the kill. The guard's ScriptTimeoutException carries the stack of where
+    // the step was cut; anything else got past the catch filters the kill stood down — a genuine
+    // fault looks the same from here, so it is shown as-is. Null when the step reached no check: a
+    // blocking call, or a `catch when` that swallowed the kill. .NET has no safe way to walk another
+    // running thread's stack, so the watchdog can't photograph the lane at expiry — a thrown stack
+    // is the only record of where the step was.
+    private string TimeoutReport(long startedAt, Exception thrown)
     {
-        if (ex is TargetInvocationException { InnerException: not null } tie)
-            ex = tie.InnerException;
-        return $"{ex.GetType().Name}: {ex.Message}\n{ex.StackTrace}";
+        var stepMs = (Stopwatch.GetTimestamp() - startedAt) * 1000 / Stopwatch.Frequency;
+        return $"script interrupted {stepMs}ms into this step (shared frame budget: {frameTimeoutMs}ms); "
+            + "handlers it installed (Harmony patches, event handlers, spawned threads) may also have been hit:\n"
+            + ScriptRender.Stack(thrown ?? new ScriptTimeoutException());
     }
 }

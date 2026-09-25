@@ -5,6 +5,9 @@ using System.ComponentModel;
 using System.IO;
 using System.Linq;
 using System.Reflection;
+#if NETCOREAPP
+using System.Runtime.Loader;
+#endif
 using System.Threading;
 using Mono.Cecil;
 using Mono.Cecil.Cil;
@@ -17,11 +20,15 @@ public sealed class CompilationResult
     public bool Success { get; }
     public Assembly Assembly { get; }
     public string ErrorOutput { get; }
+    // The id baked into this assembly's timeout checks (see InjectTimeoutChecks) — what the
+    // executor publishes while stepping it, so the watchdog can aim a kill at this script alone.
+    public int ScriptId { get; }
 
-    public CompilationResult(Assembly assembly)
+    public CompilationResult(Assembly assembly, int scriptId)
     {
         Success = true;
         Assembly = assembly;
+        ScriptId = scriptId;
     }
 
     public CompilationResult(string errorOutput)
@@ -31,8 +38,10 @@ public sealed class CompilationResult
     }
 }
 
-public sealed class Compiler(MethodInfo guardBail, MethodInfo guardStackCheck, FieldInfo guardDead, string defaultUsings)
+public sealed class Compiler(MethodInfo guardBail, MethodInfo guardStackCheck, FieldInfo guardKillId, string defaultUsings)
 {
+    // Numbers both the __REPL__N assembly and its script id, so the two can never disagree about
+    // which script it was. Process-wide across both lanes; 1-based, leaving 0 as KillId's "nobody".
     private static int _counter;
 
     // Roslyn reflection cache — process-constant, populated by the static ctor.
@@ -48,13 +57,6 @@ public sealed class Compiler(MethodInfo guardBail, MethodInfo guardStackCheck, F
     private static readonly MethodInfo Emit;
     private static readonly PropertyInfo EmitSuccess;
     private static readonly PropertyInfo EmitDiags;
-    private static readonly PropertyInfo DiagLoc;
-    private static readonly PropertyInfo DiagId;
-    private static readonly MethodInfo DiagMsg;
-    private static readonly MethodInfo LocLineSpan;
-    private static readonly PropertyInfo SpanStart;
-    private static readonly PropertyInfo PosLine;
-    private static readonly PropertyInfo PosChar;
 
     // References + resolveMap + handler are process-wide: the AppDomain assembly
     // set is identical for both executors, so duplicating the scan + per-file
@@ -69,7 +71,7 @@ public sealed class Compiler(MethodInfo guardBail, MethodInfo guardStackCheck, F
     private static ResolveEventHandler _sharedHandler;
 
     // Per-instance tokens — declared as primary constructor parameters above.
-    // ScriptGuard{Main,Render}'s Bail/StackCheck/Dead are the only thing that
+    // ScriptGuard{Main,Render}'s Bail/StackCheck/KillId are the only thing that
     // differs between the two Compiler instances.
 
     private const string ClassPrefix = """
@@ -114,9 +116,11 @@ namespace System.Runtime.CompilerServices
     private static object _iaAttrTree;
     private static object _iaAssemblyTree;
 
-    private readonly int defaultUsingLineCount = defaultUsings.Count(c => c == '\n');
-    private static readonly int ClassPrefixLineCount = ClassPrefix.Count(c => c == '\n');
-    private static readonly int RunPrefixLineCount = RunPrefix.Count(c => c == '\n');
+    // Path of every syntax tree we parse. Positions outside the user's fields (the default
+    // usings, the two ignoreaccess trees) keep it, so a diagnostic there prints as
+    // "(internal)(line,col)" instead of with no origin at all. See Compile for the #line
+    // markers that name the user's own fields.
+    private const string InternalPath = "(internal)";
 
     static Compiler()
     {
@@ -131,10 +135,6 @@ namespace System.Runtime.CompilerServices
         var srcKindType = commonAsm.GetType("Microsoft.CodeAnalysis.SourceCodeKind");
         var compilationType = commonAsm.GetType("Microsoft.CodeAnalysis.Compilation");
         var emitResultType = commonAsm.GetType("Microsoft.CodeAnalysis.Emit.EmitResult");
-        var diagnosticType = commonAsm.GetType("Microsoft.CodeAnalysis.Diagnostic");
-        var locationType = commonAsm.GetType("Microsoft.CodeAnalysis.Location");
-        var lineSpanType = commonAsm.GetType("Microsoft.CodeAnalysis.FileLinePositionSpan");
-        var linePositionType = commonAsm.GetType("Microsoft.CodeAnalysis.Text.LinePosition");
 
         var syntaxTreeCsharpType = csharpAsm.GetType("Microsoft.CodeAnalysis.CSharp.CSharpSyntaxTree");
         var compilationCsharpType = csharpAsm.GetType("Microsoft.CodeAnalysis.CSharp.CSharpCompilation");
@@ -171,19 +171,19 @@ namespace System.Runtime.CompilerServices
         // allowUnsafe via the With API rather than a ctor argument: the ctor's
         // optional-parameter list shifts across Roslyn versions, while
         // WithAllowUnsafe(bool) is the same single overload on both load paths
-        // (game 2.9 and NuGet 5.3).
+        // (game 2.9 and NuGet 5.9).
         var withAllowUnsafe = compOptsType.GetMethod("WithAllowUnsafe", [typeof(bool)])
             ?? throw new MissingMethodException(compOptsType.FullName, "WithAllowUnsafe");
         var unsafeOptions = withAllowUnsafe.Invoke(baseOptions, [true]);
 
         // ignoreaccess (compile-time half): let REPL scripts read the game's internal
-        // types/members. Verified end-to-end on Roslyn 5.3.0. Paired with the runtime
+        // types/members. Verified end-to-end on Roslyn 5.9.0. Paired with the runtime
         // [assembly: IgnoresAccessChecksTo] tree built in InitShared.
         //   (1) MetadataImportOptions.Internal — import internal members from metadata
         //       (default Public hides them). WithMetadataImportOptions is PUBLIC.
         //   (2) TopLevelBinderFlags = BinderFlags.IgnoreAccessibility (1<<22) — skip
         //       the CS0122 accessibility check. WithTopLevelBinderFlags is INTERNAL
-        //       (NonPublic lookup) — fragile if Roslyn renames it, pinned to 5.3.0.
+        //       (NonPublic lookup) — fragile if Roslyn renames it, pinned to 5.9.0.
         var mioType = commonAsm.GetType("Microsoft.CodeAnalysis.MetadataImportOptions");
         var withMetadataImport = compOptsType.GetMethod("WithMetadataImportOptions",
             BindingFlags.Public | BindingFlags.Instance, null, [mioType], null)
@@ -202,16 +202,8 @@ namespace System.Runtime.CompilerServices
                 && m.GetCustomAttribute<EditorBrowsableAttribute>()?.State != EditorBrowsableState.Never
                 && m.GetParameters().Skip(1).All(p => p.HasDefaultValue));
 
-        DiagMsg = diagnosticType.GetMethod("GetMessage", [typeof(IFormatProvider)]);
-        LocLineSpan = locationType.GetMethod("GetLineSpan", Type.EmptyTypes);
-
         EmitSuccess = emitResultType.GetProperty("Success");
         EmitDiags = emitResultType.GetProperty("Diagnostics");
-        DiagLoc = diagnosticType.GetProperty("Location");
-        DiagId = diagnosticType.GetProperty("Id");
-        SpanStart = lineSpanType.GetProperty("StartLinePosition");
-        PosLine = linePositionType.GetProperty("Line");
-        PosChar = linePositionType.GetProperty("Character");
     }
 
     // Re-resolve each unique name via Assembly.Load so CLR picks the version
@@ -290,7 +282,7 @@ namespace System.Runtime.CompilerServices
         // cause "compiles but MethodAccessException at run".) The [assembly:] usages bind
         // to OUR source-declared attribute (wins over the Harmony/other-plugin copies),
         // so no CS0433 no matter how many third-party plugins also declare it.
-        _iaAttrTree = CallWithDefaults(ParseText, null, IgnoresAccessAttrDef, ParseOptions);
+        _iaAttrTree = CallWithDefaults(ParseText, null, IgnoresAccessAttrDef, ParseOptions, InternalPath);
         // #pragma is lexically scoped to THIS tree only. This tree contains nothing but
         // [assembly: IgnoresAccessChecksTo] lines, whose only CS0436 is our attribute vs
         // the Harmony/other-plugin copies (source wins, harmless) — so this suppresses
@@ -299,7 +291,7 @@ namespace System.Runtime.CompilerServices
             + "#pragma warning disable CS0436\n"
             + string.Concat(loadContext.Keys.Concat(loadFile.Keys).Distinct()
                 .Select(n => $"[assembly: IgnoresAccessChecksTo(\"{n}\")]\n"));
-        _iaAssemblyTree = CallWithDefaults(ParseText, null, iaAssembly, ParseOptions);
+        _iaAssemblyTree = CallWithDefaults(ParseText, null, iaAssembly, ParseOptions, InternalPath);
 
         Common.Logger.Info($"{SharedReferences.Count} references collected ({SharedResolveMap.Count} LoadFile)");
     }
@@ -323,27 +315,29 @@ namespace System.Runtime.CompilerServices
     //               [DllImport] P/Invoke — anything that can't go in a method body)
     //   code      → statements inside the entry method's body
     // McpServer validated that `code` is present; `classBody` and `usings` may be null.
+    //
+    // Diagnostics name their field with no arithmetic on our side: each segment opens
+    // with `#line 1 "<field>"`, so Roslyn maps every position to that field's own line
+    // numbers and Diagnostic.ToString() already reads `code(2,9): error CS0103: ...`.
+    // A mapping runs until the next #line, so an error landing on the wrapper lines
+    // after a segment (an unclosed brace, say) is reported on that segment's trailing
+    // lines — the field to fix. Positions before the first marker (the default usings)
+    // keep the tree path, InternalPath.
     public CompilationResult Compile(IReadOnlyList<string> usings, string classBody, string code)
     {
-        classBody ??= "";
-
         var usingsBlock = usings == null ? "" : string.Concat(
             usings.Where(u => !string.IsNullOrWhiteSpace(u))
                   .Select(u => "using " + u.Trim() + ";\n"));
 
-        var fullSource = defaultUsings + usingsBlock + ClassPrefix + classBody + RunPrefix + code + ClassSuffix;
+        var fullSource = defaultUsings
+            + Segment("usings", usingsBlock) + ClassPrefix
+            + Segment("class_body", classBody) + RunPrefix
+            + Segment("code", code) + ClassSuffix;
 
-        // 0-based start lines into fullSource for each user segment. Diagnostics on
-        // wrapper lines (between user segments) are attributed to the nearest
-        // preceding user segment so the LLM knows which field to fix.
-        var usingsLines = usingsBlock.Count(c => c == '\n');
-        var classBodyStart = defaultUsingLineCount + usingsLines + ClassPrefixLineCount;
-        var classBodyLines = classBody.Count(c => c == '\n');
-        var codeStart = classBodyStart + classBodyLines + RunPrefixLineCount;
+        var scriptId = Interlocked.Increment(ref _counter);
+        var assemblyName = "__REPL__" + scriptId;
 
-        var assemblyName = "__REPL__" + Interlocked.Increment(ref _counter);
-
-        var tree = CallWithDefaults(ParseText, null, fullSource, ParseOptions);
+        var tree = CallWithDefaults(ParseText, null, fullSource, ParseOptions, InternalPath);
 
         // Three files: user script + ignoreaccess [assembly:] usages + our attribute
         // definition. InitShared always runs before any Compile (McpServer gates on
@@ -362,70 +356,65 @@ namespace System.Runtime.CompilerServices
         using var ms = new MemoryStream();
         var emitResult = CallWithDefaults(Emit, compilation, ms);
 
+        // Diagnostic.ToString() prints the #line-mapped position — see the comment on Compile.
         if (!(bool)EmitSuccess.GetValue(emitResult)!)
-        {
-            var errors = new List<string>();
-            foreach (var d in (IEnumerable)EmitDiags.GetValue(emitResult)!)
-            {
-                var location = DiagLoc.GetValue(d);
-                var span = LocLineSpan.Invoke(location, null);
-                var startPos = SpanStart.GetValue(span);
-                var compiled = (int)PosLine.GetValue(startPos)!;
-                var col = (int)PosChar.GetValue(startPos)!;
-                var id = (string)DiagId.GetValue(d)!;
-                var message = (string)CallWithDefaults(DiagMsg, d);
-
-                string field;
-                int relLine;
-                if (compiled >= codeStart)
-                {
-                    field = "code";
-                    relLine = compiled - codeStart + 1;
-                }
-                else if (compiled >= classBodyStart)
-                {
-                    field = "class_body";
-                    relLine = Math.Max(1, compiled - classBodyStart + 1);
-                }
-                else if (compiled >= defaultUsingLineCount)
-                {
-                    field = "usings";
-                    relLine = Math.Max(1, compiled - defaultUsingLineCount + 1);
-                }
-                else
-                {
-                    field = "(internal)";
-                    relLine = compiled + 1;
-                }
-
-                errors.Add($"{field} ({relLine},{col + 1}): error {id}: {message}");
-            }
-            return new CompilationResult(string.Join("\n", errors));
-        }
+            return new CompilationResult(string.Join("\n", ((IEnumerable)EmitDiags.GetValue(emitResult)!).Cast<object>()));
 
         ms.Seek(0, SeekOrigin.Begin);
         var raw = ms.ToArray();
-        raw = InjectTimeoutChecks(raw);
-        return new CompilationResult(Assembly.Load(raw));
+        raw = InjectTimeoutChecks(raw, scriptId);
+        return new CompilationResult(Assembly.Load(raw), scriptId);
     }
 
-    // Strong-name MUST match what the per-plugin AssemblyResolver hands back. Pulsar/
-    // Magnetar declare Microsoft.CodeAnalysis.CSharp 5.3.0 in the plugin manifest, the
-    // resolver loads that into LibDir, and .NET Framework's CLR strictly enforces
-    // strong-name equality on AssemblyResolve returns (dotnet/runtime#101029) —
-    // requesting (4,12,0,0) here would let the resolver hand back its 5.3.0 dll, the
-    // CLR would reject it on the version mismatch with FileLoadException, we'd fall
-    // into the catch, and the short-name Assembly.Load fallback would hit whatever's
-    // already loaded in the default context — which on SE is the game's ancient
-    // Bin64 Roslyn (C# 7.x era). Microsoft Learn is explicit: already-loaded
-    // instances bind BEFORE the resolver. So pin to (5,3,0,0) to guarantee the
-    // resolver's 5.3.0 dll is what CLR accepts.
+    // One user segment, fenced by newlines on both sides so nothing around it can share a
+    // line with the user's text: a #line directive has to start a line, and a trailing
+    // `// comment` would otherwise swallow the wrapper line after it — Run's header, or the
+    // `yield break` that keeps Run an iterator when the user wrote no yield of their own.
+    private static string Segment(string field, string text) => $"\n#line 1 \"{field}\"\n{text}\n";
+
+    // Loads the NuGet Roslyn the plugin manifests declare (5.9.0) rather than the older one
+    // every game ships (SE1/DS Bin64 2.9, SE2 4.14).
+    //
+    // The pin below is the .NET Framework path: there a strong-named reference binds to
+    // exactly the requested version — no roll-forward — so it must equal the manifests'
+    // version, or the bind fails with FileLoadException and the short-name fallback takes
+    // the game's own Roslyn. Keep the pin and the three manifests in step.
     private static (Assembly csharp, Assembly common) LoadRoslyn()
     {
+#if NETCOREAPP
+        // .NET Core keeps one version per simple name in a load context, and the default
+        // context already has the game's Roslyn: no version pin gets past it (the request is
+        // refused, and Pulsar's name-only AssemblyResolve hands back the game's copy). So the
+        // NuGet copy gets a context of its own. No separate DLL is needed for that — Roslyn
+        // is reached purely by reflection, so only BCL types ever cross the boundary.
+        //
+        // Why the DLLs sit beside this plugin: Pulsar/Magnetar copy the manifest's NuGet
+        // runtime files, culture folders included, into the plugin's Bin folder next to the
+        // compiled plugin DLL and LoadFrom it there — DevFolder builds in
+        // LocalFolderPlugin.InstallDependencies, GitHub installs in
+        // GitHubPlugin.CompileFromSource (PluginCache.BinDirectory). A plugin with nothing
+        // beside it (a DLL dropped into Local, or one loaded from bytes with an empty
+        // Location) falls through to the paths below.
+        var dir = Path.GetDirectoryName(typeof(Compiler).Assembly.Location);
+        if (!string.IsNullOrEmpty(dir) && File.Exists(Path.Combine(dir, "Microsoft.CodeAnalysis.CSharp.dll")))
+        {
+            try
+            {
+                var context = new RoslynLoadContext(dir);
+                return (
+                    context.LoadFromAssemblyName(new AssemblyName("Microsoft.CodeAnalysis.CSharp")),
+                    context.LoadFromAssemblyName(new AssemblyName("Microsoft.CodeAnalysis")));
+            }
+            catch (Exception ex)
+            {
+                Common.Logger.Warning($"isolated Roslyn load failed ({ex.GetType().Name}), trying the default context");
+            }
+        }
+#endif
         try
         {
-            var csharp = Assembly.Load(MakeAssemblyName("Microsoft.CodeAnalysis.CSharp", 5, 3, 0, 0));
-            var common = Assembly.Load(MakeAssemblyName("Microsoft.CodeAnalysis", 5, 3, 0, 0));
+            var csharp = Assembly.Load(MakeAssemblyName("Microsoft.CodeAnalysis.CSharp", 5, 9, 0, 0));
+            var common = Assembly.Load(MakeAssemblyName("Microsoft.CodeAnalysis", 5, 9, 0, 0));
             return (csharp, common);
         }
         catch (Exception ex)
@@ -437,6 +426,24 @@ namespace System.Runtime.CompilerServices
             Assembly.Load("Microsoft.CodeAnalysis.CSharp"),
             Assembly.Load("Microsoft.CodeAnalysis"));
     }
+
+#if NETCOREAPP
+    // Serves Microsoft.CodeAnalysis* and their culture-folder satellites from the plugin's
+    // folder. Every other name returns null and is shared from the default context — the
+    // BCL, System.Collections.Immutable and the rest come from the process's one framework.
+    private sealed class RoslynLoadContext(string dir) : AssemblyLoadContext("SeMcp.Roslyn")
+    {
+        protected override Assembly Load(AssemblyName name)
+        {
+            if (name.Name?.StartsWith("Microsoft.CodeAnalysis", StringComparison.Ordinal) != true)
+                return null;
+            var path = string.IsNullOrEmpty(name.CultureName)
+                ? Path.Combine(dir, name.Name + ".dll")
+                : Path.Combine(dir, name.CultureName, name.Name + ".dll");
+            return File.Exists(path) ? LoadFromAssemblyPath(path) : null;
+        }
+    }
+#endif
 
     private static AssemblyName MakeAssemblyName(string name, int major, int minor, int build, int rev)
     {
@@ -469,19 +476,26 @@ namespace System.Runtime.CompilerServices
 
     // Guard against accidental infinite loops and runaway recursion that would
     // hang the game thread. Three injection points share ScriptGuard state
-    // (Dead flag set by a background 1s timer in Executor.Tick; StackBase
-    // captured per-script on first StackCheck):
+    // (KillId raised by the lane's FrameWatchdog when a frame's budget runs
+    // out; StackBase captured per-script on first StackCheck). Every timeout
+    // check compares KillId against scriptId, baked in as a constant, so it
+    // fires only for a kill aimed at THIS script — never another script's,
+    // and never once this script has left the lane (code it leaves behind,
+    // e.g. a Harmony patch or event handler, keeps running):
     //   - Exception handler entry:
-    //       catch → rewritten into a filter handler that rejects when Dead is
-    //         set. The filter runs in CLR's pass 1 (stackless virtual unwind),
-    //         so deep-recursion-plus-catch attacks unwind in constant stack.
+    //       catch → rewritten into a filter handler that rejects while this
+    //         script is being killed. The filter runs in CLR's pass 1 (stackless
+    //         virtual unwind), so deep-recursion-plus-catch attacks unwind in
+    //         constant stack.
     //       finally / fault → Bail (filter is illegal here; no caught exception).
     //   - Backward branches → Bail. Catches tight loops with no method calls.
     //   - REPL / Delegate call sites → StackCheck + Bail. Catches recursion
     //     by sampling SP; first call per script sets StackBase, subsequent
     //     calls throw if SP descends past the budget.
+    // Each Bail site is `ldc.i4 scriptId; call Bail(int)` — stack-neutral as a
+    // pair, and always inserted adjacent, so no region boundary splits it.
     // Not a security boundary — token holders already have full RCE.
-    private byte[] InjectTimeoutChecks(byte[] raw)
+    private byte[] InjectTimeoutChecks(byte[] raw, int scriptId)
     {
         using var asm = AssemblyDefinition.ReadAssembly(new MemoryStream(raw));
         var replType = asm.MainModule.Types.FirstOrDefault(t => t.Name == "__REPL__");
@@ -489,7 +503,7 @@ namespace System.Runtime.CompilerServices
             throw new InvalidOperationException("Compiled assembly missing __REPL__ type");
 
         var bailRef = asm.MainModule.ImportReference(guardBail);
-        var deadFieldRef = asm.MainModule.ImportReference(guardDead);
+        var killIdRef = asm.MainModule.ImportReference(guardKillId);
         var stackRef = asm.MainModule.ImportReference(guardStackCheck);
 
         var types = new Stack<TypeDefinition>();
@@ -523,8 +537,9 @@ namespace System.Runtime.CompilerServices
 
                 // Handler entries:
                 //  - Catch: rewrite into a filter handler. Filter runs in pass 1
-                //    (stackless virtual unwind); rejecting catches when Dead is
-                //    set costs constant stack regardless of recursion depth.
+                //    (stackless virtual unwind); rejecting catches while this
+                //    script is being killed costs constant stack regardless of
+                //    recursion depth.
                 //    Previously tried throw-based Bail and `rethrow` opcode —
                 //    both cap at ~100 frames because nested ProcessClrException
                 //    routing in pass 1/2 is not actually stackless.
@@ -541,9 +556,10 @@ namespace System.Runtime.CompilerServices
                 //   .filter {
                 //     isinst CatchType    ; entry stack [exc] → [exc-or-null]
                 //     brfalse reject      ; null → reject (consumes top)
-                //     ldsfld Dead
-                //     ldc.i4.0
-                //     ceq                 ; 1 if Dead==0 (accept), 0 otherwise
+                //     ldsfld KillId
+                //     ldc.i4 scriptId
+                //     beq reject          ; this script is being killed → reject
+                //     ldc.i4.1            ; accept
                 //     br endLabel
                 //   reject:
                 //     ldc.i4.0
@@ -559,24 +575,27 @@ namespace System.Runtime.CompilerServices
                     if (eh.HandlerType != ExceptionHandlerType.Catch)
                     {
                         // Finally / Fault: keep Bail.
-                        il.InsertAfter(eh.HandlerStart, il.Create(OpCodes.Call, bailRef));
+                        var ldId = il.Create(OpCodes.Ldc_I4, scriptId);
+                        il.InsertAfter(eh.HandlerStart, ldId);
+                        il.InsertAfter(ldId, il.Create(OpCodes.Call, bailRef));
                         continue;
                     }
 
                     // Single-endfilter exit. Three paths converge on it with an
-                    // int32 result (0=reject, non-zero=accept):
-                    //   accept  : isinst != null AND Dead == 0  →  push 1
-                    //   reject1 : isinst == null (wrong type)   →  push 0
-                    //   reject2 : isinst != null AND Dead != 0  →  push 0 (via ceq)
+                    // int32 result (0=reject, 1=accept):
+                    //   accept  : isinst != null AND KillId != scriptId  →  push 1
+                    //   reject1 : isinst == null (wrong type)            →  push 0
+                    //   reject2 : isinst != null AND KillId == scriptId  →  push 0
                     var endLabel = il.Create(OpCodes.Endfilter);
                     var rejectLabel = il.Create(OpCodes.Ldc_I4_0);
                     var filterStart = il.Create(OpCodes.Isinst, eh.CatchType);
                     var origHandlerStart = eh.HandlerStart;
                     il.InsertBefore(origHandlerStart, filterStart);
                     il.InsertBefore(origHandlerStart, il.Create(OpCodes.Brfalse, rejectLabel));
-                    il.InsertBefore(origHandlerStart, il.Create(OpCodes.Ldsfld, deadFieldRef));
-                    il.InsertBefore(origHandlerStart, il.Create(OpCodes.Ldc_I4_0));
-                    il.InsertBefore(origHandlerStart, il.Create(OpCodes.Ceq));               // 1 if Dead==0
+                    il.InsertBefore(origHandlerStart, il.Create(OpCodes.Ldsfld, killIdRef));
+                    il.InsertBefore(origHandlerStart, il.Create(OpCodes.Ldc_I4, scriptId));
+                    il.InsertBefore(origHandlerStart, il.Create(OpCodes.Beq, rejectLabel));  // being killed
+                    il.InsertBefore(origHandlerStart, il.Create(OpCodes.Ldc_I4_1));
                     il.InsertBefore(origHandlerStart, il.Create(OpCodes.Br, endLabel));
                     il.InsertBefore(origHandlerStart, rejectLabel);                          // ldc.i4.0
                     il.InsertBefore(origHandlerStart, endLabel);                             // endfilter
@@ -625,6 +644,7 @@ namespace System.Runtime.CompilerServices
                     // body.Instructions.IndexOf(t) <= IndexOf(ins) at that point.
                     if (ins.Operand is Instruction t && t.Offset <= ins.Offset)
                     {
+                        il.InsertBefore(ins, il.Create(OpCodes.Ldc_I4, scriptId));
                         il.InsertBefore(ins, il.Create(OpCodes.Call, bailRef));
                     }
                     // REPL/Delegate call site: StackCheck + Bail. The callvirt
@@ -639,6 +659,7 @@ namespace System.Runtime.CompilerServices
                                  || mr.Name == "Invoke"))
                     {
                         il.InsertBefore(ins, il.Create(OpCodes.Call, stackRef));
+                        il.InsertBefore(ins, il.Create(OpCodes.Ldc_I4, scriptId));
                         il.InsertBefore(ins, il.Create(OpCodes.Call, bailRef));
                     }
                 }
