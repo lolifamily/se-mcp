@@ -33,16 +33,26 @@ public sealed class WorkItem
     internal string Output;
     internal string Error;
     internal bool WasCancelled;
+
+    // Answers the request: HandleToolsCall wakes on Done and renders Output with this ending.
+    // Idempotent — a second call finds Done already set — but set Output before the first.
+    internal void Complete(string error = null, bool cancelled = false)
+    {
+        Error = error;
+        WasCancelled = cancelled;
+        Done.TrySetResult(true);
+    }
 }
 
-// guard{Bail,StackCheck,KillId}: pre-resolved MemberInfos from the ScriptGuard{Main,Render}
-// static class whose Bail/KillId/StackCheck get injected into compiled REPL bytecode.
+// guard{Bail,StackCheck,Killing}: pre-resolved MethodInfos from the ScriptGuard{Main,Render}
+// static class whose Bail/StackCheck/Killing get injected into compiled REPL bytecode.
 // Resolved once at type init (see ScriptGuardMain.BailMethod etc) instead of reflecting
 // per-compile. setKillId writes that class's KillId for this lane's FrameWatchdog, from
 // the Tick thread and from the watchdog's timer thread (cross-thread, plain static
-// volatile). resetStackBase writes the [ThreadStatic] StackBase field from this
-// Executor's Tick thread (lambda body is `stsfld`, hits the calling thread's slot — so
-// the reset lands on the same slot the script's StackCheck will later read).
+// volatile). beginStep is that class's BeginStep, called on this Executor's Tick thread
+// before every step: it resets the [ThreadStatic] _stackBase slot of this thread — the
+// same slot the script's StackCheck will read — and records this thread as the lane
+// thread, the only one Killing answers yes on.
 //
 // denialMessage: the user-facing reject text (Shared holds no SE business strings).
 // The denial gate itself lives on IPluginConfig.Denied — the owning Plugin.Update
@@ -50,28 +60,22 @@ public sealed class WorkItem
 // level; server never writes, stays false). Executor reads Common.Config.Denied
 // directly; bool reads are atomic and one frame of staleness is fine.
 public sealed class Executor(
-    MethodInfo guardBail, MethodInfo guardStackCheck, FieldInfo guardKillId,
-    Action<int> setKillId, Action<long> resetStackBase,
+    MethodInfo guardBail, MethodInfo guardStackCheck, MethodInfo guardKilling,
+    Action<int> setKillId, Action beginStep,
     string denialMessage,
     int frameTimeoutMs,
-    string defaultUsings) : IDisposable
+    string defaultUsings) : IScriptLane, IDisposable
 {
-    private const string ShutdownMessage = "[server shutting down]";
-
     // Ends a script the pump reached after the frame's budget was already spent. Its own
     // code never ran this frame, so it must not read the offender's "split the work" advice.
     private const string SpentBeforeTurnMessage =
         "Script killed: frame budget spent by other scripts before its turn — retry";
 
-    // First line of the report on a script that ended in an exception. It follows the script's own
-    // output (ScriptRender.Combine), so it has to say where that output stops and what went wrong.
-    // Compile errors need none: each diagnostic names its field.
-    private const string StartFailedLabel = "script failed to start:\n";
-    private const string ThrewLabel = "script threw:\n";
-
     internal volatile bool Initialized;
 
-    private readonly Compiler compiler = new(guardBail, guardStackCheck, guardKillId, defaultUsings);
+    bool IScriptLane.Initialized => Initialized;
+
+    private readonly Compiler compiler = new(guardBail, guardStackCheck, guardKilling, defaultUsings);
     private readonly FrameWatchdog watchdog = new(setKillId, frameTimeoutMs);
     private readonly ConcurrentQueue<(WorkItem Item, CompilationResult Result)> compiled = new();
     private readonly List<ActiveScript> active = [];
@@ -98,7 +102,7 @@ public sealed class Executor(
     public void Enqueue(WorkItem item)
     {
         if (disposed)
-        { CompleteItem(item, error: ShutdownMessage); return; }
+        { CompleteItem(item, error: ScriptRender.Shutdown); return; }
 
         if (item.Cancel.IsCancellationRequested)
         { CompleteItem(item, cancelled: true); return; }
@@ -113,7 +117,7 @@ public sealed class Executor(
         // self-correct here so no WorkItem leaks past Dispose.
         if (disposed)
         {
-            CompleteItem(item, error: ShutdownMessage);
+            CompleteItem(item, error: ScriptRender.Shutdown);
             return;
         }
 
@@ -126,7 +130,7 @@ public sealed class Executor(
             }
             catch (Exception ex)
             {
-                CompleteItem(item, error: StartFailedLabel + ScriptRender.Stack(ex));
+                CompleteItem(item, error: ScriptRender.StartFailed(ex));
             }
         });
     }
@@ -220,11 +224,11 @@ public sealed class Executor(
                 continue;
             }
 
-            // Per-script stack budget: each script gets its own SP baseline.
-            // StackBase is [ThreadStatic] on the guard class; this lambda's
-            // `stsfld` writes the slot belonging to this Tick's thread — same
-            // slot the script's StackCheck will read on the very next line.
-            resetStackBase(0);
+            // Per-script stack budget: each script gets its own SP baseline —
+            // BeginStep clears this thread's _stackBase slot, and the check at
+            // MoveNext's entry sets it anew. BeginStep also marks this thread
+            // as the lane thread, before EnterStep can raise a kill below.
+            beginStep();
             var startedAt = Stopwatch.GetTimestamp();
             var more = false;
             Exception thrown = null;
@@ -248,7 +252,7 @@ public sealed class Executor(
             // a `catch when` swallowed the kill. A normal result would be the one
             // answer that leaves the caller no way to learn the frame stood frozen.
             var error = watchdog.Tripped ? TimeoutReport(startedAt, thrown)
-                : thrown != null ? ThrewLabel + ScriptRender.Stack(thrown)
+                : thrown != null ? ScriptRender.Threw(thrown)
                 : null;
             if (error == null && more)
                 continue;
@@ -267,17 +271,6 @@ public sealed class Executor(
 
         try
         {
-            var type = result.Assembly?.GetType("__REPL__");
-            var method = type?.GetMethod("Run");
-            if (method == null)
-            {
-                CompleteItem(item, error: "Failed to find __REPL__.Run in compiled assembly");
-                return;
-            }
-
-            var instance = Activator.CreateInstance(type);
-            var run = (Func<TextWriter, IEnumerable<object>>)Delegate.CreateDelegate(
-                typeof(Func<TextWriter, IEnumerable<object>>), instance, method);
             // \n, not the platform's \r\n: the text goes to a model, and ScriptRender joins on \n.
             var writer = new StringWriter { NewLine = "\n" };
 
@@ -285,13 +278,13 @@ public sealed class Executor(
             {
                 Id = result.ScriptId,
                 Item = item,
-                Coroutine = run(writer).GetEnumerator(),
+                Coroutine = result.Start(writer).GetEnumerator(),
                 Writer = writer
             });
         }
         catch (Exception ex)
         {
-            CompleteItem(item, error: StartFailedLabel + ScriptRender.Stack(ex));
+            CompleteItem(item, error: ScriptRender.StartFailed(ex));
         }
     }
 
@@ -304,9 +297,7 @@ public sealed class Executor(
 
     private void CompleteItem(WorkItem item, string error = null, bool cancelled = false)
     {
-        item.Error = error;
-        item.WasCancelled = cancelled;
-        item.Done.TrySetResult(true);
+        item.Complete(error, cancelled);
         inflight.TryRemove(item, out _);
     }
 
@@ -321,10 +312,7 @@ public sealed class Executor(
         // Items that race in via Enqueue after this point are handled by the double-check
         // in Enqueue (it sees disposed=true after adding to inflight and self-completes).
         foreach (var item in new List<WorkItem>(inflight.Keys))
-        {
-            item.Error = ShutdownMessage;
-            item.Done.TrySetResult(true);
-        }
+            item.Complete(ScriptRender.Shutdown);
         inflight.Clear();
 
         // `active` is owned by the Tick thread. Its drain happens on the next Tick

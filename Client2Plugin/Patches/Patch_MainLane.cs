@@ -29,8 +29,12 @@ internal static class PatchMainLane
         // Order matters: InitShared must populate the shared compiler references before
         // MainExecutor.Initialize flips Initialized=true — that volatile write is also what
         // publishes those references across threads (see Compiler._sharedInit notes).
+        // ParallelExecutor publishes them the same way, and EnforceDenyGate pushes the gate
+        // refreshed above onto running scripts.
         Compiler.InitShared();
         Plugin.MainExecutor?.Initialize();
+        Plugin.ParallelExecutor?.Initialize();
         Plugin.MainExecutor?.Tick();
+        Plugin.ParallelExecutor?.EnforceDenyGate();
     }
 }

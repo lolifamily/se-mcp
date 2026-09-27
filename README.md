@@ -37,24 +37,26 @@ down to `internal` types and members.
        │  ITool dispatch               │
        │  Executor · Compiler · Guard  │  Roslyn compile → Cecil IL guard → coroutine
        └──────────────────────────────┘
-              │  runs your C# on a game thread
-        ┌─────┴───────────────┐
-        ▼                     ▼
-    main lane             render lane                ← client only
-    per-frame pump        postfix on the render
-    (game / API state)    thread (hook per host)
+              │  runs your C#
+        ┌─────┴───────────────┬───────────────────────┐
+        ▼                     ▼                       ▼
+    main lane             render lane (client)    parallel lane
+    per-frame pump        postfix on the render   a thread per script,
+    (game / API state)    thread (hook per host)  concurrent, off-frame
 ```
 
 Three hosts share one MCP core (`Shared`): SE1 **`ClientPlugin`** (Pulsar,
 in-game), SE1 **`ServerPlugin`** (Magnetar, dedicated server), and SE2
 **`Client2Plugin`** (Pulsar Modern, in-game — ships as `SeMcp2`). Code runs on the
-game's **main** thread or, on either client, on the **render** thread. The
-per-frame pump differs by host:
+game's **main** thread, on either client's **render** thread, or on a thread of its
+own (**parallel**). The per-frame pump differs by host:
 
 - **main lane** — SE1 client `IPlugin.Update`, SE1 server `Update`; SE2 a Harmony
   postfix on `VRageCore.Update`.
 - **render lane** (client only) — SE1 a Harmony postfix on
   `MyRenderThread.RenderFrame`; SE2 on `Render12EngineComponent.RenderFrame`.
+- **parallel lane** — no pump: each script runs to its end on a thread of its own,
+  concurrently with the game.
 
 `execute_code` works on all three; `take_screenshot` and the render lane are
 client-only.
@@ -133,13 +135,13 @@ public class __REPL__
 | `code`       | yes      | **Statements only.** Output via `Console.WriteLine()`. Pause until the next frame with `yield return null`. |
 | `class_body` | no       | Class-level declarations — anything that can't live in a method body, e.g. `[DllImport]` P/Invoke.          |
 | `usings`     | no       | Extra namespace imports — bare paths like `"System.Runtime.InteropServices"`, no `using` keyword, no `;`.   |
-| `target`     | no       | `"main"` (default) or `"render"` (client only).                                                             |
+| `target`     | no       | `"main"` (default), `"render"` (client only) or `"parallel"`.                                               |
 
 - A large set of namespaces is **pre-imported** — SE1: `System.*`, `VRageMath`,
   `VRage.*`, `Sandbox.*`, `SpaceEngineers.Game.*`; SE2: `System.*`,
   `Keen.VRage.*`, `Keen.Game2.*`. Use short type names (SE1 `MySession.Static`,
   SE2 `GameAppComponent`), not fully-qualified ones.
-- Compiled with **Roslyn 5.9** against **every loaded assembly** (.NET + game +
+- Compiled with **Roslyn 5.3** against **every loaded assembly** (.NET + game +
   other plugins), with **ignore-accessibility** turned on: `internal` classes,
   methods, fields and properties are callable **directly, no reflection** — this
   works across the game's own assemblies *and* other loaded plugins (only truly
@@ -151,6 +153,14 @@ public class __REPL__
   stepped in it: the script running when it runs out is killed (the report says
   how long its own step took, so a bystander can be told from the culprit), and
   scripts whose turn comes after that end with a *retry* error instead.
+- Hanging up cancels the script within about 2 s, as `notifications/cancelled`
+  would: while it runs, a space goes ahead of the JSON every second, and the
+  first one that can't be written cancels it. Only the direct TCP peer is seen,
+  so keep `localhost` in `NO_PROXY`.
+- `parallel` has no frame budget: `yield return null` resumes at once. A cancel
+  or hang-up answers at once and **aborts** the script's thread, so a loop with no
+  check point in it stops too; code stuck in a `finally`, a `catch` or a native
+  call can't be stopped.
 
 **Examples**
 
@@ -208,6 +218,7 @@ tool's `inputSchema`.
 |-------------------|------------------------------------|------------------------------|---------------------------------|
 | Default port      | `9876` (`9876–9885`)               | `9000` (`9000–9009`)         | `6789` (`6789–6798`)            |
 | `render` lane     | ✅                                  | ❌                            | ✅                               |
+| `parallel` lane   | ✅                                  | ✅                            | ✅                               |
 | `take_screenshot` | ✅                                  | ❌                            | ✅                               |
 | Multiplayer gate  | Admin/Owner required               | none — token is full access  | host / local-server only¹       |
 | Settings GUI      | ✅ (MyGui)                          | ✅ (Quasar Plugin config)     | ✅ (Avalonia)                    |
@@ -235,8 +246,13 @@ For anyone reading or extending the code:
   then stepped one `MoveNext` per frame on its owning game thread. Each lane has
   its own executor and `ScriptGuard`, so finally-blocks and thread-affine state
   stay on the right thread.
+- **`ParallelExecutor`** — the parallel lane. Scripts compile with `StackCheck`
+  only and run inside `ControlledExecution.Run` (net48: a port of it). A kill
+  answers the request first, then aborts from a throwaway thread and interrupts
+  managed waits — at once, then every 250 ms — which an abort alone can't wake on
+  .NET 10.
 - **`Compiler`** — drives Roslyn entirely through **reflection** (no compile-time
-  binding, so it works against both the game's ancient Roslyn and the NuGet 5.9
+  binding, so it works against both the game's ancient Roslyn and the NuGet 5.3
   one), references every loaded assembly, and enables **ignore-accessibility** so
   scripts can reach `internal` members: `MetadataImportOptions.Internal` +
   `BinderFlags.IgnoreAccessibility` at compile time, plus an injected
@@ -244,12 +260,17 @@ For anyone reading or extending the code:
   attribute is self-declared — source wins over the copies Harmony and other
   plugins ship, so no ambiguity). It then rewrites the emitted IL with
   **Mono.Cecil** to inject the guard.
-- **`ScriptGuard`** — injected `Bail()` on backward branches and `catch`→filter
-  rewrites (so a `catch` can't swallow the abort), plus a stack-depth `StackCheck`
-  at call sites. Each script bakes its own id into those checks; when a frame's
-  1 s budget runs out, the lane's `FrameWatchdog` raises the id of the script on
-  the stack (`KillId`), so only that script is aborted — never another script,
-  and never the Harmony patches or handlers an earlier script left behind.
+- **`ScriptGuard`** — a stack-depth `StackCheck` and a `Bail()` at the entry of
+  every script method, `Bail()` on backward branches, and `catch`→filter rewrites
+  (so a `catch` can't swallow the abort). Entry checks also cover script code the
+  BCL or the game calls back into — an overridden `ToString`, a lambda handed to
+  LINQ, a Harmony patch — so recursion that detours through foreign code is
+  stopped, not a stack overflow. Each script bakes its own id into those checks;
+  when a frame's 1 s budget runs out, the lane's `FrameWatchdog` raises the id of
+  the script on the stack (`KillId`), and the checks answer only on the lane's own
+  thread — so only that script is aborted, only there: never another script, never
+  the same script's code on other threads, and never the Harmony patches or
+  handlers an earlier script left behind.
 
 ## License
 

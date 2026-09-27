@@ -21,8 +21,8 @@ using VRage.Plugins;
 
 // Define assembly version when compiled by Pulsar
 #if !DEV_BUILD
-[assembly: AssemblyVersion("2.0.0.0")]
-[assembly: AssemblyFileVersion("2.0.0.0")]
+[assembly: AssemblyVersion("2.1.0.0")]
+[assembly: AssemblyFileVersion("2.1.0.0")]
 #endif
 
 namespace ClientPlugin;
@@ -65,16 +65,21 @@ public sealed class Plugin : IPlugin, ICommonPlugin
     internal static bool RefreshSettings;
     private SettingsGenerator settingsGenerator;
 
-    // Two execution lanes:
-    //   Main   — ticked from IPlugin.Update on SE's main thread (game/API state).
-    //   Render — ticked from Patch_RenderFrame's Postfix on SE's render thread,
-    //            for inspecting plugin Harmony hooks that run there.
-    // Each binds to its own ScriptGuard{Main,Render} static class — the lambdas
-    // close over those classes' KillId / StackBase fields, and IL injection picks
-    // the matching tokens at compile time.
+    // Three execution lanes:
+    //   Main     — ticked from IPlugin.Update on SE's main thread (game/API state).
+    //   Render   — ticked from Patch_RenderFrame's Postfix on SE's render thread,
+    //              for inspecting plugin Harmony hooks that run there.
+    //   Parallel — each script on a thread of its own; Update only pushes the
+    //              deny gate onto it.
+    // Main and Render each bind to their own ScriptGuard{Main,Render} static
+    // class — the lambda closes over that class's KillId, its BeginStep marks
+    // each step's thread and stack baseline, and IL injection picks the matching
+    // tokens at compile time.
     // ReSharper disable once InconsistentNaming
     internal static Executor MainExecutor;
     internal static Executor RenderExecutor;
+    // ReSharper disable once InconsistentNaming
+    private static ParallelExecutor ParallelExecutor;
 
     private McpServer mcpServer;
 
@@ -138,9 +143,9 @@ public sealed class Plugin : IPlugin, ICommonPlugin
         MainExecutor = new Executor(
             ScriptGuardMain.BailMethod,
             ScriptGuardMain.StackCheckMethod,
-            ScriptGuardMain.KillIdField,
+            ScriptGuardMain.KillingMethod,
             v => ScriptGuardMain.KillId = v,
-            sp => ScriptGuardMain.StackBase = sp,
+            ScriptGuardMain.BeginStep,
             DenialMessage,
             frameTimeoutMs: 1000,
             defaultUsings: ScriptDefaults.Usings);
@@ -148,20 +153,23 @@ public sealed class Plugin : IPlugin, ICommonPlugin
         RenderExecutor = new Executor(
             ScriptGuardRender.BailMethod,
             ScriptGuardRender.StackCheckMethod,
-            ScriptGuardRender.KillIdField,
+            ScriptGuardRender.KillingMethod,
             v => ScriptGuardRender.KillId = v,
-            sp => ScriptGuardRender.StackBase = sp,
+            ScriptGuardRender.BeginStep,
             DenialMessage,
             frameTimeoutMs: 1000,
             defaultUsings: ScriptDefaults.Usings);
 
+        ParallelExecutor = new ParallelExecutor(DenialMessage, ScriptDefaults.Usings);
+
         var tools = new ITool[]
         {
-            new ExecuteCodeTool(MainExecutor, RenderExecutor, MpAdminNote),
+            new ExecuteCodeTool(MainExecutor, ParallelExecutor, RenderExecutor, MpAdminNote),
             new ScreenshotTool(MainExecutor)
         };
 
-        mcpServer = new McpServer(tools, config.Data);
+        mcpServer = new McpServer(tools, config.Data,
+            $"Space Engineers {MyFinalBuildConstants.APP_VERSION_STRING_DOTS}", dedicated: false);
         mcpServer.Start();
 
         AppDomain.CurrentDomain.AssemblyResolve += ResolvePluginAssembly;
@@ -193,6 +201,8 @@ public sealed class Plugin : IPlugin, ICommonPlugin
         //             script's owning thread). harmony is NOT unpatched —
         //             the hook stays in place so the drain has a chance to run;
         //             subsequent disposed-path Ticks are cheap no-ops.
+        //   - Parallel: Dispose answers its requests and aborts its scripts; their
+        //             threads are background threads, so nothing waits on them.
         // McpServer is disposed last because HttpListener.Stop also cuts inflight
         // response streams. The Dispose() calls above fulfilled all inflight
         // promises, queueing each HandleToolsCall continuation (the response
@@ -203,6 +213,7 @@ public sealed class Plugin : IPlugin, ICommonPlugin
         RenderExecutor?.Dispose();
         MainExecutor?.Dispose();
         MainExecutor?.Tick();
+        ParallelExecutor?.Dispose();
 
         AppDomain.CurrentDomain.AssemblyResolve -= ResolvePluginAssembly;
         Compiler.ReleaseShared();
@@ -223,6 +234,7 @@ public sealed class Plugin : IPlugin, ICommonPlugin
 
         MainExecutor = null;
         RenderExecutor = null;
+        ParallelExecutor = null;
         mcpServer = null;
         config = null;
     }
@@ -253,9 +265,13 @@ public sealed class Plugin : IPlugin, ICommonPlugin
         // "this lane's pump is alive". In StartSync mode (RenderFrame never
         // ticks the render lane) render-targeted requests then keep getting
         // -32002 instead of compiling into a queue nothing ever drains.
+        // ParallelExecutor.Initialize publishes the references the same way, and
+        // EnforceDenyGate pushes the gate refreshed above onto running scripts.
         Compiler.InitShared();
         MainExecutor?.Initialize();
+        ParallelExecutor?.Initialize();
         MainExecutor?.Tick();
+        ParallelExecutor?.EnforceDenyGate();
         ScreenshotService.Tick();
     }
 

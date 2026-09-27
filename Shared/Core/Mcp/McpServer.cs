@@ -1,6 +1,7 @@
 using System;
 using System.IO;
 using System.Net;
+using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.Json;
 using System.Threading;
@@ -17,6 +18,7 @@ public sealed class McpServer : IDisposable
     private const int MaxPortRetries = 10;
 
     private static readonly Encoding Utf8NoBom = new UTF8Encoding(false);
+    private static readonly byte[] Space = [(byte)' '];
 
     private readonly IPluginConfig config;
     private readonly Dictionary<string, ITool> tools;
@@ -24,11 +26,13 @@ public sealed class McpServer : IDisposable
     // construction; building once at startup beats walking the list every
     // tools/list call.
     private readonly string toolsListJson;
+    // Pre-rendered initialize result; everything in it is fixed at startup too.
+    private readonly string initResultJson;
     private readonly int basePort;
     private HttpListener listener;
     private readonly ConcurrentDictionary<string, CancellationTokenSource> pending = new();
 
-    public McpServer(IReadOnlyList<ITool> tools, IPluginConfig config)
+    public McpServer(IReadOnlyList<ITool> tools, IPluginConfig config, string game, bool dedicated)
     {
         this.config = config;
         this.tools = new Dictionary<string, ITool>(tools.Count);
@@ -42,6 +46,13 @@ public sealed class McpServer : IDisposable
         }
         sb.Append("]}");
         toolsListJson = sb.ToString();
+
+        // Launch constants only: a client reads this once per session.
+        var instructions = JsonEncodedText.Encode(
+            $"{game} on {RuntimeInformation.FrameworkDescription}, {(dedicated ? "dedicated server" : "physical client")}.");
+        // AssemblyVersion is the only one MSBuild and Pulsar builds emit alike.
+        var version = typeof(McpServer).Assembly.GetName().Version;
+        initResultJson = $$$"""{"protocolVersion":"2025-03-26","capabilities":{"tools":{}},"serverInfo":{"name":"SeMcp","version":"{{{version}}}"},"instructions":"{{{instructions}}}"}""";
 
         basePort = int.TryParse(config.Port, out var p) ? p : 9876;
     }
@@ -158,7 +169,7 @@ public sealed class McpServer : IDisposable
             // VALUE is deliberately not validated against a table of issued ids — the
             // spec's 404-on-unknown-session rule exists to force re-initialization when
             // per-session server state is lost, and this server keeps none (responses pair
-            // via the HTTP context, the initialize result is a static constant, auth is
+            // via the HTTP context, the initialize result is fixed at startup, auth is
             // the per-request Bearer token). Accepting any non-empty value means clients
             // keep working across a plugin or game restart without a forced re-init.
             // REVISIT if per-session state is ever added (SSE push, subscriptions,
@@ -210,7 +221,7 @@ public sealed class McpServer : IDisposable
                     // MUST echo it on all subsequent requests. Headers must be set before
                     // the body write below.
                     ctx.Response.AddHeader("Mcp-Session-Id", TokenGenerator.Generate());
-                    await RespondJsonRpc(ctx, rawId, JsonInitResult());
+                    await RespondJsonRpc(ctx, rawId, initResultJson);
                     break;
 
                 case "notifications/initialized":
@@ -297,7 +308,15 @@ public sealed class McpServer : IDisposable
                 await RespondJsonRpcError(ctx, rawId, errorCode, error);
                 return;
             }
-            await item.Done.Task;
+
+            // Only a failed write reveals a client that hung up; leading spaces are valid JSON.
+            // The first space sends the headers, so the content type has to be set before it.
+            ctx.Response.ContentType = "application/json";
+            while (await Task.WhenAny(item.Done.Task, Task.Delay(1000)) != item.Done.Task)
+            {
+                try { await ctx.Response.OutputStream.WriteAsync(Space, 0, 1); }
+                catch { cancelSource.Cancel(); ctx.Response.Abort(); return; }
+            }
         }
         finally
         {
@@ -334,11 +353,6 @@ public sealed class McpServer : IDisposable
         catch (ObjectDisposedException) { /* race with HandleToolsCall.Dispose() */ }
     }
 
-    private static string JsonInitResult()
-    {
-        return """{"protocolVersion":"2025-03-26","capabilities":{"tools":{}},"serverInfo":{"name":"SeMcp","version":"2.0.0"}}""";
-    }
-
     private static string JsonToolResult(string text, bool isError)
     {
         var escaped = JsonEncodedText.Encode(text);
@@ -355,31 +369,31 @@ public sealed class McpServer : IDisposable
         return $$"""{"content":[{"type":"image","data":"{{b64}}","mimeType":"image/jpeg"},{"type":"text","text":"{{note}}"}],"isError":false}""";
     }
 
-    private static async Task RespondJsonRpc(HttpListenerContext ctx, string rawId, string resultJson)
-    {
-        var json = $$"""{"jsonrpc":"2.0","id":{{rawId}},"result":{{resultJson}}}""";
-        ctx.Response.ContentType = "application/json";
-        ctx.Response.StatusCode = 200;
-        using var w = new StreamWriter(ctx.Response.OutputStream, Utf8NoBom);
-        await w.WriteAsync(json);
-    }
+    private static Task RespondJsonRpc(HttpListenerContext ctx, string rawId, string resultJson) =>
+        Send(ctx, 200, "application/json", $$"""{"jsonrpc":"2.0","id":{{rawId}},"result":{{resultJson}}}""");
 
-    private static async Task RespondJsonRpcError(HttpListenerContext ctx, string rawId, int code, string message)
+    private static Task RespondJsonRpcError(HttpListenerContext ctx, string rawId, int code, string message)
     {
         var escaped = JsonEncodedText.Encode(message);
-        var json = $$$"""{"jsonrpc":"2.0","id":{{{rawId}}},"error":{"code":{{{code}}},"message":"{{{escaped}}}"}}""";
-        ctx.Response.ContentType = "application/json";
-        ctx.Response.StatusCode = 200;
-        using var w = new StreamWriter(ctx.Response.OutputStream, Utf8NoBom);
-        await w.WriteAsync(json);
+        return Send(ctx, 200, "application/json",
+            $$$"""{"jsonrpc":"2.0","id":{{{rawId}}},"error":{"code":{{{code}}},"message":"{{{escaped}}}"}}""");
     }
 
-    private static async Task Respond(HttpListenerContext ctx, int status, string body)
+    private static Task Respond(HttpListenerContext ctx, int status, string body) =>
+        Send(ctx, status, "text/plain", body);
+
+    // The whole body in one async write, then the stream closed. Not a StreamWriter: disposing
+    // one flushes its tail synchronously, and net48's has no DisposeAsync to do it otherwise.
+    // After a heartbeat the headers are already out; HttpListener then ignores the status and
+    // content type set here rather than refusing them.
+    private static async Task Send(HttpListenerContext ctx, int status, string contentType, string body)
     {
         ctx.Response.StatusCode = status;
-        ctx.Response.ContentType = "text/plain";
-        using var w = new StreamWriter(ctx.Response.OutputStream, Utf8NoBom);
-        await w.WriteAsync(body);
+        ctx.Response.ContentType = contentType;
+        var bytes = Utf8NoBom.GetBytes(body);
+        var stream = ctx.Response.OutputStream;
+        await stream.WriteAsync(bytes, 0, bytes.Length);
+        stream.Close();
     }
 
     [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoOptimization)]

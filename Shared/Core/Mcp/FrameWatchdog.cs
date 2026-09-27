@@ -9,7 +9,8 @@ namespace Shared.Mcp;
 // lane thread, so their combined time is what freezes it. When it runs out, the kill goes to exactly
 // one script — the one on the lane's stack right then — by writing its id into the lane's KillId.
 // The Bail calls and catch filters injected into each script compare KillId against the id baked
-// into THAT script at compile time (Compiler.InjectTimeoutChecks), so nothing else answers to it.
+// into THAT script at compile time (Compiler.InjectGuards), and answer only on the lane thread
+// (ScriptGuard's Killing), so nothing else answers to it.
 //
 // An id rather than a lane-wide flag, because instrumented code OUTLIVES its script: a Harmony
 // patch, an event handler or a thread a script started keeps running after the script that
@@ -25,8 +26,8 @@ internal sealed class FrameWatchdog(Action<int> setKillId, int budgetMs)
 {
     private readonly object gate = new();
 
-    // Frame generation, bumped by BeginFrame and EndFrame alike. The lane thread is the sole writer,
-    // so `++` needs no atomic. Only ever compared for equality, so wrap is a non-event.
+    // Frame generation, bumped by BeginFrame and EndFrame alike, on the lane thread only. Only ever
+    // compared for equality, so wrap is a non-event.
     private volatile int gen;
 
     // The generation whose budget ran out, or -1 (never a live generation). Compared for equality
@@ -47,7 +48,7 @@ internal sealed class FrameWatchdog(Action<int> setKillId, int budgetMs)
     // Lane pump, start of a frame that has scripts to step: arm a full budget.
     public void BeginFrame()
     {
-        var armed = ++gen;
+        var armed = Interlocked.Increment(ref gen);
         timer?.Dispose();
         setKillId(0);
         timer = new Timer(_ => Expire(armed), null, budgetMs, Timeout.Infinite);
@@ -58,7 +59,7 @@ internal sealed class FrameWatchdog(Action<int> setKillId, int budgetMs)
     // idles.
     public void EndFrame()
     {
-        gen++;
+        Interlocked.Increment(ref gen);
         timer?.Dispose();
         timer = null;
         setKillId(0);

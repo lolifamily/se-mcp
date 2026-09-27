@@ -18,10 +18,11 @@ namespace Shared.Mcp;
 public sealed class CompilationResult
 {
     public bool Success { get; }
-    public Assembly Assembly { get; }
+    private Assembly Assembly { get; }
     public string ErrorOutput { get; }
-    // The id baked into this assembly's timeout checks (see InjectTimeoutChecks) — what the
+    // The id baked into this assembly's timeout checks (see InjectGuards) — what the
     // executor publishes while stepping it, so the watchdog can aim a kill at this script alone.
+    // A lane with no watchdog compiles no timeout checks; there it only numbers __REPL__N.
     public int ScriptId { get; }
 
     public CompilationResult(Assembly assembly, int scriptId)
@@ -36,9 +37,19 @@ public sealed class CompilationResult
         Success = false;
         ErrorOutput = errorOutput;
     }
+
+    // A fresh instance's Run(Console), not stepped yet. Constructing it runs class_body's field
+    // initializers — the script's own code — so call this on the thread the script is to run on.
+    internal IEnumerable<object> Start(TextWriter console)
+    {
+        var instance = Activator.CreateInstance(Assembly.GetType("__REPL__", throwOnError: true)!)!;
+        var run = (Func<TextWriter, IEnumerable<object>>)Delegate.CreateDelegate(
+            typeof(Func<TextWriter, IEnumerable<object>>), instance, "Run");
+        return run(console);
+    }
 }
 
-public sealed class Compiler(MethodInfo guardBail, MethodInfo guardStackCheck, FieldInfo guardKillId, string defaultUsings)
+public sealed class Compiler(MethodInfo guardBail, MethodInfo guardStackCheck, MethodInfo guardKilling, string defaultUsings)
 {
     // Numbers both the __REPL__N assembly and its script id, so the two can never disagree about
     // which script it was. Process-wide across both lanes; 1-based, leaving 0 as KillId's "nobody".
@@ -71,8 +82,9 @@ public sealed class Compiler(MethodInfo guardBail, MethodInfo guardStackCheck, F
     private static ResolveEventHandler _sharedHandler;
 
     // Per-instance tokens — declared as primary constructor parameters above.
-    // ScriptGuard{Main,Render}'s Bail/StackCheck/KillId are the only thing that
-    // differs between the two Compiler instances.
+    // ScriptGuard{Main,Render}'s Bail/StackCheck/Killing are the only thing that
+    // differs between Compiler instances. guardBail and guardKilling are null
+    // together for a lane with no watchdog: StackCheck only (see InjectGuards).
 
     private const string ClassPrefix = """
 public class __REPL__
@@ -171,26 +183,26 @@ namespace System.Runtime.CompilerServices
         // allowUnsafe via the With API rather than a ctor argument: the ctor's
         // optional-parameter list shifts across Roslyn versions, while
         // WithAllowUnsafe(bool) is the same single overload on both load paths
-        // (game 2.9 and NuGet 5.9).
+        // (game 2.9 and NuGet 5.3).
         var withAllowUnsafe = compOptsType.GetMethod("WithAllowUnsafe", [typeof(bool)])
             ?? throw new MissingMethodException(compOptsType.FullName, "WithAllowUnsafe");
         var unsafeOptions = withAllowUnsafe.Invoke(baseOptions, [true]);
 
         // ignoreaccess (compile-time half): let REPL scripts read the game's internal
-        // types/members. Verified end-to-end on Roslyn 5.9.0. Paired with the runtime
+        // types/members. Verified end-to-end on Roslyn 5.3.0. Paired with the runtime
         // [assembly: IgnoresAccessChecksTo] tree built in InitShared.
         //   (1) MetadataImportOptions.Internal — import internal members from metadata
         //       (default Public hides them). WithMetadataImportOptions is PUBLIC.
         //   (2) TopLevelBinderFlags = BinderFlags.IgnoreAccessibility (1<<22) — skip
         //       the CS0122 accessibility check. WithTopLevelBinderFlags is INTERNAL
-        //       (NonPublic lookup) — fragile if Roslyn renames it, pinned to 5.9.0.
-        var mioType = commonAsm.GetType("Microsoft.CodeAnalysis.MetadataImportOptions");
+        //       (NonPublic lookup) — fragile if Roslyn renames it, pinned to 5.3.0.
+        var mioType = commonAsm.GetType("Microsoft.CodeAnalysis.MetadataImportOptions", throwOnError: true)!;
         var withMetadataImport = compOptsType.GetMethod("WithMetadataImportOptions",
             BindingFlags.Public | BindingFlags.Instance, null, [mioType], null)
             ?? throw new MissingMethodException(compOptsType.FullName, "WithMetadataImportOptions");
         var internalImport = withMetadataImport.Invoke(unsafeOptions, [Enum.Parse(mioType, "Internal")]);
 
-        var binderFlagsType = csharpAsm.GetType("Microsoft.CodeAnalysis.CSharp.BinderFlags");
+        var binderFlagsType = csharpAsm.GetType("Microsoft.CodeAnalysis.CSharp.BinderFlags", throwOnError: true)!;
         var withTopLevelBinderFlags = compOptsType.GetMethod("WithTopLevelBinderFlags",
             BindingFlags.NonPublic | BindingFlags.Instance, null, [binderFlagsType], null)
             ?? throw new MissingMethodException(compOptsType.FullName, "WithTopLevelBinderFlags");
@@ -362,7 +374,7 @@ namespace System.Runtime.CompilerServices
 
         ms.Seek(0, SeekOrigin.Begin);
         var raw = ms.ToArray();
-        raw = InjectTimeoutChecks(raw, scriptId);
+        raw = InjectGuards(raw, scriptId);
         return new CompilationResult(Assembly.Load(raw), scriptId);
     }
 
@@ -372,13 +384,21 @@ namespace System.Runtime.CompilerServices
     // `yield break` that keeps Run an iterator when the user wrote no yield of their own.
     private static string Segment(string field, string text) => $"\n#line 1 \"{field}\"\n{text}\n";
 
-    // Loads the NuGet Roslyn the plugin manifests declare (5.9.0) rather than the older one
+    // Loads the NuGet Roslyn the plugin manifests declare (5.3.0) rather than the older one
     // every game ships (SE1/DS Bin64 2.9, SE2 4.14).
     //
     // The pin below is the .NET Framework path: there a strong-named reference binds to
     // exactly the requested version — no roll-forward — so it must equal the manifests'
     // version, or the bind fails with FileLoadException and the short-name fallback takes
     // the game's own Roslyn. Keep the pin and the three manifests in step.
+    //
+    // The same exact-version rule caps Roslyn at 5.3 on .NET Framework. 5.6+ depends on
+    // System.Collections.Immutable / System.Reflection.Metadata 10.0.1, whose net462 builds
+    // are 10.0.0.1 (NuGet bumps .NET Framework assets on every servicing release) while
+    // Roslyn references 10.0.0.0. A plugin has no config to carry the binding redirect an
+    // app would get, so the bind falls to the loader's game-dir resolver, which answers by
+    // name alone with the game's SCI 1.2.3.0: MissingMethodException on the first compile.
+    // 5.0–5.3 depend on the 9.0.0 packages, whose net462 builds are 9.0.0.0: exact matches.
     private static (Assembly csharp, Assembly common) LoadRoslyn()
     {
 #if NETCOREAPP
@@ -413,8 +433,8 @@ namespace System.Runtime.CompilerServices
 #endif
         try
         {
-            var csharp = Assembly.Load(MakeAssemblyName("Microsoft.CodeAnalysis.CSharp", 5, 9, 0, 0));
-            var common = Assembly.Load(MakeAssemblyName("Microsoft.CodeAnalysis", 5, 9, 0, 0));
+            var csharp = Assembly.Load(MakeAssemblyName("Microsoft.CodeAnalysis.CSharp", 5, 3, 0, 0));
+            var common = Assembly.Load(MakeAssemblyName("Microsoft.CodeAnalysis", 5, 3, 0, 0));
             return (csharp, common);
         }
         catch (Exception ex)
@@ -475,35 +495,49 @@ namespace System.Runtime.CompilerServices
     }
 
     // Guard against accidental infinite loops and runaway recursion that would
-    // hang the game thread. Three injection points share ScriptGuard state
-    // (KillId raised by the lane's FrameWatchdog when a frame's budget runs
-    // out; StackBase captured per-script on first StackCheck). Every timeout
-    // check compares KillId against scriptId, baked in as a constant, so it
-    // fires only for a kill aimed at THIS script — never another script's,
-    // and never once this script has left the lane (code it leaves behind,
-    // e.g. a Harmony patch or event handler, keeps running):
-    //   - Exception handler entry:
-    //       catch → rewritten into a filter handler that rejects while this
-    //         script is being killed. The filter runs in CLR's pass 1 (stackless
-    //         virtual unwind), so deep-recursion-plus-catch attacks unwind in
-    //         constant stack.
-    //       finally / fault → Bail (filter is illegal here; no caught exception).
-    //   - Backward branches → Bail. Catches tight loops with no method calls.
-    //   - REPL / Delegate call sites → StackCheck + Bail. Catches recursion
-    //     by sampling SP; first call per script sets StackBase, subsequent
-    //     calls throw if SP descends past the budget.
+    // hang the lane's thread. The checks go into the script's own methods, so
+    // they also cover REPL code the game or the BCL calls back into (virtual
+    // overrides, delegates handed to LINQ, Harmony patches). Three injection
+    // points share ScriptGuard state (KillId raised by the lane's FrameWatchdog
+    // when a frame's budget runs out; _stackBase captured per step by the first
+    // StackCheck):
+    //   - Method entry → StackCheck + Bail. Every turn of a recursion enters a
+    //     REPL method, directly or through BCL / game code calling back in, so
+    //     sampling SP here catches all of it: the step's first check sets
+    //     _stackBase, later ones throw once SP is past the budget. The check
+    //     runs one frame deeper than a check before the call would, which the
+    //     headroom absorbs (lane threads have 1.5MB stacks, the budget is
+    //     700KB). The Bail is the timeout check for recursion, which has no
+    //     back-edges, and for callbacks a loop outside the script keeps making
+    //     (LINQ over a huge sequence).
+    //   - Backward branches → Bail. Catches tight loops with no calls.
+    //   - Exception handler entry → catch rewritten into a filter that refuses
+    //     while this script is being killed; Bail at finally / fault. See
+    //     GuardHandlers.
+    // Every timeout check asks Killing with scriptId, baked in as a constant, so
+    // it fires only for a kill aimed at THIS script and only on the lane's own
+    // thread — never for another script, never in this script's code running on
+    // other threads, and never once this script has left the lane (code it
+    // leaves behind, e.g. a Harmony patch or event handler, keeps running).
     // Each Bail site is `ldc.i4 scriptId; call Bail(int)` — stack-neutral as a
     // pair, and always inserted adjacent, so no region boundary splits it.
+    //
+    // Everything that answers to KillId — every Bail site and the catch rewrite —
+    // is the timeout half, and a lane with no watchdog (guardBail null) gets none
+    // of it: nothing will ever raise KillId for its scripts, and its user catch
+    // blocks stay exactly as compiled. StackCheck is never optional: a stack
+    // overflow can't be caught in .NET, so it takes the whole process with it.
     // Not a security boundary — token holders already have full RCE.
-    private byte[] InjectTimeoutChecks(byte[] raw, int scriptId)
+    private byte[] InjectGuards(byte[] raw, int scriptId)
     {
         using var asm = AssemblyDefinition.ReadAssembly(new MemoryStream(raw));
         var replType = asm.MainModule.Types.FirstOrDefault(t => t.Name == "__REPL__");
         if (replType == null)
             throw new InvalidOperationException("Compiled assembly missing __REPL__ type");
 
-        var bailRef = asm.MainModule.ImportReference(guardBail);
-        var killIdRef = asm.MainModule.ImportReference(guardKillId);
+        // Both null on a lane with no watchdog — see above.
+        var bailRef = guardBail == null ? null : asm.MainModule.ImportReference(guardBail);
+        var killingRef = guardBail == null ? null : asm.MainModule.ImportReference(guardKilling);
         var stackRef = asm.MainModule.ImportReference(guardStackCheck);
 
         var types = new Stack<TypeDefinition>();
@@ -530,93 +564,20 @@ namespace System.Runtime.CompilerServices
 
                 var il = method.Body.GetILProcessor();
 
-                // Snapshot the original IL before we touch handlers. The
-                // backward-branch / call-site loop below iterates this snapshot,
-                // so it won't fall into the filter blocks we splice into catches.
+                // Snapshot the original IL before we touch it. The back-edge
+                // loop below iterates this snapshot, so it won't fall into the
+                // entry checks or the filter blocks we splice into catches.
                 var originalInstructions = method.Body.Instructions.ToList();
 
-                // Handler entries:
-                //  - Catch: rewrite into a filter handler. Filter runs in pass 1
-                //    (stackless virtual unwind); rejecting catches while this
-                //    script is being killed costs constant stack regardless of
-                //    recursion depth.
-                //    Previously tried throw-based Bail and `rethrow` opcode —
-                //    both cap at ~100 frames because nested ProcessClrException
-                //    routing in pass 1/2 is not actually stackless.
-                //  - Finally/Fault: `rethrow` / filter are illegal (no caught
-                //    exception in scope). Fall back to Bail. Not on the deep-
-                //    recursion attack surface.
-                //  - Existing Filter (user wrote `catch when`): skipped. Composing
-                //    filters is doable but messy — left as a documented gap,
-                //    matching SE's behavior.
-                //  - Empty finally (HandlerStart == endfinally): skipped, no body.
-                //
-                // Filter IL layout (the filter block must physically precede the
-                // handler block per CIL III.1.6.1):
-                //   .filter {
-                //     isinst CatchType    ; entry stack [exc] → [exc-or-null]
-                //     brfalse reject      ; null → reject (consumes top)
-                //     ldsfld KillId
-                //     ldc.i4 scriptId
-                //     beq reject          ; this script is being killed → reject
-                //     ldc.i4.1            ; accept
-                //     br endLabel
-                //   reject:
-                //     ldc.i4.0
-                //   endLabel:
-                //     endfilter           ; single exit; top-of-stack int32 = result
-                //   }
-                //   { stloc/pop; user catch body... }
-                foreach (var eh in method.Body.ExceptionHandlers)
-                {
-                    if (eh.HandlerType == ExceptionHandlerType.Filter) continue;
-                    if (eh.HandlerStart.OpCode == OpCodes.Endfinally) continue;
+                // Method entry, ahead of the first instruction: outside any try
+                // the body opens there, and a branch back to that instruction
+                // lands after the checks, so they run once per call.
+                var entry = originalInstructions[0];
+                il.InsertBefore(entry, il.Create(OpCodes.Call, stackRef));
+                InsertBail(il, entry, bailRef, scriptId);
 
-                    if (eh.HandlerType != ExceptionHandlerType.Catch)
-                    {
-                        // Finally / Fault: keep Bail.
-                        var ldId = il.Create(OpCodes.Ldc_I4, scriptId);
-                        il.InsertAfter(eh.HandlerStart, ldId);
-                        il.InsertAfter(ldId, il.Create(OpCodes.Call, bailRef));
-                        continue;
-                    }
-
-                    // Single-endfilter exit. Three paths converge on it with an
-                    // int32 result (0=reject, 1=accept):
-                    //   accept  : isinst != null AND KillId != scriptId  →  push 1
-                    //   reject1 : isinst == null (wrong type)            →  push 0
-                    //   reject2 : isinst != null AND KillId == scriptId  →  push 0
-                    var endLabel = il.Create(OpCodes.Endfilter);
-                    var rejectLabel = il.Create(OpCodes.Ldc_I4_0);
-                    var filterStart = il.Create(OpCodes.Isinst, eh.CatchType);
-                    var origHandlerStart = eh.HandlerStart;
-                    il.InsertBefore(origHandlerStart, filterStart);
-                    il.InsertBefore(origHandlerStart, il.Create(OpCodes.Brfalse, rejectLabel));
-                    il.InsertBefore(origHandlerStart, il.Create(OpCodes.Ldsfld, killIdRef));
-                    il.InsertBefore(origHandlerStart, il.Create(OpCodes.Ldc_I4, scriptId));
-                    il.InsertBefore(origHandlerStart, il.Create(OpCodes.Beq, rejectLabel));  // being killed
-                    il.InsertBefore(origHandlerStart, il.Create(OpCodes.Ldc_I4_1));
-                    il.InsertBefore(origHandlerStart, il.Create(OpCodes.Br, endLabel));
-                    il.InsertBefore(origHandlerStart, rejectLabel);                          // ldc.i4.0
-                    il.InsertBefore(origHandlerStart, endLabel);                             // endfilter
-
-                    // Switch handler type and point FilterStart at the filter entry.
-                    // HandlerStart is unchanged (still the original Roslyn stloc/pop).
-                    // CatchType must be cleared (filter handlers don't carry a type).
-                    eh.HandlerType = ExceptionHandlerType.Filter;
-                    eh.FilterStart = filterStart;
-                    eh.CatchType = null;
-
-                    // Other handlers' TryEnd/HandlerEnd may have referenced
-                    // origHandlerStart (try-block end == catch-block start, etc.).
-                    // Repoint them to filterStart so try/handler regions stay glued
-                    // together physically (CIL III.1.6.1 adjacency requirement).
-                    foreach (var any in method.Body.ExceptionHandlers)
-                    {
-                        if (any.TryEnd     == origHandlerStart) any.TryEnd     = filterStart;
-                        if (any.HandlerEnd == origHandlerStart) any.HandlerEnd = filterStart;
-                    }
-                }
+                if (bailRef != null)
+                    GuardHandlers(method.Body, il, bailRef, killingRef, scriptId);
 
                 foreach (var ins in originalInstructions)
                 {
@@ -643,25 +604,7 @@ namespace System.Runtime.CompilerServices
                     // (no exception, just a wrong verdict) — switch to comparing
                     // body.Instructions.IndexOf(t) <= IndexOf(ins) at that point.
                     if (ins.Operand is Instruction t && t.Offset <= ins.Offset)
-                    {
-                        il.InsertBefore(ins, il.Create(OpCodes.Ldc_I4, scriptId));
-                        il.InsertBefore(ins, il.Create(OpCodes.Call, bailRef));
-                    }
-                    // REPL/Delegate call site: StackCheck + Bail. The callvirt
-                    // will push a new frame; check budget BEFORE the push so the
-                    // first call per script captures StackBase, and recursion
-                    // automatically catches itself as SP descends past budget.
-                    // Can't Resolve() to filter true delegates from MethodInfo —
-                    // Cecil reads from MemoryStream with no probing dirs.
-                    else if ((ins.OpCode == OpCodes.Call || ins.OpCode == OpCodes.Callvirt)
-                             && ins.Operand is MethodReference mr
-                             && (mr.DeclaringType.FullName.StartsWith("__REPL__", StringComparison.Ordinal)
-                                 || mr.Name == "Invoke"))
-                    {
-                        il.InsertBefore(ins, il.Create(OpCodes.Call, stackRef));
-                        il.InsertBefore(ins, il.Create(OpCodes.Ldc_I4, scriptId));
-                        il.InsertBefore(ins, il.Create(OpCodes.Call, bailRef));
-                    }
+                        InsertBail(il, ins, bailRef, scriptId);
                 }
             }
         }
@@ -669,6 +612,106 @@ namespace System.Runtime.CompilerServices
         var output = new MemoryStream();
         asm.Write(output);
         return output.ToArray();
+    }
+
+    // Handler entries — the timeout half, so InjectGuards runs this only on a lane
+    // with a watchdog:
+    //  - Catch: rewrite into a filter handler. Filter runs in pass 1
+    //    (stackless virtual unwind); rejecting catches while this
+    //    script is being killed costs constant stack regardless of
+    //    recursion depth.
+    //    Previously tried throw-based Bail and `rethrow` opcode —
+    //    both cap at ~100 frames because nested ProcessClrException
+    //    routing in pass 1/2 is not actually stackless.
+    //  - Finally/Fault: `rethrow` / filter are illegal (no caught
+    //    exception in scope). Fall back to Bail. Not on the deep-
+    //    recursion attack surface.
+    //  - Existing Filter (user wrote `catch when`): skipped. Composing
+    //    filters is doable but messy — left as a documented gap,
+    //    matching SE's behavior.
+    //  - Empty finally (HandlerStart == endfinally): skipped, no body.
+    //
+    // Filter IL layout (the filter block must physically precede the
+    // handler block per CIL III.1.6.1):
+    //   .filter {
+    //     isinst CatchType    ; entry stack [exc] → [exc-or-null]
+    //     brfalse reject      ; null → reject (consumes top)
+    //     ldc.i4 scriptId
+    //     call Killing        ; being killed, on this thread? → [bool]
+    //     brtrue reject       ; yes → reject
+    //     ldc.i4.1            ; accept
+    //     br endLabel
+    //   reject:
+    //     ldc.i4.0
+    //   endLabel:
+    //     endfilter           ; single exit; top-of-stack int32 = result
+    //   }
+    //   { stloc/pop; user catch body... }
+    // The call is fine here: it neither throws nor nests a dispatch, and returns
+    // before the filter does, so the stack stays constant. On any other thread
+    // Killing says no, so the same catch there keeps catching during a kill.
+    private static void GuardHandlers(Mono.Cecil.Cil.MethodBody body, ILProcessor il,
+        MethodReference bailRef, MethodReference killingRef, int scriptId)
+    {
+        foreach (var eh in body.ExceptionHandlers)
+        {
+            if (eh.HandlerType == ExceptionHandlerType.Filter) continue;
+            if (eh.HandlerStart.OpCode == OpCodes.Endfinally) continue;
+
+            if (eh.HandlerType != ExceptionHandlerType.Catch)
+            {
+                // Finally / Fault: keep Bail.
+                var ldId = il.Create(OpCodes.Ldc_I4, scriptId);
+                il.InsertAfter(eh.HandlerStart, ldId);
+                il.InsertAfter(ldId, il.Create(OpCodes.Call, bailRef));
+                continue;
+            }
+
+            // Single-endfilter exit. Three paths converge on it with an
+            // int32 result (0=reject, 1=accept):
+            //   accept  : isinst != null AND !Killing(scriptId)  →  push 1
+            //   reject1 : isinst == null (wrong type)            →  push 0
+            //   reject2 : isinst != null AND Killing(scriptId)   →  push 0
+            var endLabel = il.Create(OpCodes.Endfilter);
+            var rejectLabel = il.Create(OpCodes.Ldc_I4_0);
+            var filterStart = il.Create(OpCodes.Isinst, eh.CatchType);
+            var origHandlerStart = eh.HandlerStart;
+            il.InsertBefore(origHandlerStart, filterStart);
+            il.InsertBefore(origHandlerStart, il.Create(OpCodes.Brfalse, rejectLabel));
+            il.InsertBefore(origHandlerStart, il.Create(OpCodes.Ldc_I4, scriptId));
+            il.InsertBefore(origHandlerStart, il.Create(OpCodes.Call, killingRef));
+            il.InsertBefore(origHandlerStart, il.Create(OpCodes.Brtrue, rejectLabel)); // being killed
+            il.InsertBefore(origHandlerStart, il.Create(OpCodes.Ldc_I4_1));
+            il.InsertBefore(origHandlerStart, il.Create(OpCodes.Br, endLabel));
+            il.InsertBefore(origHandlerStart, rejectLabel);                          // ldc.i4.0
+            il.InsertBefore(origHandlerStart, endLabel);                             // endfilter
+
+            // Switch handler type and point FilterStart at the filter entry.
+            // HandlerStart is unchanged (still the original Roslyn stloc/pop).
+            // CatchType must be cleared (filter handlers don't carry a type).
+            eh.HandlerType = ExceptionHandlerType.Filter;
+            eh.FilterStart = filterStart;
+            eh.CatchType = null;
+
+            // Other handlers' TryEnd/HandlerEnd may have referenced
+            // origHandlerStart (try-block end == catch-block start, etc.).
+            // Repoint them to filterStart so try/handler regions stay glued
+            // together physically (CIL III.1.6.1 adjacency requirement).
+            foreach (var any in body.ExceptionHandlers)
+            {
+                if (any.TryEnd     == origHandlerStart) any.TryEnd     = filterStart;
+                if (any.HandlerEnd == origHandlerStart) any.HandlerEnd = filterStart;
+            }
+        }
+    }
+
+    // One Bail site before `at`: `ldc.i4 scriptId; call Bail(int)`. None on a lane with
+    // no watchdog (bail null), so InjectGuards' insertion sites read the same for every lane.
+    private static void InsertBail(ILProcessor il, Instruction at, MethodReference bail, int scriptId)
+    {
+        if (bail == null) return;
+        il.InsertBefore(at, il.Create(OpCodes.Ldc_I4, scriptId));
+        il.InsertBefore(at, il.Create(OpCodes.Call, bail));
     }
 
     // Short-form branch opcode → long-form. Mono.Cecil.Rocks.SimplifyMacros would do this

@@ -32,6 +32,16 @@ internal static class ScriptRender
         return tail.Length == 0 ? o : o + "\n" + tail;
     }
 
+    // The report on a script that ended in an exception. It follows the script's own output
+    // (Combine), so its first line has to say where that output stops and what went wrong. Compile
+    // errors need none: each diagnostic names its field.
+    public static string StartFailed(Exception ex) => "script failed to start:\n" + Stack(ex);
+
+    public static string Threw(Exception ex) => "script threw:\n" + Stack(ex);
+
+    // The error on a request still open when its lane is torn down.
+    public const string Shutdown = "[server shutting down]";
+
     // An exception as .NET prints it — type, message, frames and the whole InnerException chain —
     // with two changes for a reader billed per line: a run of repeated frames collapses to one copy
     // and a count (runaway recursion is thousands of identical frames before StackCheck stops it),
@@ -41,13 +51,11 @@ internal static class ScriptRender
     {
         if (ex is TargetInvocationException { InnerException: not null } tie)
             ex = tie.InnerException;
-        var lines = FoldRepeats(ex.ToString().Split('\n').Select(l => l.TrimEnd('\r')).ToList());
-        if (lines.Count > MaxLines)
-        {
-            var more = lines.Count - MaxLines;
-            lines.RemoveRange(MaxLines, more);
-            lines.Add($"   ... {more} more line(s)");
-        }
+        var lines = FoldRepeats([.. ex.ToString().Split('\n').Select(l => l.TrimEnd('\r'))]);
+        if (lines.Count <= MaxLines) return string.Join("\n", lines);
+        var more = lines.Count - MaxLines;
+        lines.RemoveRange(MaxLines, more);
+        lines.Add($"   ... {more} more line(s)");
         return string.Join("\n", lines);
     }
 

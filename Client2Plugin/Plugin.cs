@@ -14,8 +14,8 @@ using Shared.Se2;
 
 // Define assembly version when compiled by Pulsar
 #if !DEV_BUILD
-[assembly: AssemblyVersion("2.0.0.0")]
-[assembly: AssemblyFileVersion("2.0.0.0")]
+[assembly: AssemblyVersion("2.1.0.0")]
+[assembly: AssemblyFileVersion("2.1.0.0")]
 #endif
 
 namespace Client2Plugin;
@@ -66,11 +66,14 @@ public sealed class Plugin : IPlugin, IDisposable, ICommonPlugin
     private PersistentConfig<Config> config;
     private const string ConfigFileName = $"{Name}.cfg";
 
-    // Two execution lanes (mirrors SE1). Main is pumped by PatchMainLane (VRageCore.Update
+    // Three execution lanes (mirrors SE1). Main is pumped by PatchMainLane (VRageCore.Update
     // Postfix); Render by PatchRenderFrame (Render12EngineComponent.RenderFrame Postfix). Each
     // binds its own ScriptGuard{Main,Render} static class (Shared/Core) via pre-resolved handles.
+    // Parallel runs each script on a thread of its own; PatchMainLane only pushes the deny gate
+    // onto it.
     internal static Executor MainExecutor;
     internal static Executor RenderExecutor;
+    internal static ParallelExecutor ParallelExecutor;
 
     private McpServer mcpServer;
 
@@ -114,22 +117,25 @@ public sealed class Plugin : IPlugin, IDisposable, ICommonPlugin
 
         // Two lanes, each bound to its own ScriptGuard (Shared/Core). Identical to SE1's wiring.
         MainExecutor = new Executor(
-            ScriptGuardMain.BailMethod, ScriptGuardMain.StackCheckMethod, ScriptGuardMain.KillIdField,
-            v => ScriptGuardMain.KillId = v, sp => ScriptGuardMain.StackBase = sp,
+            ScriptGuardMain.BailMethod, ScriptGuardMain.StackCheckMethod, ScriptGuardMain.KillingMethod,
+            v => ScriptGuardMain.KillId = v, ScriptGuardMain.BeginStep,
             DenialMessage, frameTimeoutMs: 1000, defaultUsings: ScriptDefaults.Usings);
 
         RenderExecutor = new Executor(
-            ScriptGuardRender.BailMethod, ScriptGuardRender.StackCheckMethod, ScriptGuardRender.KillIdField,
-            v => ScriptGuardRender.KillId = v, sp => ScriptGuardRender.StackBase = sp,
+            ScriptGuardRender.BailMethod, ScriptGuardRender.StackCheckMethod, ScriptGuardRender.KillingMethod,
+            v => ScriptGuardRender.KillId = v, ScriptGuardRender.BeginStep,
             DenialMessage, frameTimeoutMs: 1000, defaultUsings: ScriptDefaults.Usings);
+
+        ParallelExecutor = new ParallelExecutor(DenialMessage, ScriptDefaults.Usings);
 
         var tools = new ITool[]
         {
-            new ExecuteCodeTool(MainExecutor, RenderExecutor, MpAdminNote, ScriptDefaults.SchemaText),
+            new ExecuteCodeTool(MainExecutor, ParallelExecutor, RenderExecutor, MpAdminNote, ScriptDefaults.SchemaText),
             new ScreenshotTool(MainExecutor)
         };
 
-        mcpServer = new McpServer(tools, config.Data);
+        mcpServer = new McpServer(tools, config.Data,
+            $"Space Engineers 2 {typeof(Keen.Game2.GameAppComponent).Assembly.GetName().Version}", dedicated: false);
         mcpServer.Start();
 
         AppDomain.CurrentDomain.AssemblyResolve += ResolvePluginAssembly;
@@ -147,10 +153,12 @@ public sealed class Plugin : IPlugin, IDisposable, ICommonPlugin
         // Dispose (sets disposed + fulfills inflight) then Tick drains `active` on the
         // script's owning thread — finally blocks / thread-affine state stay correct. Render
         // lane: Dispose is enough; its next RenderFrame Postfix drains on the render thread
-        // (the hook is left patched so that drain can still run).
+        // (the hook is left patched so that drain can still run). Parallel: Dispose answers its
+        // requests and aborts its scripts; their threads are background threads.
         RenderExecutor?.Dispose();
         MainExecutor?.Dispose();
         MainExecutor?.Tick();
+        ParallelExecutor?.Dispose();
 
         AppDomain.CurrentDomain.AssemblyResolve -= ResolvePluginAssembly;
         Compiler.ReleaseShared();
@@ -165,6 +173,7 @@ public sealed class Plugin : IPlugin, IDisposable, ICommonPlugin
 
         MainExecutor = null;
         RenderExecutor = null;
+        ParallelExecutor = null;
         mcpServer = null;
         config = null;
     }

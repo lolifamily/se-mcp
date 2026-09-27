@@ -18,8 +18,10 @@
     <Compile Include="$(MSBuildThisFileDirectory)Mcp\ExecuteCodeTool.cs" />
     <Compile Include="$(MSBuildThisFileDirectory)Mcp\Executor.cs" />
     <Compile Include="$(MSBuildThisFileDirectory)Mcp\FrameWatchdog.cs" />
+    <Compile Include="$(MSBuildThisFileDirectory)Mcp\IScriptLane.cs" />
     <Compile Include="$(MSBuildThisFileDirectory)Mcp\ITool.cs" />
     <Compile Include="$(MSBuildThisFileDirectory)Mcp\McpServer.cs" />
+    <Compile Include="$(MSBuildThisFileDirectory)Mcp\ParallelExecutor.cs" />
     <Compile Include="$(MSBuildThisFileDirectory)Mcp\ScriptGuard.cs" />
     <Compile Include="$(MSBuildThisFileDirectory)Mcp\ScriptRender.cs" />
     <Compile Include="$(MSBuildThisFileDirectory)Mcp\TokenGenerator.cs" />
@@ -27,6 +29,7 @@
     <Compile Include="$(MSBuildThisFileDirectory)Plugin\Common.cs" />
     <Compile Include="$(MSBuildThisFileDirectory)Plugin\ICommonPlugin.cs" />
     <Compile Include="$(MSBuildThisFileDirectory)Tools\CodeChange.cs" />
+    <Compile Include="$(MSBuildThisFileDirectory)Tools\ControlledExecution.cs" />
     <Compile Include="$(MSBuildThisFileDirectory)Tools\EnsureCode.cs" />
     <Compile Include="$(MSBuildThisFileDirectory)Tools\Hashing.cs" />
     <Compile Include="$(MSBuildThisFileDirectory)Tools\UsedImplicitlyAttribute.cs" />

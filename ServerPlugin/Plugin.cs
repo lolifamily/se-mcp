@@ -11,12 +11,13 @@ using Shared.Patches;
 using Shared.Plugin;
 using Shared.Se1;
 using VRage.FileSystem;
+using VRage.Game;
 using VRage.Plugins;
 
 // Define assembly version when compiled by Magnetar
 #if !DEV_BUILD
-[assembly: AssemblyVersion("2.0.0.0")]
-[assembly: AssemblyFileVersion("2.0.0.0")]
+[assembly: AssemblyVersion("2.1.0.0")]
+[assembly: AssemblyFileVersion("2.1.0.0")]
 #endif
 
 namespace ServerPlugin;
@@ -38,11 +39,17 @@ public sealed class Plugin : IPlugin, ICommonPlugin
     // server has no Settings GUI and its file layout follows the template default).
     private const string ConfigFileName = $"{Name}.cfg";
 
-    // Single execution lane on DS: there's no render thread, no Patch_RenderFrame
-    // hook. McpServer's `target` enum is derived from lanes.Keys → tools/list
-    // exposes only ["main"] on the server, and a request that asks for "render"
-    // gets a clean -32602 rather than a silent fallback.
+    // Two execution lanes on DS, main and parallel: there's no render thread, no
+    // Patch_RenderFrame hook. ExecuteCodeTool's `target` enum comes from the lanes
+    // it is given → tools/list exposes ["main","parallel"] on the server, and a
+    // request that asks for "render" gets a clean -32602 rather than a silent
+    // fallback.
     private static Executor _mainExecutor;
+    private static ParallelExecutor _parallelExecutor;
+
+    // No deny gate on DS (see Init), so no request ever reads this; kept non-null
+    // as a guardrail against a future code path that surfaces it.
+    private const string DenialMessage = "denied";
 
     private McpServer mcpServer;
 
@@ -90,27 +97,28 @@ public sealed class Plugin : IPlugin, ICommonPlugin
         if (!PatchHelpers.HarmonyPatchAll(Log, new Harmony(Name)))
             Log.Warning("Config-schema patch failed; using default caption. Core MCP/code-execution unaffected.");
 
-        // Single lane on DS. denyPolicy returns false unconditionally — the DS
+        // No deny gate on DS: denyPolicy returns false unconditionally — the DS
         // already gates who can join the server; once a caller has the SeMcp
         // bearer token they have full RCE, so a "must be Admin" check on top
-        // would be security theater. denialMessage is unread in practice (the
-        // for-loop reject path is never taken) but kept non-null as a guardrail
-        // against a future code path that surfaces it.
+        // would be security theater.
         _mainExecutor = new Executor(
             ScriptGuardMain.BailMethod,
             ScriptGuardMain.StackCheckMethod,
-            ScriptGuardMain.KillIdField,
+            ScriptGuardMain.KillingMethod,
             v => ScriptGuardMain.KillId = v,
-            sp => ScriptGuardMain.StackBase = sp,
-            denialMessage: "denied",
+            ScriptGuardMain.BeginStep,
+            DenialMessage,
             frameTimeoutMs: 1000,
             defaultUsings: ScriptDefaults.Usings);
 
+        _parallelExecutor = new ParallelExecutor(DenialMessage, ScriptDefaults.Usings);
+
         // mpAdminNote omitted: server has no MP admin gate, the schema
         // description stays free of the "Multiplayer requires Admin" line.
-        var tools = new ITool[] { new ExecuteCodeTool(_mainExecutor) };
+        var tools = new ITool[] { new ExecuteCodeTool(_mainExecutor, _parallelExecutor) };
 
-        mcpServer = new McpServer(tools, config.Data);
+        mcpServer = new McpServer(tools, config.Data,
+            $"Space Engineers {MyFinalBuildConstants.APP_VERSION_STRING_DOTS}", dedicated: true);
         mcpServer.Start();
 
         AppDomain.CurrentDomain.AssemblyResolve += ResolvePluginAssembly;
@@ -120,12 +128,15 @@ public sealed class Plugin : IPlugin, ICommonPlugin
 
     public void Dispose()
     {
-        // Single lane: Dispose() sets `disposed` and fulfills inflight
-        // promises; Tick() then drains `active` on this thread (main).
-        // After Dispose returns SE stops calling Update — this is the
-        // last chance to run script finally blocks on the right thread.
+        // Main: Dispose() sets `disposed` and fulfills inflight promises;
+        // Tick() then drains `active` on this thread (main). After Dispose
+        // returns SE stops calling Update — this is the last chance to run
+        // script finally blocks on the right thread. Parallel: Dispose answers
+        // its requests and aborts its scripts; their threads are background
+        // threads.
         _mainExecutor?.Dispose();
         _mainExecutor?.Tick();
+        _parallelExecutor?.Dispose();
 
         AppDomain.CurrentDomain.AssemblyResolve -= ResolvePluginAssembly;
         Compiler.ReleaseShared();
@@ -141,6 +152,7 @@ public sealed class Plugin : IPlugin, ICommonPlugin
 
         ServerPlugin.Config.Instance = null;
         _mainExecutor = null;
+        _parallelExecutor = null;
         mcpServer = null;
         config = null;
     }
@@ -151,8 +163,11 @@ public sealed class Plugin : IPlugin, ICommonPlugin
         // call). Order matters: shared compiler references must populate
         // before MainExecutor exposes Initialized=true to the McpServer gate
         // (the volatile write is also what publishes them across threads).
+        // ParallelExecutor publishes them the same way.
         Compiler.InitShared();
         _mainExecutor?.Initialize();
+        _parallelExecutor?.Initialize();
         _mainExecutor?.Tick();
+        _parallelExecutor?.EnforceDenyGate();
     }
 }
