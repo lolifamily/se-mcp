@@ -5,37 +5,15 @@ using System.Text.Json;
 
 namespace Shared.Mcp;
 
-// Host-specific vocabulary spliced into the execute_code schema description. The schema
-// shape (three fields, statements-only, error format, target routing) is a mechanical
-// contract shared by SE1 and SE2; only these few symbols name the concrete game API and
-// differ per host. SE1 passes null (→ Se1Default below); SE2 passes
-// Shared.Se2.ScriptDefaults.SchemaText.
-// Primary-constructor class (NOT a record): record's init accessors need
-// System.Runtime.CompilerServices.IsExternalInit, which net48 (the SE1 targets) lacks.
-// get-only auto-props + a primary ctor compile on both net48 and net10.
-public sealed class ExecuteCodeSchemaText(
-    string preImported, string shortNames, string fqnExample,
-    string mainDriver, string mainApi, string renderTarget, string renderAssert)
-{
-    public string PreImported { get; } = preImported;    // "System.*, VRage.*, Sandbox.*"
-    public string ShortNames { get; } = shortNames;      // "MySession.Static, MyCubeGrid"
-    public string FqnExample { get; } = fqnExample;      // "Sandbox.Game.World.MySession.Static"
-    public string MainDriver { get; } = mainDriver;      // "IPlugin.Update"
-    public string MainApi { get; } = mainApi;            // "MyAPIGateway / Session / Grid / Entity"
-    public string RenderTarget { get; } = renderTarget;  // "MyRenderThread.RenderFrame"
-    public string RenderAssert { get; } = renderAssert;  // "MyAPIGateway"
-}
-
 // The execute_code tool. Every host has the main and parallel lanes; the client adds render
-// (renderExec = null on the server). One lane list drives the schema's target enum, the target
-// description and dispatch, so the three can't drift apart; a target not on it gets -32602.
+// (renderExec = null on the server). One lane list drives the schema's target enum and default,
+// the target description and dispatch, so they can't drift apart; a target not on it gets -32602.
 //
-// mpAdminNote: appended verbatim (with a leading space) to the top-level
-// description so the LLM is warned about MP gating before it composes a
-// request that the executor would only reject after dispatch. null/empty = no suffix.
-//
-// vocab: host-specific schema symbols (see ExecuteCodeSchemaText). null → Se1Default,
-// so SE1 needs no change; SE2 passes its own.
+// The schema is read by a model in every session, so it says what the next call needs and stops —
+// the Minecraft MCP's McpJson makes the full argument. What it leaves out on purpose is kept in
+// comments here, where it costs a model nothing. game and imports are the host's own words
+// (Shared.Se1/Se2 ScriptDefaults): its name, and what comes pre-imported — the one thing about
+// writing a script that differs between hosts.
 public sealed class ExecuteCodeTool : ITool
 {
     public string Name => "execute_code";
@@ -43,42 +21,67 @@ public sealed class ExecuteCodeTool : ITool
     public string SchemaJson { get; }
 
     // "main" first: the default, and first in the schema's enum.
-    private readonly (string Name, IScriptLane Lane, string Desc)[] lanes;
+    private readonly (string Name, IScriptLane Lane, string Prose)[] lanes;
 
-    public ExecuteCodeTool(
-        Executor mainExec,
-        ParallelExecutor parallelExec,
-        Executor renderExec = null,
-        string mpAdminNote = null,
-        ExecuteCodeSchemaText vocab = null)
+    public ExecuteCodeTool(Executor mainExec, ParallelExecutor parallelExec, Executor renderExec, string game, string imports)
     {
         lanes = renderExec == null
-            ? [("main", mainExec, MainLaneDesc), ("parallel", parallelExec, ParallelLaneDesc)]
-            : [("main", mainExec, MainLaneDesc), ("render", renderExec, RenderLaneDesc), ("parallel", parallelExec, ParallelLaneDesc)];
-        SchemaJson = BuildSchema(lanes, mpAdminNote, vocab ?? Se1Default);
+            ? [("main", mainExec, MainProse), ("parallel", parallelExec, ParallelProse)]
+            : [("main", mainExec, MainProse), ("render", renderExec, RenderProse), ("parallel", parallelExec, ParallelProse)];
+
+        // Each field says what goes in it, and that split is what routes a script's parts — so no "do
+        // NOT" lines: a using directive or a type declaration put in `code` fails to compile there, and
+        // a usings item written with its own `using` or `;` doubles them; either way the error names the
+        // field to fix. The usings examples show the bare form; the last one is an extern alias, which
+        // the template declares for every clashing assembly (ScriptReferences, Compiler.InitShared).
+        SchemaJson = ToolSchema.Build(Name,
+            $"Run C# inside the running {game} game; returns what the script writes to Console. "
+            + "Internal and protected types and members are accessible directly; private ones need reflection. "
+            + imports,
+            new ToolSchema.Param("code",
+                "Statements of the script's entry method. To wait: `await` on \"parallel\", `yield return null` (next frame) elsewhere.",
+                required: true),
+            new ToolSchema.Param("class_body",
+                "Members of the script's class, visible to `code`: methods, fields, nested types, [DllImport] externs."),
+            new ToolSchema.Param("usings",
+                "Extra namespaces to import, e.g. \"System.Threading.Tasks\", \"IO = System.IO\", \"static System.Math\", "
+                + "or \"Foo_Bar::Ns\" for a clashing assembly Foo.Bar.",
+                type: "array"),
+            new ToolSchema.Param("target",
+                "Thread the script runs on: " + string.Join(", ", lanes.Select(l => l.Prose)) + ".",
+                @enum: [.. lanes.Select(l => l.Name)], @default: lanes[0].Name));
     }
 
-    // SE1 back-compat default — the exact symbols the schema shipped with before it was
-    // parameterized. Passing vocab=null (both SE1 hosts) keeps them.
-    private static readonly ExecuteCodeSchemaText Se1Default = new(
-        preImported: "System.*, VRage.*, VRageMath, Sandbox.*, SpaceEngineers.Game.*",
-        shortNames: "MySession.Static, MyCubeGrid",
-        fqnExample: "Sandbox.Game.World.MySession.Static",
-        mainDriver: "IPlugin.Update",
-        mainApi: "MyAPIGateway / Session / Grid / Entity",
-        renderTarget: "MyRenderThread.RenderFrame",
-        renderAssert: "MyAPIGateway");
+    // What each lane IS; which lanes a host has, and which is the default, are the schema's enum and
+    // default. Left out of the prose on purpose, kept here for maintainers:
+    //   - main is pumped by a Postfix on the main thread's frame (MySandboxGame.Update on SE1,
+    //     VRageCore.Update on SE2); render by one on the render thread's (MyRenderThread.RenderFrame,
+    //     Render12EngineComponent.RenderFrame) — all at int.MinValue, not Priority.Last: Last is
+    //     only 0, and any negative priority would still run after it.
+    //   - render exists to inspect what runs on that thread: other plugins' Harmony hooks there, their
+    //     __instance, captured locals, accumulated fields. Game and session APIs assert-throw on it
+    //     (SE1's MyAPIGateway, SE2's session and scene).
+    //   - both frame lanes hold up their thread for each step, under a 1 s budget per frame shared by
+    //     that lane's scripts; when it runs out, the report says to split the work with
+    //     `yield return null`.
+    //   - parallel's entry is an async iterator: `await` compiles there and on no other lane, and
+    //     `yield return null` resumes at once. Whatever a script awaits, it resumes on its own
+    //     thread (ScriptPump, ScriptBuilders.cs).
+    private const string MainProse = "\"main\" (game thread)";
+    private const string RenderProse = "\"render\" (render thread)";
+    private const string ParallelProse =
+        "\"parallel\" (a thread of its own, concurrent with the game, no frame budget; for computation and blocking I/O)";
 
     public bool TryDispatch(JsonElement arguments, WorkItem item, out int errorCode, out string errorMessage)
     {
         errorCode = 0;
-        errorMessage =null;
+        errorMessage = null;
 
         if (arguments.ValueKind != JsonValueKind.Object
             || !arguments.TryGetProperty("code", out var codeEl) || codeEl.ValueKind != JsonValueKind.String)
         {
             errorCode = -32602;
-            errorMessage ="Invalid params: arguments.code must be a string";
+            errorMessage = "Invalid params: arguments.code must be a string";
             return false;
         }
 
@@ -90,7 +93,7 @@ public sealed class ExecuteCodeTool : ITool
             if (cbEl.ValueKind != JsonValueKind.String)
             {
                 errorCode = -32602;
-                errorMessage ="Invalid params: class_body must be a string";
+                errorMessage = "Invalid params: class_body must be a string";
                 return false;
             }
             item.ClassBody = cbEl.GetString();
@@ -102,7 +105,7 @@ public sealed class ExecuteCodeTool : ITool
             if (uEl.ValueKind != JsonValueKind.Array)
             {
                 errorCode = -32602;
-                errorMessage ="Invalid params: usings must be an array of strings";
+                errorMessage = "Invalid params: usings must be an array of strings";
                 return false;
             }
             var usings = new List<string>(uEl.GetArrayLength());
@@ -111,7 +114,7 @@ public sealed class ExecuteCodeTool : ITool
                 if (el.ValueKind != JsonValueKind.String)
                 {
                     errorCode = -32602;
-                    errorMessage ="Invalid params: usings items must be strings";
+                    errorMessage = "Invalid params: usings items must be strings";
                     return false;
                 }
                 usings.Add(el.GetString());
@@ -128,71 +131,40 @@ public sealed class ExecuteCodeTool : ITool
             if (tEl.ValueKind != JsonValueKind.String)
             {
                 errorCode = -32602;
-                errorMessage ="Invalid params: target must be a string";
+                errorMessage = "Invalid params: target must be a string";
                 return false;
             }
             target = tEl.GetString();
         }
 
-        var lane = string.IsNullOrEmpty(target) ? lanes[0].Lane : Array.Find(lanes, l => l.Name == target).Lane;
-        if (lane == null)
+        var lane = string.IsNullOrEmpty(target) ? lanes[0] : Array.Find(lanes, l => l.Name == target);
+        if (lane.Lane == null)
         {
             errorCode = -32602;
-            errorMessage =$"Invalid params: target must be one of {string.Join(", ", lanes.Select(l => $"\"{l.Name}\""))} (got \"{target}\")";
+            errorMessage = $"Invalid params: target must be one of {string.Join(", ", lanes.Select(l => $"\"{l.Name}\""))} (got \"{target}\")";
             return false;
         }
 
-        if (!lane.Initialized)
+        if (!lane.Lane.Initialized)
         {
             errorCode = -32002;
-            errorMessage ="Game is still loading, not all plugins have been initialized yet. Please retry shortly.";
+            errorMessage = NotReady(lane.Name);
             return false;
         }
 
-        lane.Enqueue(item);
+        lane.Lane.Enqueue(item);
         return true;
     }
 
-    // --- schema construction ---------------------------------------------------
-    //
-    // Single template + Replace passes. Host-neutral wording stays literal; every
-    // host-specific symbol is a <<PLACEHOLDER>> filled from the vocab. The target enum and
-    // description are assembled from the host's lanes.
-    private const string SchemaTemplate = """
-{"name":"execute_code","description":"Execute C# in Space Engineers. Full .NET + game API access, including the game's INTERNAL types and members — scripts compile with ignore-accessibility, so internal classes/methods/fields/properties are directly usable WITHOUT reflection (only truly private members still need reflection). Three fields map 1:1 to C# language layers: `code` is the entry method body (statements only), `class_body` holds class-level declarations (methods/fields/nested types/[DllImport]), `usings` adds namespace imports. Pre-imported namespaces: <<PREIMPORTED>>. ALWAYS use short type names like <<SHORTNAMES>> — do NOT write fully qualified names like <<FQN_EXAMPLE>>.<<MP_NOTE>>","inputSchema":{"type":"object","properties":{"code":{"type":"string","description":"Entry method body — STATEMENTS ONLY. Goes inside the wrapper Run() method. Use Console.WriteLine() for output. Use `yield return null` to pause until the next frame. Do NOT put `using` directives or class-level declarations here — use `usings` and `class_body` for those."},"class_body":{"type":"string","description":"OPTIONAL. Class-level declarations spliced into the wrapper class body alongside Run(): methods, fields, properties, nested types, [DllImport] P/Invoke. Use this when you need attributes that cannot go on statements (e.g. [DllImport]). Items declared here are referenced from `code` directly (same class). Most scripts leave this empty."},"usings":{"type":"array","items":{"type":"string"},"description":"OPTIONAL. Extra namespace imports beyond the defaults. Each item is a bare namespace path like \"System.Runtime.InteropServices\", an alias like \"IO = System.IO\", or \"static System.Math\". Do NOT include the `using` keyword or trailing semicolon — they are added automatically."},"target":{"type":"string","enum":<<LANE_ENUM>>,"description":"<<TARGET_DESC>>"}},"required":["code"]}}
-""";
-
-    private const string MainLaneDesc =
-        "\\\"main\\\" (default) runs in the game's main thread via <<MAIN_DRIVER>> — " +
-        "use this for <<MAIN_API>> access.";
-
-    private const string RenderLaneDesc =
-        "\\\"render\\\" runs in the render thread via a Harmony Postfix on <<RENDER_TARGET>> — " +
-        "use ONLY to inspect other plugins' Harmony hooks that execute on the render thread " +
-        "(their __instance, captured locals, accumulated fields). " +
-        "Render-target scripts freeze one frame per step (~16ms); use yield return null to split work across frames. " +
-        "<<RENDER_ASSERT>> will assert-throw on render thread.";
-
-    private const string ParallelLaneDesc =
-        "\\\"parallel\\\" runs off-frame and concurrently, with no frame budget — for computation and blocking I/O.";
-
-    private static string BuildSchema(
-        (string Name, IScriptLane Lane, string Desc)[] lanes, string mpAdminNote, ExecuteCodeSchemaText v)
+    // Points at the next call, not at the cause: another lane if one is up, a retry if none is. Main
+    // and parallel open on the first update once the game has loaded; render on its own thread's
+    // first frame after that — or never, when its pump doesn't run (SE1's StartSync mode, a hook
+    // broken by a game update), where "retry" alone would loop for good.
+    private string NotReady(string lane)
     {
-        var laneEnum = "[" + string.Join(",", lanes.Select(l => $"\"{l.Name}\"")) + "]";
-        var targetDesc = ("Execution lane. " + string.Join(" ", lanes.Select(l => l.Desc)))
-            .Replace("<<MAIN_DRIVER>>", v.MainDriver)
-            .Replace("<<MAIN_API>>", v.MainApi)
-            .Replace("<<RENDER_TARGET>>", v.RenderTarget)
-            .Replace("<<RENDER_ASSERT>>", v.RenderAssert);
-        var mpNote = string.IsNullOrEmpty(mpAdminNote) ? "" : " " + mpAdminNote;
-
-        return SchemaTemplate
-            .Replace("<<PREIMPORTED>>", v.PreImported)
-            .Replace("<<SHORTNAMES>>", v.ShortNames)
-            .Replace("<<FQN_EXAMPLE>>", v.FqnExample)
-            .Replace("<<LANE_ENUM>>", laneEnum)
-            .Replace("<<TARGET_DESC>>", targetDesc)
-            .Replace("<<MP_NOTE>>", mpNote);
+        var ready = lanes.Where(l => l.Lane.Initialized).Select(l => $"\"{l.Name}\"").ToArray();
+        return ready.Length == 0
+            ? "Game still loading — retry shortly."
+            : $"\"{lane}\" lane not ready. Ready targets: {string.Join(", ", ready)}.";
     }
 }

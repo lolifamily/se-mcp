@@ -29,8 +29,8 @@ namespace ClientPlugin;
 public class Config : Shared.Config.PluginConfig
 {
     [XmlIgnore]
-    public string Title => BoundPort > 0  ? $"SeMcp — :{BoundPort}"
-                         : ErrorMessage != null  ? $"SeMcp — {ErrorMessage}"
+    public string Title => BoundPort > 0 ? $"SeMcp — :{BoundPort}"
+                         : ErrorMessage != null ? $"SeMcp — {ErrorMessage}"
                          : "SeMcp — starting…";
 
     [Separator("MCP Server (port change requires restart)")]

@@ -21,7 +21,7 @@ namespace ClientPlugin.Patches;
 // right one to tick and we'd otherwise double-tick scripts on a confused thread
 // identity. RenderSystemThread is null in sync mode.
 //
-// Initialize lives here, on the lane's own pump, NOT in Plugin.Update: the flag
+// Initialize lives here, on the lane's own pump, NOT in the main lane's: the flag
 // means "this lane's pump is alive". In StartSync mode this hook never passes
 // the thread gate, so render-targeted requests keep getting -32002 from the
 // McpServer instead of compiling into a queue nothing ever drains; a patch
@@ -34,6 +34,7 @@ namespace ClientPlugin.Patches;
 [HarmonyPatch(typeof(MyRenderThread), "RenderFrame")]
 internal static class PatchRenderFrame
 {
+    [HarmonyPriority(int.MinValue)]
     private static void Postfix()
     {
         if (Thread.CurrentThread != MyRenderProxy.RenderSystemThread) return;

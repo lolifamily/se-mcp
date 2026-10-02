@@ -178,6 +178,14 @@
       <HintPath>$(Bin64)\System.Text.Json.dll</HintPath>
       <Private>False</Private>
     </Reference>
+    <!-- IAsyncDisposable for System.Text.Json on .NET Framework: Utf8JsonWriter implements it,
+         so ToolSchema's `using` needs it at compile time. SE ships it beside System.Text.Json,
+         which loads it anyway. net48 only: this is the .NET Framework build, which defines
+         IAsyncDisposable itself, while net10.0 has the framework's own and no copy to dedupe. -->
+    <Reference Include="Microsoft.Bcl.AsyncInterfaces" Condition="'$(TargetFramework)' == 'net48'">
+      <HintPath>$(Bin64)\Microsoft.Bcl.AsyncInterfaces.dll</HintPath>
+      <Private>False</Private>
+    </Reference>
     <Reference Include="VRage, Version=1.0.0.0, Culture=neutral, PublicKeyToken=null">
       <HintPath>$(Bin64)\VRage.dll</HintPath>
       <Private>False</Private>

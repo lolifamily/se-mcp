@@ -9,6 +9,7 @@ using System.Reflection;
 using System.Runtime.Loader;
 #endif
 using System.Threading;
+using System.Threading.Tasks;
 using Mono.Cecil;
 using Mono.Cecil.Cil;
 using Shared.Plugin;
@@ -38,18 +39,32 @@ public sealed class CompilationResult
         ErrorOutput = errorOutput;
     }
 
-    // A fresh instance's Run(Console), not stepped yet. Constructing it runs class_body's field
-    // initializers — the script's own code — so call this on the thread the script is to run on.
-    internal IEnumerable<object> Start(TextWriter console)
+    // A frame lane's entry: a fresh instance's Run(), not stepped yet.
+    internal IEnumerable<object> Start(Capture output)
     {
-        var instance = Activator.CreateInstance(Assembly.GetType("__REPL__", throwOnError: true)!)!;
-        var run = (Func<TextWriter, IEnumerable<object>>)Delegate.CreateDelegate(
-            typeof(Func<TextWriter, IEnumerable<object>>), instance, "Run");
-        return run(console);
+        var run = (Func<IEnumerable<object>>)Delegate.CreateDelegate(
+            typeof(Func<IEnumerable<object>>), Instantiate(output), "Run");
+        return run();
+    }
+
+    // The parallel lane's entry (Compiler's asyncEntry): a fresh instance's __Drive, not called yet.
+    // Calling it runs the script up to its first await.
+    internal Func<Task> StartAsync(Capture output) =>
+        (Func<Task>)Delegate.CreateDelegate(typeof(Func<Task>), Instantiate(output), "__Drive");
+
+    // The script's Console holder is filled first, and filling it runs nothing (see
+    // Compiler.ClassPrefix), so everything the script writes lands in `output` — class_body's static
+    // and instance initializers included. Constructing the instance does run the script's own code,
+    // those initializers, so both entries are taken on the thread the script is to run on.
+    private object Instantiate(Capture output)
+    {
+        var type = Assembly.GetType("__REPL__", throwOnError: true)!;
+        type.GetNestedType("__Out", BindingFlags.NonPublic)!.GetField("W")!.SetValue(null, output);
+        return Activator.CreateInstance(type)!;
     }
 }
 
-public sealed class Compiler(MethodInfo guardBail, MethodInfo guardStackCheck, MethodInfo guardKilling, string defaultUsings)
+public sealed class Compiler(MethodInfo guardBail, MethodInfo guardStackCheck, MethodInfo guardKilling, string defaultUsings, bool asyncEntry)
 {
     // Numbers both the __REPL__N assembly and its script id, so the two can never disagree about
     // which script it was. Process-wide across both lanes; 1-based, leaving 0 as KillId's "nobody".
@@ -64,36 +79,73 @@ public sealed class Compiler(MethodInfo guardBail, MethodInfo guardStackCheck, M
     private static readonly object CompileOptions;
     private static readonly Type SyntaxTreeBase;
     private static readonly Type MetaRefBase;
-    private static readonly MethodInfo CreateFromFile;
+    private static readonly Type ModuleMetadata;
+    private static readonly MethodInfo ModuleFromStream;
+    private static readonly object MetadataOnly;
+    private static readonly MethodInfo ModuleNames;
+    private static readonly MethodInfo AssemblyCreate;
+    private static readonly MethodInfo AssemblyGetReference;
+    private static readonly MethodInfo WithAliases;
     private static readonly MethodInfo Emit;
     private static readonly PropertyInfo EmitSuccess;
     private static readonly PropertyInfo EmitDiags;
+    private static readonly PropertyInfo DiagSeverity;
 
-    // References + resolveMap + handler are process-wide: the AppDomain assembly
-    // set is identical for both executors, so duplicating the scan + per-file
-    // Mono.Cecil MetadataReference creation gives nothing back. Lifecycle is
-    // owned by Plugin (Update lazily inits on first call; Dispose releases).
-    // No lock: Plugin's main-thread Update/Dispose are the only writers. The
+    // References + resolveMap + handler + extern aliases are process-wide: the AppDomain
+    // assembly set is identical for both executors, so duplicating the scan + per-file
+    // MetadataReference creation gives nothing back. Lifecycle is
+    // owned by the plugin (its main-lane pump lazily inits on the first call;
+    // Dispose releases). No lock: the pump and Dispose, both on the main
+    // thread, are the only writers. The
     // memory-visibility chain to Compile (Task pool) goes through Executor's
     // volatile Initialized flag, which is set AFTER InitShared returns.
     private static bool _sharedInit;
     private static readonly List<object> SharedReferences = [];
     private static readonly Dictionary<string, Assembly> SharedResolveMap = new();
     private static ResolveEventHandler _sharedHandler;
+    // `extern alias X;` for every aliased reference (ScriptReferences.Scope). The aliases are the
+    // template's, so Compile declares them all ahead of the default usings in every script.
+    private static string _externAliases = "";
 
     // Per-instance tokens — declared as primary constructor parameters above.
-    // ScriptGuard{Main,Render}'s Bail/StackCheck/Killing are the only thing that
-    // differs between Compiler instances. guardBail and guardKilling are null
+    // ScriptGuard{Main,Render}'s Bail/StackCheck/Killing and the entry's shape are
+    // what differ between Compiler instances. guardBail and guardKilling are null
     // together for a lane with no watchdog: StackCheck only (see InjectGuards).
+    // asyncEntry is the parallel lane's: Run becomes an async iterator (AsyncRunPrefix).
 
+    // Console is the script's output wherever its code runs: code, class_body, nested types, static
+    // members, any thread. It reads __Out.W at each call — a holder CompilationResult.Start fills
+    // before anything else, with no type initializer of its own, so filling it runs none of the
+    // script's code. __REPL__ can't hold it: class_body can give __REPL__ a type initializer, and
+    // filling a static field runs its type's initializer first — the script's static initializers
+    // would print before their Console existed. `= null` is only there to keep CS0649 (never
+    // assigned) out of every failed compile's report; a default value emits no initializer.
     private const string ClassPrefix = """
 public class __REPL__
 {
+    static class __Out { public static global::System.IO.TextWriter W = null; }
+    static global::System.IO.TextWriter Console => __Out.W;
 
 """;
 
     private const string RunPrefix = """
-    public IEnumerable<object> Run(TextWriter Console)
+    public IEnumerable<object> Run()
+    {
+
+""";
+
+    // The parallel lane's entry (asyncEntry). Run is an async iterator, so `await` compiles there beside
+    // `yield return`. __Drive iterates it to its end and is what the lane calls
+    // (CompilationResult.StartAsync); it lives in the script, so the iteration's own awaits are script
+    // code, built like every other (RetargetBuilders). It goes ahead of Run, so both entries end with the
+    // same ClassSuffix.
+    private const string AsyncRunPrefix = """
+    public async global::System.Threading.Tasks.Task __Drive()
+    {
+        await foreach (var _ in Run()) { }
+    }
+
+    public async IAsyncEnumerable<object> Run()
     {
 
 """;
@@ -140,8 +192,7 @@ namespace System.Runtime.CompilerServices
 
         MetaRefBase = commonAsm.GetType("Microsoft.CodeAnalysis.MetadataReference");
         SyntaxTreeBase = commonAsm.GetType("Microsoft.CodeAnalysis.SyntaxTree");
-        var metaRefPropsType = commonAsm.GetType("Microsoft.CodeAnalysis.MetadataReferenceProperties");
-        var docProviderType = commonAsm.GetType("Microsoft.CodeAnalysis.DocumentationProvider");
+        var assemblyMetadata = commonAsm.GetType("Microsoft.CodeAnalysis.AssemblyMetadata", throwOnError: true)!;
         var outputKindType = commonAsm.GetType("Microsoft.CodeAnalysis.OutputKind");
         var docModeType = commonAsm.GetType("Microsoft.CodeAnalysis.DocumentationMode");
         var srcKindType = commonAsm.GetType("Microsoft.CodeAnalysis.SourceCodeKind");
@@ -154,9 +205,26 @@ namespace System.Runtime.CompilerServices
         var parseOptsType = csharpAsm.GetType("Microsoft.CodeAnalysis.CSharp.CSharpParseOptions");
         var compOptsType = csharpAsm.GetType("Microsoft.CodeAnalysis.CSharp.CSharpCompilationOptions");
 
-        CreateFromFile = MetaRefBase.GetMethod("CreateFromFile",
-            BindingFlags.Public | BindingFlags.Static, null,
-            [typeof(string), metaRefPropsType, docProviderType], null);
+        // What a reference is built with (see Reference). CreateFromStream(Stream, PEStreamOptions)
+        // is found by its shape: PEStreamOptions has to be the one from the
+        // System.Reflection.Metadata this Roslyn binds to, which need not be ours.
+        ModuleMetadata = commonAsm.GetType("Microsoft.CodeAnalysis.ModuleMetadata", throwOnError: true)!;
+        ModuleFromStream = ModuleMetadata.GetMethods(BindingFlags.Public | BindingFlags.Static)
+            .Single(m => m.Name == "CreateFromStream"
+                && m.GetParameters().Length == 2 && m.GetParameters()[1].ParameterType.IsEnum);
+        MetadataOnly = Enum.Parse(ModuleFromStream.GetParameters()[1].ParameterType, "PrefetchMetadata, LeaveOpen");
+        ModuleNames = ModuleMetadata.GetMethod("GetModuleNames", Type.EmptyTypes)
+            ?? throw new MissingMethodException(ModuleMetadata.FullName, "GetModuleNames");
+        AssemblyCreate = assemblyMetadata.GetMethod("Create", [ModuleMetadata.MakeArrayType()])
+            ?? throw new MissingMethodException(assemblyMetadata.FullName, "Create");
+        AssemblyGetReference = assemblyMetadata.GetMethod("GetReference")
+            ?? throw new MissingMethodException(assemblyMetadata.FullName, "GetReference");
+
+        // For an assembly that would change what a name means in a script (ScriptReferences.Scope).
+        // The IEnumerable<string> overload: a string[] crosses into either Roslyn as is, where an
+        // ImmutableArray would have to come from the System.Collections.Immutable Roslyn binds to.
+        WithAliases = MetaRefBase.GetMethod("WithAliases", [typeof(IEnumerable<string>)])
+            ?? throw new MissingMethodException(MetaRefBase.FullName, "WithAliases");
 
         ParseText = syntaxTreeCsharpType.GetMethod("ParseText",
             BindingFlags.Public | BindingFlags.Static, null,
@@ -216,67 +284,43 @@ namespace System.Runtime.CompilerServices
 
         EmitSuccess = emitResultType.GetProperty("Success");
         EmitDiags = emitResultType.GetProperty("Diagnostics");
+        DiagSeverity = commonAsm.GetType("Microsoft.CodeAnalysis.Diagnostic", throwOnError: true)!.GetProperty("Severity");
     }
 
-    // Re-resolve each unique name via Assembly.Load so CLR picks the version
-    // that runtime binding (probing paths + redirects) would actually use.
-    // Deferred until first Update() so all plugin assemblies are loaded.
+    // Collects what every script compiles against (ScriptReferences.Collect). Deferred until the
+    // main lane's first pump so all plugin assemblies are loaded.
     //
-    // Cached Pulsar GitHubPlugins are loaded via Assembly.LoadFile, placing
-    // them outside the default Load context. Assembly.Load(name) fails for
-    // their randomized names. We collect those into a separate bucket and
-    // pick the highest version per name, then register an AssemblyResolve
-    // handler so REPL code can find them at runtime.
-    public static void InitShared()
+    // gameDir is the game's own folder, the one the loader's game-directory AssemblyResolve handler
+    // probes: Pulsar and Magnetar point MyFileSystem.ExePath (SE1, DS) and AppContext.BaseDirectory
+    // (SE2) at it, from the same value they hand that handler.
+    public static void InitShared(string gameDir)
     {
         if (_sharedInit) return;
         _sharedInit = true;
 
-        var loadContext = new Dictionary<string, string>();
-        var loadFile = new Dictionary<string, (Assembly asm, Version ver)>();
-
-        foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
+        var entries = ScriptReferences.Collect(gameDir);
+        var aliases = new List<string>();
+        foreach (var entry in entries)
         {
-            if (asm.IsDynamic) continue;
-            var name = asm.GetName().Name;
-            if (name == null || loadContext.ContainsKey(name)) continue;
-
             try
             {
-                loadContext[name] = Assembly.Load(name).Location;
+                var reference = Reference(entry.Path);
+                if (entry.Alias != null)
+                {
+                    reference = WithAliases.Invoke(reference, [new[] { entry.Alias }]);
+                    aliases.Add(entry.Alias);
+                }
+                SharedReferences.Add(reference);
+                if (entry.LoadFile != null) SharedResolveMap[entry.Name] = entry.LoadFile;
             }
-            catch
-            {
-                var loc = asm.Location;
-                if (string.IsNullOrEmpty(loc)) continue;
-                var ver = asm.GetName().Version ?? new Version(0, 0);
-                if (!loadFile.TryGetValue(name, out var prev) || ver > prev.ver)
-                    loadFile[name] = (asm, ver);
-            }
+            catch (Exception ex) { Common.Logger.Info($"failed reference {entry.Name}: {ex.Message}"); }
         }
+        // Only aliases whose reference made it in: declaring one with none behind it is CS0430 in
+        // every script. The '@' lets an alias that happens to spell a C# keyword still be declared.
+        _externAliases = string.Concat(aliases.Select(a => $"extern alias @{a};\n"));
 
-        foreach (var (name, loc) in loadContext)
-        {
-            if (string.IsNullOrEmpty(loc)) continue;
-            if (Path.GetFileName(loc) == "VRage.Native.dll"
-                || Path.GetFileName(loc).StartsWith("Mono.Cecil", StringComparison.Ordinal)) continue;
-            try { SharedReferences.Add(CallWithDefaults(CreateFromFile, null, loc)); }
-            catch (Exception ex) { Common.Logger.Info($"failed reference {name}: {ex.Message}"); }
-        }
-
-        foreach (var (name, (asm, _)) in loadFile)
-        {
-            var loc = asm.Location;
-            if (Path.GetFileName(loc) == "VRage.Native.dll"
-                || Path.GetFileName(loc).StartsWith("Mono.Cecil", StringComparison.Ordinal)) continue;
-            try
-            {
-                SharedReferences.Add(CallWithDefaults(CreateFromFile, null, loc));
-                SharedResolveMap[name] = asm;
-            }
-            catch (Exception ex) { Common.Logger.Info($"failed LoadFile reference {name}: {ex.Message}"); }
-        }
-
+        // A plugin loaded with LoadFile can't be found by name, not even by the binder, so its loaded
+        // instance is handed back when a script's reference asks for it.
         _sharedHandler = (_, args) =>
         {
             if (args.RequestingAssembly?.GetName().Name?.StartsWith("__REPL__", StringComparison.Ordinal) != true)
@@ -288,8 +332,8 @@ namespace System.Runtime.CompilerServices
         AppDomain.CurrentDomain.AssemblyResolve += _sharedHandler;
 
         // ignoreaccess (runtime half): one [assembly: IgnoresAccessChecksTo(name)] for
-        // EVERY referenced assembly — game + BCL (loadContext) and other plugins
-        // (loadFile) alike, matching the SharedReferences set exactly. (Compile-time
+        // EVERY referenced assembly — loaded or not yet, plain or aliased — matching
+        // the SharedReferences set exactly. (Compile-time
         // internal import is global anyway, so per-assembly runtime gating would only
         // cause "compiles but MethodAccessException at run".) The [assembly:] usages bind
         // to OUR source-declared attribute (wins over the Harmony/other-plugin copies),
@@ -301,7 +345,7 @@ namespace System.Runtime.CompilerServices
         // exactly that one, while the user's own script tree still reports its CS0436s.
         var iaAssembly = "using System.Runtime.CompilerServices;\n"
             + "#pragma warning disable CS0436\n"
-            + string.Concat(loadContext.Keys.Concat(loadFile.Keys).Distinct()
+            + string.Concat(entries.Select(e => e.Name).Distinct()
                 .Select(n => $"[assembly: IgnoresAccessChecksTo(\"{n}\")]\n"));
         _iaAssemblyTree = CallWithDefaults(ParseText, null, iaAssembly, ParseOptions, InternalPath);
 
@@ -318,7 +362,35 @@ namespace System.Runtime.CompilerServices
         }
         SharedReferences.Clear();
         SharedResolveMap.Clear();
+        _externAliases = "";
         _sharedInit = false;
+    }
+
+    // One reference: its assembly's metadata, copied into memory, and nothing else of the file.
+    // MetadataReference.CreateFromFile keeps the whole file there, IL, resources and precompiled
+    // code included: 462 MB of references in SE2, where the metadata is 106 MB and compiling reads
+    // nothing else. A file is closed as soon as it's read, so none stays locked.
+    //
+    // An assembly can be several files, the first naming the others, its modules
+    // (System.EnterpriseServices is, of the .NET Framework's). Each is read the same way.
+    private static object Reference(string path)
+    {
+        var manifest = ReadModule(path);
+        var names = ((IEnumerable)ModuleNames.Invoke(manifest, null)!).Cast<string>().ToList();
+        var modules = Array.CreateInstance(ModuleMetadata, 1 + names.Count);
+        modules.SetValue(manifest, 0);
+        for (var i = 0; i < names.Count; i++)
+            modules.SetValue(ReadModule(Path.Combine(Path.GetDirectoryName(path)!, names[i])), i + 1);
+
+        // GetReference(documentation, aliases, embedInteropTypes, filePath, display): the path is
+        // only the reference's label, in a diagnostic that names it.
+        return CallWithDefaults(AssemblyGetReference, AssemblyCreate.Invoke(null, [modules]), null, null, false, path);
+    }
+
+    private static object ReadModule(string path)
+    {
+        using var file = File.OpenRead(path);
+        return ModuleFromStream.Invoke(null, [file, MetadataOnly]);
     }
 
     // Three-segment input maps 1:1 to C# language layers:
@@ -333,17 +405,17 @@ namespace System.Runtime.CompilerServices
     // numbers and Diagnostic.ToString() already reads `code(2,9): error CS0103: ...`.
     // A mapping runs until the next #line, so an error landing on the wrapper lines
     // after a segment (an unclosed brace, say) is reported on that segment's trailing
-    // lines — the field to fix. Positions before the first marker (the default usings)
-    // keep the tree path, InternalPath.
+    // lines — the field to fix. Positions before the first marker (the extern aliases
+    // and the default usings) keep the tree path, InternalPath.
     public CompilationResult Compile(IReadOnlyList<string> usings, string classBody, string code)
     {
         var usingsBlock = usings == null ? "" : string.Concat(
             usings.Where(u => !string.IsNullOrWhiteSpace(u))
                   .Select(u => "using " + u.Trim() + ";\n"));
 
-        var fullSource = defaultUsings
+        var fullSource = _externAliases + defaultUsings
             + Segment("usings", usingsBlock) + ClassPrefix
-            + Segment("class_body", classBody) + RunPrefix
+            + Segment("class_body", classBody) + (asyncEntry ? AsyncRunPrefix : RunPrefix)
             + Segment("code", code) + ClassSuffix;
 
         var scriptId = Interlocked.Increment(ref _counter);
@@ -370,12 +442,33 @@ namespace System.Runtime.CompilerServices
 
         // Diagnostic.ToString() prints the #line-mapped position — see the comment on Compile.
         if (!(bool)EmitSuccess.GetValue(emitResult)!)
-            return new CompilationResult(string.Join("\n", ((IEnumerable)EmitDiags.GetValue(emitResult)!).Cast<object>()));
+            return new CompilationResult(FailureReport((IEnumerable)EmitDiags.GetValue(emitResult)!));
 
         ms.Seek(0, SeekOrigin.Begin);
         var raw = ms.ToArray();
         raw = InjectGuards(raw, scriptId);
         return new CompilationResult(Assembly.Load(raw), scriptId);
+    }
+
+    // Diagnostics shown in full; the rest are left to one count line.
+    private const int MaxDiagnostics = 8;
+
+    // A failed compile's report, as the Minecraft MCP renders one: warnings and errors (Roslyn's
+    // DiagnosticSeverity: Hidden 0, Info 1, Warning 2, Error 3), errors first so a run of warnings
+    // can't bury the one that failed the compile, then capped. The sort is stable, so within one
+    // severity Roslyn's own order survives. DiagnosticSeverity is an int enum, and a boxed enum
+    // unboxes to its underlying type.
+    private static string FailureReport(IEnumerable diagnostics)
+    {
+        var shown = diagnostics.Cast<object>()
+            .Select(d => (Text: d.ToString(), Severity: (int)DiagSeverity.GetValue(d)!))
+            .Where(d => d.Severity >= 2)
+            .OrderByDescending(d => d.Severity)
+            .ToList();
+        var report = string.Join("\n", shown.Take(MaxDiagnostics).Select(d => d.Text));
+        return shown.Count > MaxDiagnostics
+            ? report + $"\n... {shown.Count - MaxDiagnostics} more diagnostic(s) not shown"
+            : report;
     }
 
     // One user segment, fenced by newlines on both sides so nothing around it can share a
@@ -527,6 +620,11 @@ namespace System.Runtime.CompilerServices
     // of it: nothing will ever raise KillId for its scripts, and its user catch
     // blocks stay exactly as compiled. StackCheck is never optional: a stack
     // overflow can't be caught in .NET, so it takes the whole process with it.
+    //
+    // And a script's async methods are built by our builders, not the BCL's
+    // (RetargetBuilders): on every lane, a faulted script Task can't take SE2
+    // down as an unobserved exception, and on the parallel lane an await resumes
+    // on the script's own thread whatever its awaiter does.
     // Not a security boundary — token holders already have full RCE.
     private byte[] InjectGuards(byte[] raw, int scriptId)
     {
@@ -539,6 +637,8 @@ namespace System.Runtime.CompilerServices
         var bailRef = guardBail == null ? null : asm.MainModule.ImportReference(guardBail);
         var killingRef = guardBail == null ? null : asm.MainModule.ImportReference(guardKilling);
         var stackRef = asm.MainModule.ImportReference(guardStackCheck);
+
+        RetargetBuilders(asm.MainModule);
 
         var types = new Stack<TypeDefinition>();
         types.Push(replType);
@@ -712,6 +812,100 @@ namespace System.Runtime.CompilerServices
         if (bail == null) return;
         il.InsertBefore(at, il.Create(OpCodes.Ldc_I4, scriptId));
         il.InsertBefore(at, il.Create(OpCodes.Call, bail));
+    }
+
+    // Each BCL builder by full name, and the script builder that takes its place. The ValueTask ones become
+    // the Task ones (ValueTasksOnTasks).
+    private static readonly Dictionary<string, Type> ScriptBuilders = new()
+    {
+        ["System.Runtime.CompilerServices.AsyncVoidMethodBuilder"] = typeof(ScriptVoidBuilder),
+        ["System.Runtime.CompilerServices.AsyncTaskMethodBuilder"] = typeof(ScriptTaskBuilder),
+        ["System.Runtime.CompilerServices.AsyncTaskMethodBuilder`1"] = typeof(ScriptTaskBuilder<>),
+        ["System.Runtime.CompilerServices.AsyncValueTaskMethodBuilder"] = typeof(ScriptTaskBuilder),
+        ["System.Runtime.CompilerServices.AsyncValueTaskMethodBuilder`1"] = typeof(ScriptTaskBuilder<>),
+        ["System.Runtime.CompilerServices.AsyncIteratorMethodBuilder"] = typeof(ScriptIteratorBuilder)
+    };
+
+    // A module refers to each type it uses from elsewhere through one type reference: the state machines'
+    // builder fields, the locals and every call to a builder member all go through it. So pointing that
+    // one reference at our builder (ScriptBuilders.cs) swaps the builder of every async method in the
+    // script, and not one instruction changes. The runtime then binds each call by name and signature, on
+    // our type, which mirrors the BCL's member for member. By full name: on .NET Framework the six live in
+    // three assemblies, and in SE2 every game assembly ships one more AsyncVoidMethodBuilder of its own,
+    // with the same members.
+    private static void RetargetBuilders(ModuleDefinition module)
+    {
+        // While the ValueTask builders still go by their own names.
+        ValueTasksOnTasks(module);
+
+        foreach (var reference in module.GetTypeReferences())
+        {
+            if (!ScriptBuilders.TryGetValue(reference.FullName, out var ours)) continue;
+            var target = module.ImportReference(ours);
+            reference.Scope = target.Scope;
+            reference.Namespace = target.Namespace;
+            reference.Name = target.Name;
+        }
+    }
+
+    // An async ValueTask method runs on the Task builder. Of the ValueTask builder's members only get_Task
+    // names ValueTask, and it is called once, from the method's stub; that call becomes the Task builder's,
+    // and the ValueTask is made from its Task right after:
+    //     call    ValueTask AsyncValueTaskMethodBuilder::get_Task()
+    // becomes
+    //     call    Task AsyncValueTaskMethodBuilder::get_Task()     (the type reference is retargeted next)
+    //     newobj  ValueTask::.ctor(Task)
+    // That ValueTask is the script's own type reference, so nothing in the plugin names one — and nothing
+    // could: on .NET Framework the plugin's ValueTask is another type than the scripts', as Pulsar loads
+    // Roslyn's NuGet copy of System.Threading.Tasks.Extensions beside the plugin, next to the game's.
+    private static void ValueTasksOnTasks(ModuleDefinition module)
+    {
+        var task = module.ImportReference(typeof(Task));
+        var taskOfT = module.ImportReference(typeof(Task<>));
+        foreach (var type in module.GetTypes())
+        foreach (var method in type.Methods)
+        {
+            if (!method.HasBody) continue;
+            var il = method.Body.GetILProcessor();
+            foreach (var ins in method.Body.Instructions.ToList())
+            {
+                if (ins.OpCode.Code != Code.Call || ins.Operand is not MethodReference { Name: "get_Task" } call
+                    || call.DeclaringType.GetElementType().FullName is not
+                        ("System.Runtime.CompilerServices.AsyncValueTaskMethodBuilder"
+                        or "System.Runtime.CompilerServices.AsyncValueTaskMethodBuilder`1"))
+                    continue;
+
+                var valueTask = call.ReturnType.GetElementType();
+                valueTask.IsValueType = true;
+                TypeReference returned = task, ctorOwner = valueTask, ctorParameter = task;
+                if (call.DeclaringType is GenericInstanceType bound)
+                {
+                    returned = Instance(taskOfT, FirstParameterOf(bound.ElementType));   // Task<!0>, the builder's !0
+                    ctorOwner = Instance(valueTask, bound.GenericArguments[0]);          // ValueTask<T>
+                    ctorParameter = Instance(taskOfT, FirstParameterOf(valueTask));      // Task<!0>, ValueTask`1's !0
+                }
+                var ctor = new MethodReference(".ctor", module.TypeSystem.Void, ctorOwner) { HasThis = true };
+                ctor.Parameters.Add(new ParameterDefinition(ctorParameter));
+
+                ins.Operand = new MethodReference("get_Task", returned, call.DeclaringType) { HasThis = true };
+                il.InsertAfter(ins, il.Create(OpCodes.Newobj, ctor));
+            }
+        }
+    }
+
+    private static GenericInstanceType Instance(TypeReference open, TypeReference argument)
+    {
+        var instance = new GenericInstanceType(open);
+        instance.GenericArguments.Add(argument);
+        return instance;
+    }
+
+    // A generic type's first type parameter, as a signature refers to it: !0.
+    private static GenericParameter FirstParameterOf(TypeReference open)
+    {
+        if (open.GenericParameters.Count == 0)
+            open.GenericParameters.Add(new GenericParameter(open));
+        return open.GenericParameters[0];
     }
 
     // Short-form branch opcode → long-form. Mono.Cecil.Rocks.SimplifyMacros would do this

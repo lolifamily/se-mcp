@@ -15,16 +15,16 @@ public interface IPluginConfig : INotifyPropertyChanged
     string ErrorMessage { get; set; }
 
     // Whether code execution should be denied. A plain stored bool, NOT a
-    // computed property. The owner thread (client: Plugin.Update on main;
+    // computed property. The owner thread (client: the main-lane pump on main;
     // server: never writes) refreshes this once per frame from whatever SE
     // state it consults (e.g. MyAPIGateway.Session.PromoteLevel < Admin);
     // any thread may read it — bool reads/writes are atomic on .NET, and
-    // up to one frame of staleness is acceptable since Update rewrites
+    // up to one frame of staleness is acceptable since the pump rewrites it
     // each frame. No volatile / Interlocked needed.
     //
     // Interface exposes only the read side — McpServer / Executor only need
     // the gate value. The write lives on the implementing class (PluginConfig
-    // declares `set`), and the only writer (client Plugin.Update) holds a
+    // declares `set`), and the only writer (the client's pump) holds a
     // concrete Config reference, so going through the interface for writes
     // is never required.
     bool Denied { get; }

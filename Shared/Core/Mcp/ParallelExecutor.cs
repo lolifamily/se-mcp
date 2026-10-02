@@ -1,10 +1,7 @@
 using System;
 using System.Collections.Concurrent;
-using System.Collections.Generic;
 using System.Globalization;
-using System.IO;
 using System.Runtime;
-using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 using Shared.Plugin;
@@ -13,15 +10,23 @@ namespace Shared.Mcp;
 
 // The off-frame lane: each script runs to its end on a thread of its own, concurrently with the
 // game and with other scripts — for long computation or blocking I/O that would freeze a frame
-// lane. Nothing pumps it, so there is no frame budget and no watchdog: `yield return null` resumes
-// at once, and scripts compile with StackCheck alone (Compiler.InjectGuards). That one stays: a
-// stack overflow takes the whole process, and no kill from outside gets there first.
+// lane. No game frame drives it, so there is no frame budget and no watchdog: `yield return null`
+// resumes at once, and scripts compile with StackCheck alone (Compiler.InjectGuards). That one
+// stays: a stack overflow takes the whole process, and no kill from outside gets there first.
+//
+// `await` works here, and only here: the entry is an async iterator (Compiler's asyncEntry), and the
+// worker runs it with a ScriptPump — the script's own continuation queue — that the script builders
+// send every continuation of the script to (ScriptBuilders.cs). So whatever a script awaits, and
+// whichever thread completes it, the script resumes on its worker: the one thread the kill below
+// reaches and StackCheck's baseline belongs to.
 //
 // A kill is a real abort — ControlledExecution.Run (net48: the port in Shared/Core/Tools) — so a
 // loop with no check point in it stops too. Three things kill a script: its request cancelled (or
 // its client gone), the deny gate closing (EnforceDenyGate), and Dispose. Each goes the same way:
 //   - The request is answered first, with the output so far, and the output sealed: the abort can
 //     take arbitrarily long to land, and nobody waits for it.
+//   - Its pump is killed (ScriptPump.Kill): the script's continuations still to come are dropped —
+//     one parked at an `await` would otherwise come back to life on the thread pool.
 //   - The abort is fired from a throwaway thread: Cancel() returns only once it has landed, which
 //     it can't while the script is in a finally, a catch, native code or a wait.
 //   - A killed script sitting in a managed wait is interrupted at once, and again every NudgeMs
@@ -35,7 +40,7 @@ public sealed class ParallelExecutor(string denialMessage, string defaultUsings)
 
     // StackCheck alone: nothing here would ever raise a kill id. Borrowed from the main lane's
     // guard — _stackBase is [ThreadStatic], and every script gets a thread of its own.
-    private readonly Compiler compiler = new(null, ScriptGuardMain.StackCheckMethod, null, defaultUsings);
+    private readonly Compiler compiler = new(null, ScriptGuardMain.StackCheckMethod, null, defaultUsings, asyncEntry: true);
 
     // Every script not yet gone: compiling, running, or killed while its thread lives on. Only
     // Sweep removes entries, so a worker never touches this after its script: a killed one may
@@ -164,27 +169,30 @@ public sealed class ParallelExecutor(string denialMessage, string defaultUsings)
 
     // The script, inside ControlledExecution.Run. Returns the report on a script that could not
     // start, or null once it ran to its end. Instantiating runs class_body's initializers — the
-    // script's own code — so that happens in here too, where an abort can reach it.
+    // script's own code — so that happens in here too, where an abort can reach it, and with the
+    // pump in place already, so async work they start comes back here as well.
     private static string Drive(Script s)
     {
+        Task run = null;
         s.InScript = true;
         try
         {
-            IEnumerable<object> run;
+            ScriptPump.Current = s.Pump;
+            Func<Task> start;
             try
             {
-                run = s.Compiled.Start(s.Output);
+                start = s.Compiled.StartAsync(s.Output);
             }
             catch (Exception ex)
             {
                 return ScriptRender.StartFailed(ex);
             }
 
-            // No frame to wait for: `yield return null` resumes at once. No `using` either: its
-            // Dispose would run while an overflow unwinds, and trip its own StackCheck.
-            var steps = run.GetEnumerator();
-            while (steps.MoveNext()) { }
-            steps.Dispose();
+            // The call runs the script up to its first await; the pump runs the rest of it, on this
+            // thread. No frame to wait for either: `yield return null` resumes at once.
+            run = start();
+            s.Pump.RunUntil(run);
+            run.GetAwaiter().GetResult();   // the script's own exception, as it threw it
             return null;
         }
         finally
@@ -192,6 +200,11 @@ public sealed class ParallelExecutor(string denialMessage, string defaultUsings)
             // Before Run's own cleanup, which no nudge may reach: it waits for the canceller with
             // SpinWait, which sleeps, and an interrupt landing there would cut that wait short.
             s.InScript = false;
+
+            // A script that finished leaves its loose ends running; one that didn't — killed, or
+            // never started — leaves none of its own. A no-op when a kill closed the pump already.
+            if (run is { IsCompleted: true }) s.Pump.End();
+            else s.Pump.Kill();
         }
     }
 
@@ -200,6 +213,7 @@ public sealed class ParallelExecutor(string denialMessage, string defaultUsings)
     {
         if (!Finish(s, error, cancelled)) return;
         s.Killed = true;
+        s.Pump.Kill();
         new Thread(() =>
         {
             // Returns once the abort has landed — or at once while no worker has registered for
@@ -258,10 +272,16 @@ public sealed class ParallelExecutor(string denialMessage, string defaultUsings)
     private sealed class Script(WorkItem item)
     {
         public readonly WorkItem Item = item;
+
+        // The script's Console. A kill takes it before it fires the abort (Finish), so an abort
+        // landing mid-write can't tear text anyone reads.
         public readonly Capture Output = new();
 
         // Handed to ControlledExecution.Run: cancelling it is the abort.
         public readonly CancellationTokenSource Abort = new();
+
+        // Where the script's continuations queue for its worker.
+        public readonly ScriptPump Pump = new();
 
         public CompilationResult Compiled;
 
@@ -279,44 +299,5 @@ public sealed class ParallelExecutor(string denialMessage, string defaultUsings)
 
         // Exactly one ending answers the request: running out, throwing, or a kill.
         public bool TryFinish() => Interlocked.Exchange(ref finished, 1) == 0;
-    }
-
-    // The script's Console. Locked, since the script's own tasks may write to it too, and sealed
-    // by Take: a kill takes the output before it fires the abort, so an abort landing mid-write
-    // can't tear text anyone reads — later writes just go nowhere.
-    private sealed class Capture : TextWriter
-    {
-        private readonly object gate = new();
-        private StringBuilder text = new();
-
-        // \n, like the frame lanes: the text goes to a model, and ScriptRender joins on \n.
-        public Capture() => NewLine = "\n";
-
-        public override Encoding Encoding => Encoding.UTF8;
-
-        public override void Write(char value)
-        {
-            lock (gate) text?.Append(value);
-        }
-
-        public override void Write(string value)
-        {
-            lock (gate) text?.Append(value);
-        }
-
-        public override void Write(char[] buffer, int index, int count)
-        {
-            lock (gate) text?.Append(buffer, index, count);
-        }
-
-        public string Take()
-        {
-            lock (gate)
-            {
-                var taken = text?.ToString() ?? "";
-                text = null;
-                return taken;
-            }
-        }
     }
 }

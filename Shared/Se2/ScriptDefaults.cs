@@ -1,22 +1,16 @@
-using Shared.Mcp;
-
 namespace Shared.Se2;
 
-// SE2 default usings + execute_code schema vocabulary, prepended/spliced so users
-// reference the common Keen.VRage / Keen.Game2 API without boilerplate. Shared by the
-// SE2 client (and a future SE2 server, same game API surface), so it lives once here in
-// Shared/Se2 — exactly symmetric to SE1's Shared/Se1/ScriptDefaults. The namespace is
-// Shared.Se2 — deliberately NOT Shared.Mcp — so Compiler (in Shared.Mcp) cannot reach it
-// directly; the host does `using Shared.Se2` in its Plugin and passes these into the
-// Executor/Compiler + ExecuteCodeTool constructors. That inaccessibility is the entire
-// point of constructor injection.
+// SE2 default usings, prepended so users reference the common Keen.VRage / Keen.Game2 API without
+// boilerplate, and this host's words in the execute_code description (Game, Imports). Shared by the
+// SE2 client (and a future SE2 server, same game API surface), so it lives once here in Shared/Se2 —
+// exactly symmetric to SE1's Shared/Se1/ScriptDefaults. The namespace is Shared.Se2 — deliberately NOT
+// Shared.Mcp — so Compiler (in Shared.Mcp) cannot reach it directly; the host does `using Shared.Se2`
+// in its Plugin and passes these into the Executor/Compiler and ExecuteCodeTool constructors. That
+// inaccessibility is the entire point of constructor injection.
 //
-// NOTE: both Usings and SchemaText are the block-4 starting point from the plan. Usings
-// is a STRING injected into user-script compilation at runtime (not parsed when
-// Client2Plugin compiles), so any namespace that doesn't exist in the SE2 assemblies
-// would make EVERY user script fail with CS0246; SchemaText only names symbols in the
-// tool description shown to the LLM. Block 4 verifies both against the real Game2
-// assemblies when execute_code is exercised end-to-end, and prunes/extends before shipping.
+// Usings is a STRING injected into user-script compilation at runtime (not parsed when Client2Plugin
+// compiles), so a namespace that doesn't exist in the SE2 assemblies would make EVERY user script fail
+// with CS0246.
 internal static class ScriptDefaults
 {
     // Every namespace below was verified to exist in the SE2 assemblies (block-4 audit).
@@ -53,15 +47,14 @@ using Keen.Game2.Client.GameSystems.PlayerControl;
 
 """;
 
-    // Host-specific execute_code schema vocabulary (SE2 game API symbols). Passed to
-    // ExecuteCodeTool so the tool description names Keen.* / GameAppComponent / Render12,
-    // not SE1's Sandbox.* / MyAPIGateway / MyRenderThread.
-    public static readonly ExecuteCodeSchemaText SchemaText = new(
-        preImported: "System.*, Keen.VRage.*, Keen.Game2.*",
-        shortNames: "GameAppComponent, CubeGridComponent",
-        fqnExample: "Keen.Game2.GameAppComponent",
-        mainDriver: "a Harmony Postfix on VRageCore.Update",
-        mainApi: "Singleton<VRageCore>.Instance.Engine.Get<GameAppComponent>().ClientSession and its entities",
-        renderTarget: "Render12EngineComponent.RenderFrame",
-        renderAssert: "Session / scene access");
+    // This host's name in the execute_code description (ExecuteCodeTool).
+    public const string Game = "Space Engineers 2";
+
+    // The session's entry path is the one thing a model can't guess about SE2 — GameAppComponent is
+    // internal, reachable only through ignore-accessibility — so it rides in the description every
+    // model reads. It used to sit in the main lane's text ("use this for ... access"), read only by a
+    // model already choosing a lane. Short names are the norm here too, not a rule: see SE1's Imports.
+    public const string Imports =
+        "Common System, Keen.VRage and Keen.Game2 namespaces are pre-imported; "
+        + "the session is Singleton<VRageCore>.Instance.Engine.Get<GameAppComponent>().ClientSession.";
 }

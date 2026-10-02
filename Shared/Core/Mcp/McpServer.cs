@@ -125,6 +125,14 @@ public sealed class McpServer : IDisposable
         var rawId = "null";
         try
         {
+            // The listener takes every interface (http.sys, Wine) and Host is forgeable; a source address
+            // isn't. Not LocalEndPoint: from outside, a packet can be addressed to 127.0.0.1.
+            if (!IsLoopbackPeer(ctx.Request.RemoteEndPoint))
+            {
+                await Respond(ctx, 403, "Forbidden: localhost only");
+                return;
+            }
+
             if (ctx.Request.HttpMethod != "POST")
             {
                 await Respond(ctx, 405, "POST only");
@@ -394,6 +402,16 @@ public sealed class McpServer : IDisposable
         var stream = ctx.Response.OutputStream;
         await stream.WriteAsync(bytes, 0, bytes.Length);
         stream.Close();
+    }
+
+    // ::ffff:127.x is a dual-mode socket's IPv4 peer, which IsLoopback misses on .NET Framework (and
+    // past ::ffff:127.0.0.1 on .NET). No address, no service.
+    private static bool IsLoopbackPeer(IPEndPoint peer)
+    {
+        var address = peer?.Address;
+        if (address == null) return false;
+        if (address.IsIPv4MappedToIPv6) address = address.MapToIPv4();
+        return IPAddress.IsLoopback(address);
     }
 
     [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoOptimization)]

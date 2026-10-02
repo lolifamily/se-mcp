@@ -14,6 +14,7 @@
     <Compile Include="$(MSBuildThisFileDirectory)Config\PluginConfig.cs" />
     <Compile Include="$(MSBuildThisFileDirectory)Logging\IPluginLogger.cs" />
     <Compile Include="$(MSBuildThisFileDirectory)Logging\LogFormatter.cs" />
+    <Compile Include="$(MSBuildThisFileDirectory)Mcp\Capture.cs" />
     <Compile Include="$(MSBuildThisFileDirectory)Mcp\Compiler.cs" />
     <Compile Include="$(MSBuildThisFileDirectory)Mcp\ExecuteCodeTool.cs" />
     <Compile Include="$(MSBuildThisFileDirectory)Mcp\Executor.cs" />
@@ -22,9 +23,13 @@
     <Compile Include="$(MSBuildThisFileDirectory)Mcp\ITool.cs" />
     <Compile Include="$(MSBuildThisFileDirectory)Mcp\McpServer.cs" />
     <Compile Include="$(MSBuildThisFileDirectory)Mcp\ParallelExecutor.cs" />
+    <Compile Include="$(MSBuildThisFileDirectory)Mcp\ScriptBuilders.cs" />
     <Compile Include="$(MSBuildThisFileDirectory)Mcp\ScriptGuard.cs" />
+    <Compile Include="$(MSBuildThisFileDirectory)Mcp\ScriptPump.cs" />
+    <Compile Include="$(MSBuildThisFileDirectory)Mcp\ScriptReferences.cs" />
     <Compile Include="$(MSBuildThisFileDirectory)Mcp\ScriptRender.cs" />
     <Compile Include="$(MSBuildThisFileDirectory)Mcp\TokenGenerator.cs" />
+    <Compile Include="$(MSBuildThisFileDirectory)Mcp\ToolSchema.cs" />
     <Compile Include="$(MSBuildThisFileDirectory)Patches\PatchHelpers.cs" />
     <Compile Include="$(MSBuildThisFileDirectory)Plugin\Common.cs" />
     <Compile Include="$(MSBuildThisFileDirectory)Plugin\ICommonPlugin.cs" />

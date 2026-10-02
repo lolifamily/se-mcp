@@ -79,8 +79,8 @@ public class PluginConfig : IPluginConfig
     [XmlIgnore] public int BoundPort { get; set; }
     [XmlIgnore] public string ErrorMessage { get; set; }
 
-    // Volatile.Read/Write on the field-backed property: main thread (client
-    // Plugin.Update) writes, render thread (RenderExecutor.Tick) reads. bool
+    // Volatile.Read/Write on the field-backed property: main thread (the
+    // client's main-lane pump) writes, render thread (RenderExecutor.Tick) reads. bool
     // reads/writes are atomic on .NET but that alone gives no memory-ordering
     // guarantee under ECMA-335; x86/x64's strong memory model masks the
     // omission in practice. Explicit fences here so we don't depend on that.

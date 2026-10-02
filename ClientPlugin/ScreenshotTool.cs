@@ -13,13 +13,18 @@ public sealed class ScreenshotTool(Executor mainExec) : ITool
     public string Name => "take_screenshot";
     public bool ReturnsImage => true;
 
-    public string SchemaJson =>
-        """{"name":"take_screenshot","description":"Capture the current game frame and return it as an image. Only one screenshot may be in flight at a time.","inputSchema":{"type":"object","properties":{"ignore_sprites":{"type":"boolean","description":"true = capture the 3D scene only, without HUD/GUI overlays. Default false (HUD included)."}}}}""";
+    // One capture at a time goes unsaid: ScreenshotService is a single slot (as MyRender11's screenshot
+    // is), and a second concurrent call is refused with "retry shortly" — all a model needs to know, at
+    // the moment it needs it.
+    public string SchemaJson { get; } = ToolSchema.Build("take_screenshot",
+        "Capture the current game frame as an image.",
+        new ToolSchema.Param("ignore_sprites", "The 3D scene only, without HUD/GUI overlays.",
+            type: "boolean", @default: false));
 
     public bool TryDispatch(JsonElement arguments, WorkItem item, out int errorCode, out string errorMessage)
     {
         errorCode = 0;
-        errorMessage =null;
+        errorMessage = null;
 
         // Absent arguments / absent flag / JSON null stay lenient (the default:
         // HUD included). A present ignore_sprites of any other shape is rejected
@@ -32,18 +37,18 @@ public sealed class ScreenshotTool(Executor mainExec) : ITool
             if (sEl.ValueKind != JsonValueKind.True && sEl.ValueKind != JsonValueKind.False)
             {
                 errorCode = -32602;
-                errorMessage ="Invalid params: ignore_sprites must be a boolean";
+                errorMessage = "Invalid params: ignore_sprites must be a boolean";
                 return false;
             }
             ignoreSprites = sEl.ValueKind == JsonValueKind.True;
         }
 
         // The executor is borrowed for the Initialized gate; ScreenshotService
-        // issues from Plugin.Update, not through Enqueue.
+        // issues from the main-lane pump, not through Enqueue.
         if (!mainExec.Initialized)
         {
             errorCode = -32002;
-            errorMessage ="Game is still loading, not all plugins have been initialized yet. Please retry shortly.";
+            errorMessage = "Game still loading — retry shortly.";
             return false;
         }
 

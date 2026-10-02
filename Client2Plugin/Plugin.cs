@@ -14,38 +14,36 @@ using Shared.Se2;
 
 // Define assembly version when compiled by Pulsar
 #if !DEV_BUILD
-[assembly: AssemblyVersion("2.1.0.0")]
-[assembly: AssemblyFileVersion("2.1.0.0")]
+[assembly: AssemblyVersion("2.2.0.0")]
+[assembly: AssemblyFileVersion("2.2.0.0")]
 #endif
 
 namespace Client2Plugin;
 
-// SE2 client plugin entry point. Unlike SE1 (IPlugin.Init(gameInstance) + per-frame
-// IPlugin.Update), SE2's IPlugin is an EMPTY interface: the constructor is the load hook,
-// teardown requires implementing IDisposable (Pulsar Modern's PluginInstance.Dispose
-// reflectively checks `plugin as IDisposable`, PluginInstance.cs:153), and the per-frame
-// pumps are Harmony patches (PatchMainLane on VRageCore.Update, PatchRenderFrame on
-// Render12EngineComponent.RenderFrame) rather than a native Update callback.
+// SE2 client plugin entry point. Unlike SE1 (IPlugin.Init(gameInstance) + IPlugin.Dispose),
+// SE2's IPlugin is an EMPTY interface: the constructor is the load hook, and teardown
+// requires implementing IDisposable (Pulsar Modern's PluginInstance.Dispose reflectively
+// checks `plugin as IDisposable`, PluginInstance.cs:153). The per-frame pumps are Harmony
+// patches on both games — here PatchMainLane on VRageCore.Update and PatchRenderFrame on
+// Render12EngineComponent.RenderFrame.
 //
 // Structurally one-for-one with SE1's ClientPlugin.Plugin: same PersistentConfig wiring,
 // same two Executors bound to Shared/Core's ScriptGuard{Main,Render}, same McpServer +
 // ExecuteCodeTool, same AssemblyResolve, same deny-gate cache. Only the host mechanics
-// differ (constructor vs Init, IDisposable vs Dispose, patched pumps vs Update, Plugin2Logger
-// vs PluginLogger, GameAppComponent session vs MyAPIGateway).
+// differ (constructor vs Init, IDisposable vs Dispose, Plugin2Logger vs PluginLogger,
+// GameAppComponent session vs MyAPIGateway).
 public sealed class Plugin : IPlugin, IDisposable, ICommonPlugin
 {
     public const string Name = "SeMcp2";
     internal static Plugin Instance;
 
-    // Suffix added to the execute_code tool description (LLM-facing reminder). The actual
-    // gate is Config.Denied, refreshed each frame by PatchMainLane via GameAccess.
-    private const string MpAdminNote =
-        "Multiplayer (once SE2 ships it): only host / local-server sessions can execute; pure clients are blocked.";
-
-    // Returned as the WorkItem error when the deny gate trips. SE-business-specific wording,
-    // kept here (not in Shared) — Shared.Executor stays string-neutral.
+    // Returned as the WorkItem error when the deny gate trips: a client with no local authoritative
+    // server, which only multiplayer makes (once SE2 ships it). The gate is Config.Denied, refreshed
+    // each frame by PatchMainLane via SessionGate. SE-business-specific wording, kept here (not in
+    // Shared) — Shared.Executor stays string-neutral. Not in the tool description, for SE1's reasons:
+    // most sessions never meet it, and the first denied call says it.
     private const string DenialMessage =
-        "Multiplayer client-only session: code execution is disabled — no local authoritative server present.";
+        "Code execution needs a local server; this is a client-only multiplayer session.";
 
     // DataDir provided by Pulsar via reflection, injected BEFORE construction
     // (PluginInstance.cs DependencyInject, before Activator.CreateInstance).
@@ -130,7 +128,7 @@ public sealed class Plugin : IPlugin, IDisposable, ICommonPlugin
 
         var tools = new ITool[]
         {
-            new ExecuteCodeTool(MainExecutor, ParallelExecutor, RenderExecutor, MpAdminNote, ScriptDefaults.SchemaText),
+            new ExecuteCodeTool(MainExecutor, ParallelExecutor, RenderExecutor, ScriptDefaults.Game, ScriptDefaults.Imports),
             new ScreenshotTool(MainExecutor)
         };
 

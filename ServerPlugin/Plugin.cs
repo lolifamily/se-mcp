@@ -16,8 +16,8 @@ using VRage.Plugins;
 
 // Define assembly version when compiled by Magnetar
 #if !DEV_BUILD
-[assembly: AssemblyVersion("2.1.0.0")]
-[assembly: AssemblyFileVersion("2.1.0.0")]
+[assembly: AssemblyVersion("2.2.0.0")]
+[assembly: AssemblyFileVersion("2.2.0.0")]
 #endif
 
 namespace ServerPlugin;
@@ -87,15 +87,9 @@ public sealed class Plugin : IPlugin, ICommonPlugin
 
         Common.SetPlugin(this);
 
-        // Best-effort on DS. The only patch here is Patch_ConfigSchema, which
-        // just relabels one caption in the config-screen schema. The executor
-        // and McpServer started below are driven by the native IPlugin.Update
-        // pump, not by any patch — so if Magnetar's ConfigSchema shape shifts
-        // and PatchAll throws, the screen falls back to the default caption and
-        // core code-execution keeps working. A cosmetic patch must not take the
-        // plugin down with it: log and carry on.
+        // No patches, no main lane pump: nothing to serve. PatchHelpers logs why.
         if (!PatchHelpers.HarmonyPatchAll(Log, new Harmony(Name)))
-            Log.Warning("Config-schema patch failed; using default caption. Core MCP/code-execution unaffected.");
+            return;
 
         // No deny gate on DS: denyPolicy returns false unconditionally — the DS
         // already gates who can join the server; once a caller has the SeMcp
@@ -113,9 +107,11 @@ public sealed class Plugin : IPlugin, ICommonPlugin
 
         _parallelExecutor = new ParallelExecutor(DenialMessage, ScriptDefaults.Usings);
 
-        // mpAdminNote omitted: server has no MP admin gate, the schema
-        // description stays free of the "Multiplayer requires Admin" line.
-        var tools = new ITool[] { new ExecuteCodeTool(_mainExecutor, _parallelExecutor) };
+        // No render lane on DS (renderExec null): the schema offers main and parallel.
+        var tools = new ITool[]
+        {
+            new ExecuteCodeTool(_mainExecutor, _parallelExecutor, null, ScriptDefaults.Game, ScriptDefaults.Imports)
+        };
 
         mcpServer = new McpServer(tools, config.Data,
             $"Space Engineers {MyFinalBuildConstants.APP_VERSION_STRING_DOTS}", dedicated: true);
@@ -129,11 +125,10 @@ public sealed class Plugin : IPlugin, ICommonPlugin
     public void Dispose()
     {
         // Main: Dispose() sets `disposed` and fulfills inflight promises;
-        // Tick() then drains `active` on this thread (main). After Dispose
-        // returns SE stops calling Update — this is the last chance to run
-        // script finally blocks on the right thread. Parallel: Dispose answers
-        // its requests and aborts its scripts; their threads are background
-        // threads.
+        // Tick() then drains `active` on this thread (main). No pump runs after
+        // plugins unload — this is the last chance to run script finally blocks
+        // on the right thread. Parallel: Dispose answers its requests and aborts
+        // its scripts; their threads are background threads.
         _mainExecutor?.Dispose();
         _mainExecutor?.Tick();
         _parallelExecutor?.Dispose();
@@ -157,14 +152,21 @@ public sealed class Plugin : IPlugin, ICommonPlugin
         config = null;
     }
 
+    // Unused: Patch_MainLane pumps the main lane.
     public void Update()
+    {
+    }
+
+    // Called by Patch_MainLane.
+    internal static void Pump()
     {
         // InitShared / Initialize are self-guarded (return after the first
         // call). Order matters: shared compiler references must populate
         // before MainExecutor exposes Initialized=true to the McpServer gate
         // (the volatile write is also what publishes them across threads).
-        // ParallelExecutor publishes them the same way.
-        Compiler.InitShared();
+        // ParallelExecutor publishes them the same way. MyFileSystem.ExePath is
+        // DedicatedServer64, the game folder InitShared asks for.
+        Compiler.InitShared(MyFileSystem.ExePath);
         _mainExecutor?.Initialize();
         _parallelExecutor?.Initialize();
         _mainExecutor?.Tick();

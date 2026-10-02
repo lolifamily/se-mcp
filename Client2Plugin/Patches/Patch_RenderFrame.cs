@@ -22,6 +22,7 @@ namespace Client2Plugin.Patches;
 [HarmonyPatch("Keen.VRage.Render12.EngineComponents.Render12EngineComponent", "RenderFrame")]
 internal static class PatchRenderFrame
 {
+    [HarmonyPriority(int.MinValue)]
     private static void Postfix()
     {
         if (Thread.CurrentThread.Name != "Render thread")

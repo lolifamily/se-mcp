@@ -16,10 +16,12 @@ down to `internal` types and members.
 >
 > - **Never** share, screenshot, or commit the token.
 > - **Never** port-forward the listener or expose it past `localhost`.
-> - The server binds `127.0.0.1` only, rejects browser-origin (CSRF) and
->   foreign `Host` headers, and uses constant-time token comparison. In
->   multiplayer the client additionally gates execution (SE1: **Admin/Owner**
->   promote level; SE2: **host / local-server** sessions only).
+> - The server answers `http://localhost:<port>` from this machine only: the
+>   port may listen on every interface, but other machines and any other
+>   `Host` (`127.0.0.1` included) are refused. Browser-origin (CSRF) requests
+>   are rejected and the token is compared in constant time. In multiplayer
+>   the client additionally gates execution (SE1: **Admin/Owner** promote
+>   level; SE2: **host / local-server** sessions only).
 > - The per-script watchdog (1 s/frame, 700 KB stack) exists to stop runaway
 >   loops from hanging the game thread. **It is not a security boundary** — a
 >   token holder already has full RCE.
@@ -30,7 +32,7 @@ down to `internal` types and members.
 
 ```
         MCP client  (Claude, etc.)
-              │   HTTP · JSON-RPC · Bearer token   (127.0.0.1 only)
+              │   HTTP · JSON-RPC · Bearer token   (localhost only)
               ▼
        ┌──────────────────────────────┐
        │  McpServer        (Shared)    │  HttpListener · JSON-RPC · auth · sessions
@@ -51,10 +53,12 @@ in-game), SE1 **`ServerPlugin`** (Magnetar, dedicated server), and SE2
 game's **main** thread, on either client's **render** thread, or on a thread of its
 own (**parallel**). The per-frame pump differs by host:
 
-- **main lane** — SE1 client `IPlugin.Update`, SE1 server `Update`; SE2 a Harmony
-  postfix on `VRageCore.Update`.
+- **main lane** — a Harmony postfix on the main thread's frame: SE1 (client and
+  server) `MySandboxGame.Update`, SE2 `VRageCore.Update`.
 - **render lane** (client only) — SE1 a Harmony postfix on
   `MyRenderThread.RenderFrame`; SE2 on `Render12EngineComponent.RenderFrame`.
+- Every pump postfix runs at Harmony priority `int.MinValue`, after every other
+  plugin's postfix on the same method, so a script sees the frame fully settled.
 - **parallel lane** — no pump: each script runs to its end on a thread of its own,
   concurrently with the game.
 
@@ -75,7 +79,7 @@ On first launch the plugin auto-generates a token. Where to find it and the URL:
   `9000→9009` climb if taken, with the bound port in the log.
 
 > Use `localhost`, **not** `127.0.0.1` — the `Host` header is checked and a
-> mismatch returns `403`.
+> mismatch is refused.
 
 Transport is **MCP Streamable HTTP** (not SSE): POST JSON-RPC to
 `http://localhost:<port>/`. Auth is either an `Authorization: Bearer <token>`
@@ -121,8 +125,9 @@ Your input maps 1:1 onto three C# layers, which are spliced into a wrapper:
 // <usings>            ← extra "using" lines (defaults already imported)
 public class __REPL__
 {
+    static TextWriter Console => …;   // your output — from code, class_body, nested types, any thread
     // <class_body>     ← methods, fields, nested types, [DllImport] — class-level
-    public IEnumerable<object> Run(TextWriter Console)
+    public IEnumerable<object> Run()
     {
         // <code>       ← statements only; this is the entry point
         yield break;
@@ -142,10 +147,14 @@ public class __REPL__
   `Keen.VRage.*`, `Keen.Game2.*`. Use short type names (SE1 `MySession.Static`,
   SE2 `GameAppComponent`), not fully-qualified ones.
 - Compiled with **Roslyn 5.3** against **every loaded assembly** (.NET + game +
-  other plugins), with **ignore-accessibility** turned on: `internal` classes,
-  methods, fields and properties are callable **directly, no reflection** — this
-  works across the game's own assemblies *and* other loaded plugins (only truly
-  `private` members still need reflection). `unsafe` and `[DllImport]` are allowed.
+  other plugins) **and every one the game can still load**, each at the file the
+  runtime will load it from, with **ignore-accessibility** turned on: `internal`
+  classes, methods, fields and properties are callable **directly, no reflection**
+  — this works across the game's own assemblies *and* other loaded plugins (only
+  truly `private` members still need reflection). `unsafe` and `[DllImport]` are
+  allowed. An assembly not loaded yet that would change what a name already means
+  in a script is reached through an extern alias instead, its name with `_` for
+  `.`: `Foo_Bar::Namespace.Type`.
 - Compile errors come back per field with corrected line numbers:
   `code(3,9): error CS0103: ...`.
 - Scripts are coroutines and **run in parallel**; each step is bounded by the
@@ -161,6 +170,16 @@ public class __REPL__
   or hang-up answers at once and **aborts** the script's thread, so a loop with no
   check point in it stops too; code stuck in a `finally`, a `catch` or a native
   call can't be stopped.
+- `await` works on `parallel`, and only there — its entry is
+  `async IAsyncEnumerable<object> Run()`. Whatever a script awaits, it resumes on
+  its own thread, the one a cancel aborts: even after `ConfigureAwait(false)`, and
+  even when an SE2 engine task completes on the game thread. Don't block on your
+  own async methods there (`.Result`, `.Wait()`): their continuations wait for the
+  very thread you're blocking, until a cancel frees it. Methods returning SE2's
+  own `Task` type keep Keen's rules.
+- On every lane, a script's faulted `Task` that nobody awaits stays quiet (SE2
+  treats an unobserved one as a crash), and an `async void` method's exception
+  becomes its script's error on `parallel`, a log line elsewhere.
 
 **Examples**
 
@@ -240,26 +259,43 @@ on the server they are editable through Quasar's **Plugin configuration** page.
 For anyone reading or extending the code:
 
 - **`McpServer`** — one `HttpListener`, single (non-batched) JSON-RPC, auth +
-  CSRF/host checks, pre-rendered `tools/list`. Sessions namespace in-flight
+  loopback-peer/CSRF/host checks, pre-rendered `tools/list`. Sessions namespace in-flight
   request ids but carry no server state.
 - **`Executor`** — compilation runs on the thread pool; the compiled coroutine is
   then stepped one `MoveNext` per frame on its owning game thread. Each lane has
   its own executor and `ScriptGuard`, so finally-blocks and thread-affine state
   stay on the right thread.
 - **`ParallelExecutor`** — the parallel lane. Scripts compile with `StackCheck`
-  only and run inside `ControlledExecution.Run` (net48: a port of it). A kill
-  answers the request first, then aborts from a throwaway thread and interrupts
-  managed waits — at once, then every 250 ms — which an abort alone can't wake on
-  .NET 10.
+  only and run inside `ControlledExecution.Run` (net48: a port of it), each with a
+  `ScriptPump`: the queue of its continuations, which its thread runs until the
+  script completes. A kill answers the request first, drops the continuations
+  still to come, then aborts from a throwaway thread and interrupts managed waits
+  — at once, then every 250 ms — which an abort alone can't wake on .NET 10.
 - **`Compiler`** — drives Roslyn entirely through **reflection** (no compile-time
   binding, so it works against both the game's ancient Roslyn and the NuGet 5.3
-  one), references every loaded assembly, and enables **ignore-accessibility** so
+  one), references what `ScriptReferences` collects (keeping only each file's
+  metadata in memory), and enables **ignore-accessibility** so
   scripts can reach `internal` members: `MetadataImportOptions.Internal` +
   `BinderFlags.IgnoreAccessibility` at compile time, plus an injected
   `[assembly: IgnoresAccessChecksTo]` per referenced assembly at runtime (its
   attribute is self-declared — source wins over the copies Harmony and other
   plugins ship, so no ambiguity). It then rewrites the emitted IL with
-  **Mono.Cecil** to inject the guard.
+  **Mono.Cecil** to inject the guard, and points the script's reference to each
+  BCL async method builder at SeMcp's own.
+- **`ScriptBuilders`** — those builders, member for member the same as the BCL's,
+  so retargeting one type reference swaps the builder of every async method in a
+  script without touching an instruction. `async ValueTask` methods run on the
+  `Task` ones: their one call that names `ValueTask` is rewritten to make it from
+  the `Task`, so the plugin never names a `ValueTask` of its own. On a parallel
+  script's thread they wrap each awaiter, sending its continuation through the
+  script's `ScriptPump`; anywhere else they pass the script's own call through.
+  A faulted `Task` of theirs counts as observed.
+- **`ScriptReferences`** — what scripts compile against: for each assembly name,
+  the first file the runtime's binder would come to (loaded, then TPA on .NET 10,
+  the loader's library folder, the game folder, the runtime folder on .NET
+  Framework), read as metadata only. One that would change what a name already
+  means in a script (a type's full name defined a second time, or a type with no
+  namespace hiding the one a `using` brings in) goes in under an extern alias.
 - **`ScriptGuard`** — a stack-depth `StackCheck` and a `Bail()` at the entry of
   every script method, `Bail()` on backward branches, and `catch`→filter rewrites
   (so a `catch` can't swallow the abort). Entry checks also cover script code the

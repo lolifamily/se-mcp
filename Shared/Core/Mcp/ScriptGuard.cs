@@ -4,11 +4,14 @@ using System.Runtime.CompilerServices;
 
 namespace Shared.Mcp;
 
+// Only ever shown under Executor.TimeoutReport's header, which already says the step was cut and
+// what the budget was — so the message is the next move alone.
 public class ScriptTimeoutException()
-    : Exception("Script killed: shared frame budget ran out mid-step — split work across frames with `yield return null`");
+    : Exception("split work across frames with `yield return null`");
 
+// Shown under "script threw:"; the folded stack under it shows the recursion.
 public class ScriptStackException()
-    : Exception("Script killed: stack depth budget exhausted (700KB)");
+    : Exception("stack depth budget exhausted (700KB)");
 
 // Two independent guards — one per execution lane (main / render).
 // Kept as separate static classes rather than one class with parallel

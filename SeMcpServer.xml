@@ -12,7 +12,7 @@
     <Tooltip>MCP server for LLM-driven code execution inside Space Engineers Dedicated Server</Tooltip>
 
     <Description>*** WARNING — REMOTE CODE EXECUTION ***
-The bearer token = root password. Any client with it can run arbitrary C# on the dedicated server host (file I/O, processes, native [DllImport]). Never share or screenshot it; never port-forward the listener. Binds 127.0.0.1 only.
+The bearer token = root password. Any client with it can run arbitrary C# on the dedicated server host (file I/O, processes, native [DllImport]). Never share or screenshot it; never port-forward the listener. Serves localhost only.
 
 Turns your Space Engineers Dedicated Server into an MCP (Model Context Protocol) server. An LLM like Claude can connect over HTTP and execute C# directly in the running server engine with full .NET and game API access.
 

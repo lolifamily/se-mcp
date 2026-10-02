@@ -51,7 +51,7 @@ internal static class ScreenshotService
     private static Request _pending;
 
     // Flipped by Drain (Plugin.Dispose, main thread) before the listener stops.
-    // After that point Plugin.Update never runs again: a request that slipped
+    // After that point the main-lane pump never runs again: a request that slipped
     // into the slot would never be issued, never time out, and leave its
     // HandleToolsCall awaiting forever. Same contract as Executor.disposed.
     private static volatile bool _disposed;
@@ -80,7 +80,7 @@ internal static class ScreenshotService
             Complete(item, error: ShutdownMessage);
     }
 
-    // Main thread, called from Plugin.Update every frame. Polices cancellation
+    // Main thread, called from the main-lane pump (Plugin.Pump) every frame. Polices cancellation
     // first — a request is cancellable in any state — then advances the state
     // machine: not yet issued → issue; issued → wait for the signal or deadline.
     public static void Tick()
@@ -130,9 +130,10 @@ internal static class ScreenshotService
         }
 
         if (req.Started.ElapsedMilliseconds <= TimeoutMs) return;
+        // The likely cause stays here, not in the report: a same-frame F4 displaced ours (see
+        // TimeoutMs), and the file may still land at req.Path later. The report says what to do.
         if (TryClaim(req))
-            Complete(req.Item, error: $"screenshot not reported within {TimeoutMs}ms (expected at {req.Path}); " +
-                                      $"a concurrent screenshot (e.g. F4) may have displaced it, retry");
+            Complete(req.Item, error: $"screenshot not reported within {TimeoutMs}ms — retry");
     }
 
     // Patch thread (render or background). Every screenshot in the game funnels

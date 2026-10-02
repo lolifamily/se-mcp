@@ -45,8 +45,10 @@ public sealed class ScreenshotTool(Executor mainExec) : ITool
     public string Name => "take_screenshot";
     public bool ReturnsImage => true;
 
-    public string SchemaJson =>
-        """{"name":"take_screenshot","description":"Capture the current game frame and return it as an image.","inputSchema":{"type":"object","properties":{"ignore_sprites":{"type":"boolean","description":"true = capture the 3D scene only, without HUD/GUI overlays. Default false (HUD included)."}}}}""";
+    public string SchemaJson { get; } = ToolSchema.Build("take_screenshot",
+        "Capture the current game frame as an image.",
+        new ToolSchema.Param("ignore_sprites", "The 3D scene only, without HUD/GUI overlays.",
+            type: "boolean", @default: false));
 
     public bool TryDispatch(JsonElement arguments, WorkItem item, out int errorCode, out string errorMessage)
     {
@@ -74,7 +76,7 @@ public sealed class ScreenshotTool(Executor mainExec) : ITool
         if (!mainExec.Initialized)
         {
             errorCode = -32002;
-            errorMessage = "Game is still loading, not all plugins have been initialized yet. Please retry shortly.";
+            errorMessage = "Game still loading — retry shortly.";
             return false;
         }
 

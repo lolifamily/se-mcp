@@ -21,8 +21,8 @@ using VRage.Plugins;
 
 // Define assembly version when compiled by Pulsar
 #if !DEV_BUILD
-[assembly: AssemblyVersion("2.1.0.0")]
-[assembly: AssemblyFileVersion("2.1.0.0")]
+[assembly: AssemblyVersion("2.2.0.0")]
+[assembly: AssemblyFileVersion("2.2.0.0")]
 #endif
 
 namespace ClientPlugin;
@@ -32,17 +32,14 @@ public sealed class Plugin : IPlugin, ICommonPlugin
 {
     private const string Name = "SeMcp";
 
-    // Suffix added to the execute_code tool description (LLM-facing reminder).
-    // The actual gate is the IsDenied lambda below — the description just primes
-    // the LLM to expect it.
-    private const string MpAdminNote =
-        "Multiplayer requires Admin or Owner promote level.";
-
     // Returned to the caller as the WorkItem error when IsDenied trips. Kept here
     // (not in Shared) because the wording is SE-business-specific (Admin/Owner
     // terminology, "in multiplayer" framing) — Shared.Executor stays string-neutral.
+    // The tool description says nothing of the gate: single player never meets it,
+    // a non-admin's first call gets this message instead, and no model can promote
+    // itself — knowing it sooner changes no call.
     private const string DenialMessage =
-        "Multiplayer non-admin: code execution is disabled. You must be Admin or Owner to use SeMcp in multiplayer.";
+        "Code execution needs Admin or Owner promote level in multiplayer.";
 
     private static bool _failed;
 
@@ -66,10 +63,11 @@ public sealed class Plugin : IPlugin, ICommonPlugin
     private SettingsGenerator settingsGenerator;
 
     // Three execution lanes:
-    //   Main     — ticked from IPlugin.Update on SE's main thread (game/API state).
+    //   Main     — ticked by Pump, from Patch_MainLane's Postfix on SE's main
+    //              thread (game/API state).
     //   Render   — ticked from Patch_RenderFrame's Postfix on SE's render thread,
     //              for inspecting plugin Harmony hooks that run there.
-    //   Parallel — each script on a thread of its own; Update only pushes the
+    //   Parallel — each script on a thread of its own; Pump only pushes the
     //              deny gate onto it.
     // Main and Render each bind to their own ScriptGuard{Main,Render} static
     // class — the lambda closes over that class's KillId, its BeginStep marks
@@ -164,7 +162,7 @@ public sealed class Plugin : IPlugin, ICommonPlugin
 
         var tools = new ITool[]
         {
-            new ExecuteCodeTool(MainExecutor, ParallelExecutor, RenderExecutor, MpAdminNote),
+            new ExecuteCodeTool(MainExecutor, ParallelExecutor, RenderExecutor, ScriptDefaults.Game, ScriptDefaults.Imports),
             new ScreenshotTool(MainExecutor)
         };
 
@@ -193,9 +191,8 @@ public sealed class Plugin : IPlugin, ICommonPlugin
         // that ran the script (finally blocks observe Thread.CurrentThread and
         // hold thread-affine D3D11 state). So:
         //   - Main:   we are on the main thread now. Dispose() then Tick() drains
-        //             active on this thread (the script's owning thread). After
-        //             Plugin.Dispose returns SE stops calling Update, so this is
-        //             the last chance.
+        //             active on this thread (the script's owning thread). No pump
+        //             runs after plugins unload, so this is the last chance.
         //   - Render: setting disposed=true is enough. The next RenderFrame
         //             Postfix hook drains active on the render thread (the
         //             script's owning thread). harmony is NOT unpatched —
@@ -244,12 +241,14 @@ public sealed class Plugin : IPlugin, ICommonPlugin
         if (_failed)
             return;
 
-        if (RefreshSettings)
-        {
-            RefreshSettings = false;
-            _settingsDialog?.RecreateControls(false);
-        }
+        if (!RefreshSettings) return;
+        RefreshSettings = false;
+        _settingsDialog?.RecreateControls(false);
+    }
 
+    // Called by Patch_MainLane.
+    internal static void Pump()
+    {
         // Refresh the deny gate on the main thread once per frame. Other threads
         // (Enqueue from the ThreadPool, RenderExecutor.Tick on render) read it
         // through Common.Config.Denied — bool atomic, at most one frame stale.
@@ -267,7 +266,8 @@ public sealed class Plugin : IPlugin, ICommonPlugin
         // -32002 instead of compiling into a queue nothing ever drains.
         // ParallelExecutor.Initialize publishes the references the same way, and
         // EnforceDenyGate pushes the gate refreshed above onto running scripts.
-        Compiler.InitShared();
+        // MyFileSystem.ExePath is Bin64, the game folder InitShared asks for.
+        Compiler.InitShared(MyFileSystem.ExePath);
         MainExecutor?.Initialize();
         ParallelExecutor?.Initialize();
         MainExecutor?.Tick();

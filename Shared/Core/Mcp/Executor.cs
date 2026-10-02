@@ -1,7 +1,6 @@
 using System;
 using System.Collections.Concurrent;
 using System.Diagnostics;
-using System.IO;
 using System.Reflection;
 using System.Threading;
 using System.Threading.Tasks;
@@ -55,8 +54,8 @@ public sealed class WorkItem
 // thread, the only one Killing answers yes on.
 //
 // denialMessage: the user-facing reject text (Shared holds no SE business strings).
-// The denial gate itself lives on IPluginConfig.Denied — the owning Plugin.Update
-// refreshes it on the main thread once per frame (client checks SE Admin/Owner
+// The denial gate itself lives on IPluginConfig.Denied — the owning plugin's main-lane
+// pump refreshes it on the main thread once per frame (client checks SE Admin/Owner
 // level; server never writes, stays false). Executor reads Common.Config.Denied
 // directly; bool reads are atomic and one frame of staleness is fine.
 public sealed class Executor(
@@ -75,7 +74,7 @@ public sealed class Executor(
 
     bool IScriptLane.Initialized => Initialized;
 
-    private readonly Compiler compiler = new(guardBail, guardStackCheck, guardKilling, defaultUsings);
+    private readonly Compiler compiler = new(guardBail, guardStackCheck, guardKilling, defaultUsings, asyncEntry: false);
     private readonly FrameWatchdog watchdog = new(setKillId, frameTimeoutMs);
     private readonly ConcurrentQueue<(WorkItem Item, CompilationResult Result)> compiled = new();
     private readonly List<ActiveScript> active = [];
@@ -85,7 +84,7 @@ public sealed class Executor(
     public void Initialize()
     {
         if (Initialized) return;
-        // Compiler.InitShared is process-wide and called by Plugin.Update before
+        // Compiler.InitShared is process-wide and called by the main-lane pump before
         // either Executor.Initialize. Nothing per-Executor needs to happen here
         // beyond flipping the gate the McpServer reads.
         Initialized = true;
@@ -96,7 +95,7 @@ public sealed class Executor(
         public int Id; // CompilationResult.ScriptId — what its injected checks answer to
         public WorkItem Item;
         public IEnumerator<object> Coroutine;
-        public StringWriter Writer;
+        public Capture Output;
     }
 
     public void Enqueue(WorkItem item)
@@ -152,8 +151,7 @@ public sealed class Executor(
             {
                 try { s.Coroutine?.Dispose(); }
                 catch (Exception ex) { Common.Logger.Warning($"coroutine dispose failed: {ex.Message}"); }
-                try { s.Writer?.Dispose(); }
-                catch (Exception ex) { Common.Logger.Warning($"writer dispose failed: {ex.Message}"); }
+                s.Output.Take();   // sealed: what the script left behind now writes nowhere
             }
             active.Clear();
             return;
@@ -269,21 +267,22 @@ public sealed class Executor(
             return;
         }
 
+        var output = new Capture();
         try
         {
-            // \n, not the platform's \r\n: the text goes to a model, and ScriptRender joins on \n.
-            var writer = new StringWriter { NewLine = "\n" };
-
             active.Add(new ActiveScript
             {
                 Id = result.ScriptId,
                 Item = item,
-                Coroutine = result.Start(writer).GetEnumerator(),
-                Writer = writer
+                Coroutine = result.Start(output).GetEnumerator(),
+                Output = output
             });
         }
         catch (Exception ex)
         {
+            // Taken, not dropped: what class_body's initializers printed before one threw, and the
+            // seal on anything they registered on the way.
+            item.Output = output.Take();
             CompleteItem(item, error: ScriptRender.StartFailed(ex));
         }
     }
@@ -291,7 +290,7 @@ public sealed class Executor(
     private void Complete(ActiveScript s, string error = null, bool cancelled = false)
     {
         s.Coroutine.Dispose();
-        s.Item.Output = s.Writer.ToString();
+        s.Item.Output = s.Output.Take();
         CompleteItem(s.Item, error, cancelled);
     }
 
@@ -318,10 +317,9 @@ public sealed class Executor(
         // `active` is owned by the Tick thread. Its drain happens on the next Tick
         // (disposed branch). Caller must arrange one final Tick on the owner thread
         // after Dispose: render Executor relies on the natural next-frame hook;
-        // main Executor must be ticked once from Plugin.Dispose since SE stops
-        // calling Update after dispose. Partial-output capture before promise
-        // fulfillment is dropped — it required reading Writer concurrently with
-        // a possibly-still-running script.
+        // main Executor must be ticked once from Plugin.Dispose, since no pump
+        // comes after it. Partial output is dropped: each script's
+        // Capture sits on `active`, which only the Tick thread touches.
 
         // Compiler's shared state (references, resolve handler) is process-wide;
         // it's released by Plugin.Dispose once both executors are torn down.
@@ -337,11 +335,15 @@ public sealed class Executor(
     // blocking call, or a `catch when` that swallowed the kill. .NET has no safe way to walk another
     // running thread's stack, so the watchdog can't photograph the lane at expiry — a thrown stack
     // is the only record of where the step was.
+    //
+    // Not in the report: code the script installed is cut with it only where the step itself set
+    // it off on the lane thread — a patched method it called, an event it raised — and those frames
+    // are on the stack shown. Code of its running anywhere else (a thread it started, a handler the
+    // game fires later) is never touched: Killing answers on the lane thread, during this step, alone.
     private string TimeoutReport(long startedAt, Exception thrown)
     {
         var stepMs = (Stopwatch.GetTimestamp() - startedAt) * 1000 / Stopwatch.Frequency;
-        return $"script interrupted {stepMs}ms into this step (shared frame budget: {frameTimeoutMs}ms); "
-            + "handlers it installed (Harmony patches, event handlers, spawned threads) may also have been hit:\n"
+        return $"script interrupted {stepMs}ms into its step (shared frame budget: {frameTimeoutMs}ms):\n"
             + ScriptRender.Stack(thrown ?? new ScriptTimeoutException());
     }
 }
