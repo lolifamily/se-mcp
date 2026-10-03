@@ -8,8 +8,8 @@ namespace Shared.Mcp;
 
 // The builders a script's async methods run on. Compiler.RetargetBuilders points the script's reference to
 // each BCL builder at the one here of the same shape, so the code the C# compiler wrote drives these
-// instead: each mirrors its BCL builder member for member, and all but the async void one keep that
-// builder underneath. Two things change.
+// instead: each mirrors its BCL builder member for member, and all but the async void and iterator ones
+// keep that builder underneath. Two things change.
 //
 // Where an await resumes. On a parallel script's worker (ScriptPump.Current), the awaiter is wrapped, so
 // the continuation goes back through the pump whatever thread completes what was awaited. Anywhere else
@@ -125,17 +125,20 @@ public struct ScriptTaskBuilder<TResult>
 }
 
 // An async iterator reports its faults through the enumerator it hands out, not through a Task, so this
-// one has nothing to observe.
+// one has nothing to observe. Not a wrapper either: the BCL AsyncIteratorMethodBuilder can't be named in
+// SE1's build on .NET 10 (Pulsar Interim), which references the game's .NET Framework copy of
+// Microsoft.Bcl.AsyncInterfaces beside CoreLib, each defining it. Built on the Task builder instead, as
+// that package builds its own; the Task is nobody's.
 public struct ScriptIteratorBuilder
 {
-    private AsyncIteratorMethodBuilder inner;
+    private AsyncTaskMethodBuilder inner;
 
-    public static ScriptIteratorBuilder Create() => new() { inner = AsyncIteratorMethodBuilder.Create() };
+    public static ScriptIteratorBuilder Create() => new() { inner = AsyncTaskMethodBuilder.Create() };
 
     public void MoveNext<TStateMachine>(ref TStateMachine stateMachine) where TStateMachine : IAsyncStateMachine =>
-        inner.MoveNext(ref stateMachine);
+        inner.Start(ref stateMachine);
 
-    public void Complete() => inner.Complete();
+    public void Complete() => inner.SetResult();
 
     public void AwaitOnCompleted<TAwaiter, TStateMachine>(ref TAwaiter awaiter, ref TStateMachine stateMachine)
         where TAwaiter : INotifyCompletion where TStateMachine : IAsyncStateMachine
