@@ -33,8 +33,8 @@ internal static class PatchRenderFrame
             return;
         if (!exec.Initialized)
         {
-            // Gate on the main lane's pump being alive first — its InitShared is what
-            // publishes the shared compiler refs to this thread.
+            // Gate on the main lane being open first — its Initialized, set once InitShared
+            // returns true, is what publishes the shared compiler refs to this thread.
             if (Plugin.MainExecutor?.Initialized != true)
                 return;
             exec.Initialize();

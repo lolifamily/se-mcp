@@ -152,9 +152,12 @@ public class __REPL__
   classes, methods, fields and properties are callable **directly, no reflection**
   — this works across the game's own assemblies *and* other loaded plugins (only
   truly `private` members still need reflection). `unsafe` and `[DllImport]` are
-  allowed. An assembly not loaded yet that would change what a name already means
-  in a script is reached through an extern alias instead, its name with `_` for
-  `.`: `Foo_Bar::Namespace.Type`.
+  allowed. Where several assemblies define the same type, a public copy hides the
+  copies from lower tiers (framework, then game, then everything else) and the
+  internal ones from its own, unless they carry extension methods it lacks. An
+  assembly not loaded yet that would still change what a name already means in a
+  script is reached through an extern alias instead, its name with `_` for `.`:
+  `Foo_Bar::Namespace.Type`.
 - Compile errors come back per field with corrected line numbers:
   `code(3,9): error CS0103: ...`.
 - Scripts are coroutines and **run in parallel**; each step is bounded by the
@@ -291,11 +294,16 @@ For anyone reading or extending the code:
   script's `ScriptPump`; anywhere else they pass the script's own call through.
   A faulted `Task` of theirs counts as observed.
 - **`ScriptReferences`** — what scripts compile against: for each assembly name,
-  the first file the runtime's binder would come to (loaded, then TPA on .NET 10,
-  the loader's library folder, the game folder, the runtime folder on .NET
-  Framework), read as metadata only. One that would change what a name already
-  means in a script (a type's full name defined a second time, or a type with no
-  namespace hiding the one a `using` brings in) goes in under an extern alias.
+  the first file the runtime's binder would come to (loaded by the main lane's
+  first frame, then TPA on .NET 10, the loader's library folder, the game folder,
+  the runtime folder on .NET Framework), read as metadata only, on a thread of its
+  own; the lanes open once it's done. Of a type defined in several, the copies
+  another one beats are hidden: Roslyn reads their files from a copy of the
+  metadata that marks them `[Microsoft.CodeAnalysis.Embedded]` (**`HiddenTypes`**),
+  which keeps a type out of lookup. One that would still change what a name
+  already means in a script (a type's full name defined a second time, or a type
+  with no namespace hiding the one a `using` brings in) goes in under an extern
+  alias.
 - **`ScriptGuard`** — a stack-depth `StackCheck` and a `Bail()` at the entry of
   every script method, `Bail()` on backward branches, and `catch`→filter rewrites
   (so a `catch` can't swallow the abort). Entry checks also cover script code the

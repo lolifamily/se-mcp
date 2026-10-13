@@ -19,6 +19,7 @@
     <Compile Include="$(MSBuildThisFileDirectory)Mcp\ExecuteCodeTool.cs" />
     <Compile Include="$(MSBuildThisFileDirectory)Mcp\Executor.cs" />
     <Compile Include="$(MSBuildThisFileDirectory)Mcp\FrameWatchdog.cs" />
+    <Compile Include="$(MSBuildThisFileDirectory)Mcp\HiddenTypes.cs" />
     <Compile Include="$(MSBuildThisFileDirectory)Mcp\IScriptLane.cs" />
     <Compile Include="$(MSBuildThisFileDirectory)Mcp\ITool.cs" />
     <Compile Include="$(MSBuildThisFileDirectory)Mcp\McpServer.cs" />

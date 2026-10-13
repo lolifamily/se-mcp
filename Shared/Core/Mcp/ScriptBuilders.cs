@@ -6,30 +6,30 @@ using Shared.Plugin;
 
 namespace Shared.Mcp;
 
-// The builders a script's async methods run on. Compiler.RetargetBuilders points the script's reference to
-// each BCL builder at the one here of the same shape, so the code the C# compiler wrote drives these
-// instead: each mirrors its BCL builder member for member, and all but the async void and iterator ones
-// keep that builder underneath. Two things change.
+// The builders a script's async methods run on. Compiler.RetargetBuilders points the script's reference
+// to each BCL builder at the one here of the same shape, so the code the C# compiler wrote drives these
+// instead. Each mirrors its BCL builder member for member, and all but the iterator and void ones keep
+// that builder underneath. Two things change:
 //
-// Where an await resumes. On a parallel script's worker (ScriptPump.Current), the awaiter is wrapped, so
-// the continuation goes back through the pump whatever thread completes what was awaited. Anywhere else
-// the BCL builder gets the script's own awaiter: the call the script made. A SynchronizationContext alone
-// couldn't get there — whether an await honors one is its awaiter's choice, and ConfigureAwait(false)
-// declines, as does every awaiter of SE2's Keen tasks, which run continuations right on the thread
-// completing the task, the game's main thread included. A continuation running anywhere but the worker is
-// out of the kill's reach, and its StackCheck measures against a baseline that isn't its own.
+// - Where an await resumes. On a parallel script's worker (ScriptPump.Current) the awaiter is wrapped,
+//   so the continuation goes back through the pump, whatever thread completes what was awaited.
+//   Anywhere else the BCL builder gets the script's own awaiter. A SynchronizationContext couldn't do
+//   this: whether an await honors one is the awaiter's choice, and ConfigureAwait(false) declines, as
+//   does every awaiter of SE2's Keen tasks, which run continuations on the thread completing the task,
+//   the game's main thread included. A continuation running anywhere but the worker is out of the
+//   kill's reach, and its StackCheck measures against a baseline that isn't its own.
 //
-// What a fault leaves behind. A script's Task counts as observed the moment it faults. Unobserved, it
-// would raise TaskScheduler.UnobservedTaskException once collected, which SE2's crash handler answers by
-// ending the session — for a script that started a task and never awaited it, or one killed mid-step,
-// whose abort lands in its own state machine as a ThreadAbortException. An async void method's exception
-// goes to its script as the script's error, or with no script around to the log; the BCL rethrows it on the
-// thread pool or the captured context, ending the process either way.
+// - What a fault leaves behind. A script's Task counts as observed the moment it faults. Unobserved,
+//   it would raise TaskScheduler.UnobservedTaskException once collected, which SE2's crash handler
+//   answers by ending the session: a script that started a task and never awaited it was enough, or
+//   one killed mid-step, whose abort lands in its own state machine. An async void method's exception
+//   becomes its script's error on "parallel" and a log line elsewhere; the BCL would rethrow it on the
+//   thread pool or the captured context, ending the process either way.
 //
-// C# picks a builder by return type: void, Task, Task<T>, ValueTask, ValueTask<T>, IAsyncEnumerable<T> and
-// IAsyncEnumerator<T>. The ValueTask methods run on the Task builders here (Compiler.ValueTasksOnTasks), so
-// these four cover all of them. Any other builder keeps its own behavior: PoolingAsyncValueTaskMethodBuilder
-// and a script's own, which take an explicit [AsyncMethodBuilder], and SE2's Keen TaskMethodBuilder.
+// C# picks a builder by return type. void, Task, Task<T> and the async iterators come here, and the
+// ValueTask methods run on the Task builders (Compiler.ValueTasksOnTasks). Any other builder keeps its
+// own behavior: one named by an explicit [AsyncMethodBuilder] (PoolingAsyncValueTaskMethodBuilder, a
+// script's own), and SE2's Keen TaskMethodBuilder.
 
 // ReSharper disable UnusedMember.Global
 public struct ScriptTaskBuilder
@@ -50,7 +50,7 @@ public struct ScriptTaskBuilder
     public void SetException(Exception exception)
     {
         inner.SetException(exception);
-        _ = inner.Task.Exception;
+        _ = inner.Task.Exception;   // reading it marks the fault observed
     }
 
     public void AwaitOnCompleted<TAwaiter, TStateMachine>(ref TAwaiter awaiter, ref TStateMachine stateMachine)
@@ -96,7 +96,7 @@ public struct ScriptTaskBuilder<TResult>
     public void SetException(Exception exception)
     {
         inner.SetException(exception);
-        _ = inner.Task.Exception;
+        _ = inner.Task.Exception;   // reading it marks the fault observed
     }
 
     public void AwaitOnCompleted<TAwaiter, TStateMachine>(ref TAwaiter awaiter, ref TStateMachine stateMachine)
@@ -124,11 +124,11 @@ public struct ScriptTaskBuilder<TResult>
     }
 }
 
-// An async iterator reports its faults through the enumerator it hands out, not through a Task, so this
-// one has nothing to observe. Not a wrapper either: the BCL AsyncIteratorMethodBuilder can't be named in
-// SE1's build on .NET 10 (Pulsar Interim), which references the game's .NET Framework copy of
-// Microsoft.Bcl.AsyncInterfaces beside CoreLib, each defining it. Built on the Task builder instead, as
-// that package builds its own; the Task is nobody's.
+// Async iterators. Their faults surface through the enumerator they hand out, not a Task, so there is
+// nothing to observe. Built on the Task builder rather than wrapping AsyncIteratorMethodBuilder, which
+// SE1's build on .NET 10 (Pulsar Interim) can't name: it references the game's .NET Framework copy of
+// Microsoft.Bcl.AsyncInterfaces beside CoreLib, and both define it. That package builds its own the
+// same way; the Task is nobody's.
 public struct ScriptIteratorBuilder
 {
     private AsyncTaskMethodBuilder inner;
@@ -165,9 +165,9 @@ public struct ScriptIteratorBuilder
     }
 }
 
-// Not a wrapper: the BCL AsyncVoidMethodBuilder can't be named in SE2's build, where every game assembly
-// ships a public type of the same full name. Built on the Task builder instead, as Keen builds theirs; the
-// Task is nobody's.
+// Async void methods. Built on the Task builder rather than wrapping AsyncVoidMethodBuilder, which
+// SE2's build can't name: every game assembly ships a public type of the same full name. Keen builds
+// theirs the same way; the Task is nobody's.
 public struct ScriptVoidBuilder
 {
     private AsyncTaskMethodBuilder inner;
@@ -184,8 +184,8 @@ public struct ScriptVoidBuilder
 
     public void SetResult() => inner.SetResult();
 
-    // To its script's worker, thrown there as it was here: the script's error. A pump closed by then
-    // sends it to the thread pool's log, or drops it with the killed script's other continuations.
+    // Thrown on its script's worker as it was thrown here: the script's error. A pump closed by then
+    // sends it to the thread pool and the log, or drops it with a killed script's other continuations.
     public void SetException(Exception exception)
     {
         inner.SetResult();
@@ -220,8 +220,8 @@ public struct ScriptVoidBuilder
     }
 }
 
-// The awaiter a builder is handed in place of the script's: when the continuation runs is still the
-// original awaiter's to decide; where it runs becomes the pump's. Each calls the original through its own
+// The awaiter a builder gets in place of the script's: when the continuation runs is still the original
+// awaiter's to decide; where it runs becomes the pump's. Each calls the original through its own
 // constraint, so nothing is boxed.
 // ReSharper disable once StructCanBeMadeReadOnly
 internal struct Rerouted<TAwaiter>(TAwaiter awaiter, ScriptPump pump) : INotifyCompletion
@@ -238,4 +238,3 @@ internal struct ReroutedCritical<TAwaiter>(TAwaiter awaiter, ScriptPump pump) : 
 
     public void UnsafeOnCompleted(Action continuation) => awaiter.UnsafeOnCompleted(pump.Resume(continuation));
 }
-

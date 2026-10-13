@@ -2,6 +2,7 @@ using System;
 using System.Collections;
 using System.Collections.Generic;
 using System.ComponentModel;
+using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Reflection;
@@ -81,6 +82,7 @@ public sealed class Compiler(MethodInfo guardBail, MethodInfo guardStackCheck, M
     private static readonly Type MetaRefBase;
     private static readonly Type ModuleMetadata;
     private static readonly MethodInfo ModuleFromStream;
+    private static readonly MethodInfo ModuleFromMetadata;
     private static readonly object MetadataOnly;
     private static readonly MethodInfo ModuleNames;
     private static readonly MethodInfo AssemblyCreate;
@@ -93,13 +95,11 @@ public sealed class Compiler(MethodInfo guardBail, MethodInfo guardStackCheck, M
 
     // References + resolveMap + handler + extern aliases are process-wide: the AppDomain
     // assembly set is identical for both executors, so duplicating the scan + per-file
-    // MetadataReference creation gives nothing back. Lifecycle is
-    // owned by the plugin (its main-lane pump lazily inits on the first call;
-    // Dispose releases). No lock: the pump and Dispose, both on the main
-    // thread, are the only writers. The
-    // memory-visibility chain to Compile (Task pool) goes through Executor's
-    // volatile Initialized flag, which is set AFTER InitShared returns.
+    // MetadataReference creation gives nothing back. BuildShared fills them on a thread of its
+    // own and sets _sharedReady last; the lanes open only on it, so it is the one field that
+    // needs to be volatile. No lock with ReleaseShared: that runs as the game exits.
     private static bool _sharedInit;
+    private static volatile bool _sharedReady;
     private static readonly List<object> SharedReferences = [];
     private static readonly Dictionary<string, Assembly> SharedResolveMap = new();
     private static ResolveEventHandler _sharedHandler;
@@ -175,7 +175,7 @@ namespace System.Runtime.CompilerServices
 }
 """;
 
-    // Two ignoreaccess trees (definition + [assembly:] usage), parsed once by InitShared
+    // Two ignoreaccess trees (definition + [assembly:] usage), parsed once by BuildShared
     // and compiled alongside every user script.
     private static object _iaAttrTree;
     private static object _iaAssemblyTree;
@@ -213,6 +213,8 @@ namespace System.Runtime.CompilerServices
             .Single(m => m.Name == "CreateFromStream"
                 && m.GetParameters().Length == 2 && m.GetParameters()[1].ParameterType.IsEnum);
         MetadataOnly = Enum.Parse(ModuleFromStream.GetParameters()[1].ParameterType, "PrefetchMetadata, LeaveOpen");
+        ModuleFromMetadata = ModuleMetadata.GetMethod("CreateFromMetadata", [typeof(IntPtr), typeof(int)])
+            ?? throw new MissingMethodException(ModuleMetadata.FullName, "CreateFromMetadata");
         ModuleNames = ModuleMetadata.GetMethod("GetModuleNames", Type.EmptyTypes)
             ?? throw new MissingMethodException(ModuleMetadata.FullName, "GetModuleNames");
         AssemblyCreate = assemblyMetadata.GetMethod("Create", [ModuleMetadata.MakeArrayType()])
@@ -258,7 +260,7 @@ namespace System.Runtime.CompilerServices
 
         // ignoreaccess (compile-time half): let REPL scripts read the game's internal
         // types/members. Verified end-to-end on Roslyn 5.3.0. Paired with the runtime
-        // [assembly: IgnoresAccessChecksTo] tree built in InitShared.
+        // [assembly: IgnoresAccessChecksTo] tree built in BuildShared.
         //   (1) MetadataImportOptions.Internal — import internal members from metadata
         //       (default Public hides them). WithMetadataImportOptions is PUBLIC.
         //   (2) TopLevelBinderFlags = BinderFlags.IgnoreAccessibility (1<<22) — skip
@@ -287,40 +289,21 @@ namespace System.Runtime.CompilerServices
         DiagSeverity = commonAsm.GetType("Microsoft.CodeAnalysis.Diagnostic", throwOnError: true)!.GetProperty("Severity");
     }
 
-    // Collects what every script compiles against (ScriptReferences.Collect). Deferred until the
-    // main lane's first pump so all plugin assemblies are loaded.
+    // Collects what every script compiles against (ScriptReferences.Collect); true once done.
+    // Deferred until the main lane's first pump, when the game's assemblies are loaded. What is
+    // loaded decides what gets aliased, so it's read here; BuildShared reads the files.
     //
     // gameDir is the game's own folder, the one the loader's game-directory AssemblyResolve handler
     // probes: Pulsar and Magnetar point MyFileSystem.ExePath (SE1, DS) and AppContext.BaseDirectory
     // (SE2) at it, from the same value they hand that handler.
-    public static void InitShared(string gameDir)
+    public static bool InitShared(string gameDir)
     {
-        if (_sharedInit) return;
+        if (_sharedInit) return _sharedReady;
         _sharedInit = true;
 
-        var entries = ScriptReferences.Collect(gameDir);
-        var aliases = new List<string>();
-        foreach (var entry in entries)
-        {
-            try
-            {
-                var reference = Reference(entry.Path);
-                if (entry.Alias != null)
-                {
-                    reference = WithAliases.Invoke(reference, [new[] { entry.Alias }]);
-                    aliases.Add(entry.Alias);
-                }
-                SharedReferences.Add(reference);
-                if (entry.LoadFile != null) SharedResolveMap[entry.Name] = entry.LoadFile;
-            }
-            catch (Exception ex) { Common.Logger.Info($"failed reference {entry.Name}: {ex.Message}"); }
-        }
-        // Only aliases whose reference made it in: declaring one with none behind it is CS0430 in
-        // every script. The '@' lets an alias that happens to spell a C# keyword still be declared.
-        _externAliases = string.Concat(aliases.Select(a => $"extern alias @{a};\n"));
-
         // A plugin loaded with LoadFile can't be found by name, not even by the binder, so its loaded
-        // instance is handed back when a script's reference asks for it.
+        // instance is handed back when a script's reference asks for it. Registered here, on
+        // ReleaseShared's thread; no script asks before the build is in.
         _sharedHandler = (_, args) =>
         {
             if (args.RequestingAssembly?.GetName().Name?.StartsWith("__REPL__", StringComparison.Ordinal) != true)
@@ -331,25 +314,64 @@ namespace System.Runtime.CompilerServices
         };
         AppDomain.CurrentDomain.AssemblyResolve += _sharedHandler;
 
-        // ignoreaccess (runtime half): one [assembly: IgnoresAccessChecksTo(name)] for
-        // EVERY referenced assembly — loaded or not yet, plain or aliased — matching
-        // the SharedReferences set exactly. (Compile-time
-        // internal import is global anyway, so per-assembly runtime gating would only
-        // cause "compiles but MethodAccessException at run".) The [assembly:] usages bind
-        // to OUR source-declared attribute (wins over the Harmony/other-plugin copies),
-        // so no CS0433 no matter how many third-party plugins also declare it.
-        _iaAttrTree = CallWithDefaults(ParseText, null, IgnoresAccessAttrDef, ParseOptions, InternalPath);
-        // #pragma is lexically scoped to THIS tree only. This tree contains nothing but
-        // [assembly: IgnoresAccessChecksTo] lines, whose only CS0436 is our attribute vs
-        // the Harmony/other-plugin copies (source wins, harmless) — so this suppresses
-        // exactly that one, while the user's own script tree still reports its CS0436s.
-        var iaAssembly = "using System.Runtime.CompilerServices;\n"
-            + "#pragma warning disable CS0436\n"
-            + string.Concat(entries.Select(e => e.Name).Distinct()
-                .Select(n => $"[assembly: IgnoresAccessChecksTo(\"{n}\")]\n"));
-        _iaAssemblyTree = CallWithDefaults(ParseText, null, iaAssembly, ParseOptions, InternalPath);
+        var loaded = AppDomain.CurrentDomain.GetAssemblies();
+        new Thread(() => BuildShared(gameDir, loaded)) { IsBackground = true, Name = "SeMcp references" }.Start();
+        return false;
+    }
 
-        Common.Logger.Info($"{SharedReferences.Count} references collected ({SharedResolveMap.Count} LoadFile)");
+    // Its own thread: nothing may escape, an unhandled exception there ends the process.
+    private static void BuildShared(string gameDir, Assembly[] loaded)
+    {
+        try
+        {
+            var started = Stopwatch.GetTimestamp();
+            var entries = ScriptReferences.Collect(gameDir, loaded);
+            var aliases = new List<string>();
+            foreach (var entry in entries)
+            {
+                try
+                {
+                    var reference = Reference(entry);
+                    if (entry.Alias != null)
+                    {
+                        reference = WithAliases.Invoke(reference, [new[] { entry.Alias }]);
+                        aliases.Add(entry.Alias);
+                    }
+                    SharedReferences.Add(reference);
+                    if (entry.LoadFile != null) SharedResolveMap[entry.Name] = entry.LoadFile;
+                }
+                catch (Exception ex) { Common.Logger.Info($"failed reference {entry.Name}: {ex.Message}"); }
+            }
+            // Only aliases whose reference made it in: declaring one with none behind it is CS0430 in
+            // every script. The '@' lets an alias that happens to spell a C# keyword still be declared.
+            _externAliases = string.Concat(aliases.Select(a => $"extern alias @{a};\n"));
+
+            // ignoreaccess (runtime half): one [assembly: IgnoresAccessChecksTo(name)] for
+            // EVERY referenced assembly — loaded or not yet, plain or aliased — matching
+            // the SharedReferences set exactly. (Compile-time
+            // internal import is global anyway, so per-assembly runtime gating would only
+            // cause "compiles but MethodAccessException at run".) The [assembly:] usages bind
+            // to OUR source-declared attribute (wins over the Harmony/other-plugin copies),
+            // so no CS0433 no matter how many third-party plugins also declare it.
+            _iaAttrTree = CallWithDefaults(ParseText, null, IgnoresAccessAttrDef, ParseOptions, InternalPath);
+            // #pragma is lexically scoped to THIS tree only. This tree contains nothing but
+            // [assembly: IgnoresAccessChecksTo] lines, whose only CS0436 is our attribute vs
+            // the Harmony/other-plugin copies (source wins, harmless) — so this suppresses
+            // exactly that one, while the user's own script tree still reports its CS0436s.
+            var iaAssembly = "using System.Runtime.CompilerServices;\n"
+                + "#pragma warning disable CS0436\n"
+                + string.Concat(entries.Select(e => e.Name).Distinct()
+                    .Select(n => $"[assembly: IgnoresAccessChecksTo(\"{n}\")]\n"));
+            _iaAssemblyTree = CallWithDefaults(ParseText, null, iaAssembly, ParseOptions, InternalPath);
+
+            var ms = (Stopwatch.GetTimestamp() - started) * 1000 / Stopwatch.Frequency;
+            Common.Logger.Info($"{SharedReferences.Count} references collected ({SharedResolveMap.Count} LoadFile) in {ms} ms");
+            _sharedReady = true;
+        }
+        catch (Exception ex)
+        {
+            Common.Logger.Error(ex, "collecting script references failed: execute_code stays unavailable");
+        }
     }
 
     public static void ReleaseShared()
@@ -372,19 +394,30 @@ namespace System.Runtime.CompilerServices
     // nothing else. A file is closed as soon as it's read, so none stays locked.
     //
     // An assembly can be several files, the first naming the others, its modules
-    // (System.EnterpriseServices is, of the .NET Framework's). Each is read the same way.
-    private static object Reference(string path)
+    // (System.EnterpriseServices is, of the .NET Framework's). Each is read the same way. One with
+    // types to hide is read from HiddenTypes' patched copy instead, always of one module.
+    private static object Reference(ScriptReferences.Entry entry)
     {
-        var manifest = ReadModule(path);
-        var names = ((IEnumerable)ModuleNames.Invoke(manifest, null)!).Cast<string>().ToList();
-        var modules = Array.CreateInstance(ModuleMetadata, 1 + names.Count);
-        modules.SetValue(manifest, 0);
-        for (var i = 0; i < names.Count; i++)
-            modules.SetValue(ReadModule(Path.Combine(Path.GetDirectoryName(path)!, names[i])), i + 1);
+        Array modules;
+        if (entry.Hidden.Count > 0 && HiddenTypes.Patch(entry.Path, entry.Hidden) is { } patched)
+        {
+            modules = Array.CreateInstance(ModuleMetadata, 1);
+            modules.SetValue(ModuleFromMetadata.Invoke(null, [patched.Pointer, patched.Size]), 0);
+        }
+        else
+        {
+            if (entry.Hidden.Count > 0) Common.Logger.Warning($"can't hide {entry.Hidden.Count} types of {entry.Name}: referenced as is");
+            var manifest = ReadModule(entry.Path);
+            var names = ((IEnumerable)ModuleNames.Invoke(manifest, null)!).Cast<string>().ToList();
+            modules = Array.CreateInstance(ModuleMetadata, 1 + names.Count);
+            modules.SetValue(manifest, 0);
+            for (var i = 0; i < names.Count; i++)
+                modules.SetValue(ReadModule(Path.Combine(Path.GetDirectoryName(entry.Path)!, names[i])), i + 1);
+        }
 
         // GetReference(documentation, aliases, embedInteropTypes, filePath, display): the path is
         // only the reference's label, in a diagnostic that names it.
-        return CallWithDefaults(AssemblyGetReference, AssemblyCreate.Invoke(null, [modules]), null, null, false, path);
+        return CallWithDefaults(AssemblyGetReference, AssemblyCreate.Invoke(null, [modules]), null, null, false, entry.Path);
     }
 
     private static object ReadModule(string path)
@@ -407,7 +440,11 @@ namespace System.Runtime.CompilerServices
     // after a segment (an unclosed brace, say) is reported on that segment's trailing
     // lines — the field to fix. Positions before the first marker (the extern aliases
     // and the default usings) keep the tree path, InternalPath.
-    public CompilationResult Compile(IReadOnlyList<string> usings, string classBody, string code)
+    //
+    // Roslyn checks `cancel` while parsing and throughout Emit (declarations, each type and
+    // member body, serialization). Its OperationCanceledException comes out wrapped in
+    // TargetInvocationException, so callers test the token, not the exception type.
+    public CompilationResult Compile(IReadOnlyList<string> usings, string classBody, string code, CancellationToken cancel)
     {
         var usingsBlock = usings == null ? "" : string.Concat(
             usings.Where(u => !string.IsNullOrWhiteSpace(u))
@@ -421,10 +458,10 @@ namespace System.Runtime.CompilerServices
         var scriptId = Interlocked.Increment(ref _counter);
         var assemblyName = "__REPL__" + scriptId;
 
-        var tree = CallWithDefaults(ParseText, null, fullSource, ParseOptions, InternalPath);
+        var tree = CallCancellable(ParseText, null, cancel, fullSource, ParseOptions, InternalPath);
 
         // Three files: user script + ignoreaccess [assembly:] usages + our attribute
-        // definition. InitShared always runs before any Compile (McpServer gates on
+        // definition. BuildShared always finishes before any Compile (McpServer gates on
         // Initialized), so both ia trees are set.
         var treesArr = Array.CreateInstance(SyntaxTreeBase, 3);
         treesArr.SetValue(tree, 0);
@@ -438,7 +475,7 @@ namespace System.Runtime.CompilerServices
         var compilation = CompilationCreate.Invoke(null, [assemblyName, treesArr, refsArr, CompileOptions]);
 
         using var ms = new MemoryStream();
-        var emitResult = CallWithDefaults(Emit, compilation, ms);
+        var emitResult = CallCancellable(Emit, compilation, cancel, ms);
 
         // Diagnostic.ToString() prints the #line-mapped position — see the comment on Compile.
         if (!(bool)EmitSuccess.GetValue(emitResult)!)
@@ -447,6 +484,8 @@ namespace System.Runtime.CompilerServices
         ms.Seek(0, SeekOrigin.Begin);
         var raw = ms.ToArray();
         raw = InjectGuards(raw, scriptId);
+        // A loaded assembly stays loaded for the life of the process.
+        cancel.ThrowIfCancellationRequested();
         return new CompilationResult(Assembly.Load(raw), scriptId);
     }
 
@@ -567,6 +606,15 @@ namespace System.Runtime.CompilerServices
 
     private static object CallWithDefaults(MethodInfo method, object target, params object[] leading) =>
         method.Invoke(target, FillDefaults(method.GetParameters(), leading));
+
+    // Puts `cancel` in the CancellationToken parameter wherever it is (Emit's is 11th of 11).
+    private static object CallCancellable(MethodInfo method, object target, CancellationToken cancel, params object[] leading)
+    {
+        var parms = method.GetParameters();
+        var args = FillDefaults(parms, leading);
+        args[Array.FindIndex(parms, p => p.ParameterType == typeof(CancellationToken))] = cancel;
+        return method.Invoke(target, args);
+    }
 
     private static object NewWithDefaults(ConstructorInfo ctor, params object[] leading) =>
         ctor.Invoke(FillDefaults(ctor.GetParameters(), leading));

@@ -33,7 +33,7 @@ public sealed class ExecuteCodeTool : ITool
         // NOT" lines: a using directive or a type declaration put in `code` fails to compile there, and
         // a usings item written with its own `using` or `;` doubles them; either way the error names the
         // field to fix. The usings examples show the bare form; the last one is an extern alias, which
-        // the template declares for every clashing assembly (ScriptReferences, Compiler.InitShared).
+        // the template declares for every clashing assembly (ScriptReferences, Compiler.BuildShared).
         SchemaJson = ToolSchema.Build(Name,
             $"Run C# inside the running {game} game; returns what the script writes to Console. "
             + "Internal and protected types and members are accessible directly; private ones need reflection. "
@@ -157,7 +157,7 @@ public sealed class ExecuteCodeTool : ITool
     }
 
     // Points at the next call, not at the cause: another lane if one is up, a retry if none is. Main
-    // and parallel open on the first update once the game has loaded; render on its own thread's
+    // and parallel open once the game has loaded and BuildShared is done; render on its own thread's
     // first frame after that — or never, when its pump doesn't run (SE1's StartSync mode, a hook
     // broken by a game update), where "retry" alone would loop for good.
     private string NotReady(string lane)

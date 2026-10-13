@@ -16,8 +16,8 @@ using VRage.Plugins;
 
 // Define assembly version when compiled by Magnetar
 #if !DEV_BUILD
-[assembly: AssemblyVersion("2.2.0.0")]
-[assembly: AssemblyFileVersion("2.2.0.0")]
+[assembly: AssemblyVersion("2.3.0.0")]
+[assembly: AssemblyFileVersion("2.3.0.0")]
 #endif
 
 namespace ServerPlugin;
@@ -160,13 +160,14 @@ public sealed class Plugin : IPlugin, ICommonPlugin
     // Called by Patch_MainLane.
     internal static void Pump()
     {
-        // InitShared / Initialize are self-guarded (return after the first
-        // call). Order matters: shared compiler references must populate
-        // before MainExecutor exposes Initialized=true to the McpServer gate
-        // (the volatile write is also what publishes them across threads).
-        // ParallelExecutor publishes them the same way. MyFileSystem.ExePath is
-        // DedicatedServer64, the game folder InitShared asks for.
-        Compiler.InitShared(MyFileSystem.ExePath);
+        // InitShared is true once the shared compiler references, built on a
+        // thread of its own, are in; until then nothing below has work. Order
+        // matters: they must be in before MainExecutor exposes Initialized=true
+        // to the McpServer gate (the volatile write is also what publishes them
+        // across threads). ParallelExecutor publishes them the same way.
+        // MyFileSystem.ExePath is DedicatedServer64, the game folder InitShared
+        // asks for.
+        if (!Compiler.InitShared(MyFileSystem.ExePath)) return;
         _mainExecutor?.Initialize();
         _parallelExecutor?.Initialize();
         _mainExecutor?.Tick();

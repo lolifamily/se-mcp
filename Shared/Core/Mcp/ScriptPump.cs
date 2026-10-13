@@ -6,17 +6,17 @@ using Shared.Plugin;
 
 namespace Shared.Mcp;
 
-// A parallel script's continuation queue, run by its worker thread. The script builders (ScriptBuilders.cs)
-// send every continuation of the script's async methods here, whichever thread completes what was awaited,
-// so the script keeps coming back to its worker: the one thread its kill (ControlledExecution's abort)
-// reaches and its StackCheck baseline belongs to.
+// A parallel script's continuation queue, run by its worker thread. The script builders
+// (ScriptBuilders.cs) send every continuation of the script's async methods here, whichever thread
+// completes what was awaited, so the script keeps coming back to its worker: the one thread its kill
+// (ControlledExecution's abort) reaches and its StackCheck baseline belongs to.
 //
-// Only the script's own continuations come here. No SynchronizationContext is involved, so the BCL and
-// engine async code a script calls resumes wherever it always would. Once the script is over:
-//   - it finished, normally or by throwing (End): what is still to come — work it started and never
-//     awaited — runs on the thread pool, as it would have with no pump at all;
-//   - it didn't (Kill): what is still to come is dropped, or a script stopped at an `await` would come back
-//     to life on the thread pool, out of the kill's reach for good.
+// Only the script's own continuations come here. No SynchronizationContext is involved, so BCL and
+// engine async code the script calls resumes wherever it always would. Once the script is over:
+//   - if it finished, normally or by throwing (End), what is still to come (work it started and never
+//     awaited) runs on the thread pool, as it would with no pump at all;
+//   - if it didn't (Kill), what is still to come is dropped, or a script stopped at an `await` would
+//     come back to life on the thread pool, out of the kill's reach for good.
 internal sealed class ScriptPump
 {
     // The pump of the script running on this thread: set by its worker, null on every other thread.
@@ -27,18 +27,18 @@ internal sealed class ScriptPump
     private readonly object gate = new();
     private readonly Queue<Action> queue = new();
 
-    // Written under gate; Close reads it once without. Leaves Running once, to Ended or Killed, and never
-    // changes again.
+    // Running, then once Ended or Killed, never changing again. Written under `gate`; volatile for
+    // Close's first read, which is taken without it.
     private volatile int phase;
 
-    // A continuation's way back: what the awaiter calls once the awaited thing completes, on whatever thread
-    // that is. Always queued, never run in place, so the script resumes at the top of RunUntil's loop and
-    // nowhere inside other code.
+    // A continuation's way back: what the awaiter calls once the awaited thing completes, on whatever
+    // thread that is. Always queued, never run in place, so the script resumes at the top of RunUntil's
+    // loop and nowhere inside other code.
     internal Action Resume(Action continuation) => () => Enqueue(continuation);
 
-    // Worker thread: runs what arrives until `run`, the script, completes — and returns then, with work
-    // still queued if there is any: work the script started and didn't await, which must not keep its
-    // answer waiting. End sends it to the thread pool.
+    // Worker thread: runs what arrives until `run`, the script, completes, then returns, even with work
+    // still queued: work the script started and didn't await must not keep its answer waiting. End
+    // sends that work to the thread pool.
     internal void RunUntil(Task run)
     {
         // A completion on another thread still has to wake the wait below.
@@ -86,8 +86,8 @@ internal sealed class ScriptPump
 
     private void Close(int to)
     {
-        // A killed script's worker comes through here on its way out, perhaps with an interrupt pending: it
-        // must not wait on a lock for what is settled already.
+        // A killed script's worker comes through here on its way out, maybe with an interrupt pending,
+        // which waiting for the lock would throw: it must not wait for what is settled already.
         if (phase != Running) return;
 
         Action[] left;
@@ -108,8 +108,9 @@ internal sealed class ScriptPump
         ThreadPool.QueueUserWorkItem(RunDetached, continuation);
     }
 
-    // Nothing may escape: an exception on a thread-pool thread ends the process. What can throw here is an
-    // async void method's exception (ScriptVoidBuilder), arriving after its script ended; it goes to the log.
+    // Nothing may escape: an exception on a thread-pool thread ends the process. What can throw here is
+    // an async void method's exception (ScriptVoidBuilder) arriving after its script ended; it goes to
+    // the log.
     private static void RunDetached(object continuation)
     {
         try

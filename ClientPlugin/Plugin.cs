@@ -21,8 +21,8 @@ using VRage.Plugins;
 
 // Define assembly version when compiled by Pulsar
 #if !DEV_BUILD
-[assembly: AssemblyVersion("2.2.0.0")]
-[assembly: AssemblyFileVersion("2.2.0.0")]
+[assembly: AssemblyVersion("2.3.0.0")]
+[assembly: AssemblyFileVersion("2.3.0.0")]
 #endif
 
 namespace ClientPlugin;
@@ -254,11 +254,11 @@ public sealed class Plugin : IPlugin, ICommonPlugin
         // through Common.Config.Denied — bool atomic, at most one frame stale.
         ClientPlugin.Config.Current.Denied = IsSeAdminDenied();
 
-        // InitShared / Initialize are self-guarded (return after the first call);
-        // cost on subsequent frames is a static-bool read each. Order matters:
-        // shared compiler references must populate before MainExecutor exposes
-        // Initialized=true to the McpServer gate — that volatile write is also
-        // what publishes them across threads (see Compiler._sharedInit notes).
+        // InitShared is true once the shared compiler references, built on a
+        // thread of its own, are in; until then nothing below has work. Order
+        // matters: they must be in before MainExecutor exposes Initialized=true
+        // to the McpServer gate — that volatile write is also what publishes them
+        // across threads (see Compiler._sharedReady notes).
         // RenderExecutor.Initialize deliberately does NOT happen here: it lives
         // in PatchRenderFrame on the render lane's own pump, so the flag means
         // "this lane's pump is alive". In StartSync mode (RenderFrame never
@@ -267,7 +267,7 @@ public sealed class Plugin : IPlugin, ICommonPlugin
         // ParallelExecutor.Initialize publishes the references the same way, and
         // EnforceDenyGate pushes the gate refreshed above onto running scripts.
         // MyFileSystem.ExePath is Bin64, the game folder InitShared asks for.
-        Compiler.InitShared(MyFileSystem.ExePath);
+        if (!Compiler.InitShared(MyFileSystem.ExePath)) return;
         MainExecutor?.Initialize();
         ParallelExecutor?.Initialize();
         MainExecutor?.Tick();

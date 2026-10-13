@@ -28,9 +28,9 @@ namespace ClientPlugin.Patches;
 // broken by a game update fails the same safe way. Until the lane is open,
 // early-exit — no Initialize, no Tick (nothing to drain either: the McpServer
 // gate keeps `active` empty before Initialized flips). The gate on
-// MainExecutor.Initialized is load-bearing: that volatile write — set AFTER
-// Compiler.InitShared returns on the main thread — is what publishes the
-// shared compiler references to this thread (see Compiler._sharedInit notes).
+// MainExecutor.Initialized is load-bearing: that volatile write — set once
+// Compiler.InitShared returns true on the main thread — is what publishes the
+// shared compiler references to this thread (see Compiler._sharedReady notes).
 [HarmonyPatch(typeof(MyRenderThread), "RenderFrame")]
 internal static class PatchRenderFrame
 {

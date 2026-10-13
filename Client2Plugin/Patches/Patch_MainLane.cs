@@ -24,13 +24,14 @@ internal static class PatchMainLane
         // at most one frame stale — because they can't safely touch the scene off-thread.
         Config.Current.Denied = SessionGate.IsClientOnlySession();
 
-        // Order matters: InitShared must populate the shared compiler references before
+        // InitShared is true once the shared compiler references, built on a thread of its own,
+        // are in; until then nothing below has work. Order matters: they must be in before
         // MainExecutor.Initialize flips Initialized=true — that volatile write is also what
-        // publishes those references across threads (see Compiler._sharedInit notes).
+        // publishes those references across threads (see Compiler._sharedReady notes).
         // ParallelExecutor publishes them the same way, and EnforceDenyGate pushes the gate
         // refreshed above onto running scripts. AppContext.BaseDirectory is Game2, the game
         // folder InitShared asks for.
-        Compiler.InitShared(AppContext.BaseDirectory);
+        if (!Compiler.InitShared(AppContext.BaseDirectory)) return;
         Plugin.MainExecutor?.Initialize();
         Plugin.ParallelExecutor?.Initialize();
         Plugin.MainExecutor?.Tick();
