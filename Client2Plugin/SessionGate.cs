@@ -4,15 +4,12 @@ using Keen.VRage.Library.Utils;
 
 namespace Client2Plugin;
 
-// SE2 anti-cheat deny-gate probe (plan decision 7). "Client session present, no local
-// authoritative server" = a pure client on someone else's server (MP). Single-player: both
-// non-null. Main menu / loading: GameAppComponent absent, or both sessions null. So this only
-// trips for the pure-client case. Called on the main thread each frame; the Executor reads the
-// cached Config.Denied result off-thread.
+// SE2's anti-cheat deny gate: closed for a pure client on someone else's server, a client session
+// with no local server. Single player has both; the main menu and loading have neither, or no
+// GameAppComponent yet, which TryGet returns as null. Main thread, once a frame (PatchMainLane).
 //
-// GameAppComponent is internal in SpaceEngineers2.dll (publicized via the csproj); its
-// ClientSession / ServerSession are already public. TryGet<T> yields null before the component
-// is mounted, which reads as "not a client-only session".
+// GameAppComponent is internal to SpaceEngineers2.dll, publicized through the csproj; its two
+// sessions are public already.
 internal static class SessionGate
 {
     public static bool IsClientOnlySession()

@@ -9,6 +9,7 @@ using System.Reflection;
 #if NETCOREAPP
 using System.Runtime.Loader;
 #endif
+using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 using Mono.Cecil;
@@ -22,7 +23,7 @@ public sealed class CompilationResult
     public bool Success { get; }
     private Assembly Assembly { get; }
     public string ErrorOutput { get; }
-    // The id baked into this assembly's timeout checks (see InjectGuards) — what the
+    // The id baked into this assembly's timeout checks (see InjectGuards): what the
     // executor publishes while stepping it, so the watchdog can aim a kill at this script alone.
     // A lane with no watchdog compiles no timeout checks; there it only numbers __REPL__N.
     public int ScriptId { get; }
@@ -54,7 +55,7 @@ public sealed class CompilationResult
         (Func<Task>)Delegate.CreateDelegate(typeof(Func<Task>), Instantiate(output), "__Drive");
 
     // The script's Console holder is filled first, and filling it runs nothing (see
-    // Compiler.ClassPrefix), so everything the script writes lands in `output` — class_body's static
+    // Compiler.ClassPrefix), so everything the script writes lands in `output`, class_body's static
     // and instance initializers included. Constructing the instance does run the script's own code,
     // those initializers, so both entries are taken on the thread the script is to run on.
     private object Instantiate(Capture output)
@@ -65,15 +66,19 @@ public sealed class CompilationResult
     }
 }
 
-public sealed class Compiler(MethodInfo guardBail, MethodInfo guardStackCheck, MethodInfo guardKilling, string defaultUsings, bool asyncEntry)
+// Compiles one lane's scripts: wraps the three fields in a class, compiles it against everything
+// the game can load, injects the guards and loads the result.
+//
+// The guard arguments are the lane's ScriptGuard members, which the injected code reads and calls;
+// guardKillId and guardLaneThread are null together on a lane with no watchdog, which gets StackCheck
+// only. asyncEntry is the parallel lane's: Run becomes an async iterator (AsyncRunPrefix).
+public sealed class Compiler(FieldInfo guardKillId, FieldInfo guardLaneThread, MethodInfo guardStackCheck, string defaultUsings, bool asyncEntry)
 {
     // Numbers both the __REPL__N assembly and its script id, so the two can never disagree about
     // which script it was. Process-wide across both lanes; 1-based, leaving 0 as KillId's "nobody".
     private static int _counter;
 
-    // Roslyn reflection cache — process-constant, populated by the static ctor.
-    // The same tokens for both executors; resolving them once instead of per-Compiler
-    // saves a redundant LoadRoslyn + dozens of reflection lookups at startup.
+    // Roslyn, reached by reflection: resolved once, by the static constructor, for every lane.
     private static readonly MethodInfo ParseText;
     private static readonly MethodInfo CompilationCreate;
     private static readonly object ParseOptions;
@@ -89,15 +94,14 @@ public sealed class Compiler(MethodInfo guardBail, MethodInfo guardStackCheck, M
     private static readonly MethodInfo AssemblyGetReference;
     private static readonly MethodInfo WithAliases;
     private static readonly MethodInfo Emit;
+    private static readonly object EmitOptions;
     private static readonly PropertyInfo EmitSuccess;
     private static readonly PropertyInfo EmitDiags;
     private static readonly PropertyInfo DiagSeverity;
 
-    // References + resolveMap + handler + extern aliases are process-wide: the AppDomain
-    // assembly set is identical for both executors, so duplicating the scan + per-file
-    // MetadataReference creation gives nothing back. BuildShared fills them on a thread of its
-    // own and sets _sharedReady last; the lanes open only on it, so it is the one field that
-    // needs to be volatile. No lock with ReleaseShared: that runs as the game exits.
+    // What every script compiles against, the same for every lane (InitShared). BuildShared fills it
+    // on a thread of its own and sets _sharedReady last; the lanes open only on that, so it is the
+    // one volatile field. ReleaseShared takes no lock: it runs as the game exits.
     private static bool _sharedInit;
     private static volatile bool _sharedReady;
     private static readonly List<object> SharedReferences = [];
@@ -107,19 +111,12 @@ public sealed class Compiler(MethodInfo guardBail, MethodInfo guardStackCheck, M
     // template's, so Compile declares them all ahead of the default usings in every script.
     private static string _externAliases = "";
 
-    // Per-instance tokens — declared as primary constructor parameters above.
-    // ScriptGuard{Main,Render}'s Bail/StackCheck/Killing and the entry's shape are
-    // what differ between Compiler instances. guardBail and guardKilling are null
-    // together for a lane with no watchdog: StackCheck only (see InjectGuards).
-    // asyncEntry is the parallel lane's: Run becomes an async iterator (AsyncRunPrefix).
-
     // Console is the script's output wherever its code runs: code, class_body, nested types, static
-    // members, any thread. It reads __Out.W at each call — a holder CompilationResult.Start fills
-    // before anything else, with no type initializer of its own, so filling it runs none of the
-    // script's code. __REPL__ can't hold it: class_body can give __REPL__ a type initializer, and
-    // filling a static field runs its type's initializer first — the script's static initializers
-    // would print before their Console existed. `= null` is only there to keep CS0649 (never
-    // assigned) out of every failed compile's report; a default value emits no initializer.
+    // members, any thread. It reads __Out.W on every call, which CompilationResult fills before
+    // anything else: __Out has no type initializer, so filling it runs none of the script's code.
+    // __REPL__ can't hold it, as setting a static field runs its type's initializer first, and
+    // class_body's static initializers would print before Console existed. `= null` emits no
+    // initializer; it only keeps CS0649 out of failed compiles.
     private const string ClassPrefix = """
 public class __REPL__
 {
@@ -156,12 +153,9 @@ public class __REPL__
 }
 """;
 
-    // The IgnoresAccessChecksToAttribute definition — its own compilation unit (own
-    // `using System;`, reads naturally). We DECLARE our own instead of `using` an
-    // existing one: MULTIPLE loaded assemblies ship this type (0Harmony AND third-party
-    // plugins like HdrRender), so `using` it is CS0433-ambiguous. A source-declared type
-    // wins over ANY number of imported same-name types (CS0436 warning, filtered out in
-    // Compile) — which is exactly why Roslyn/Orleans/etc. declare their own.
+    // IgnoresAccessChecksToAttribute, declared rather than imported: 0Harmony and other plugins each
+    // ship one, so naming theirs is CS0433. A type declared in source wins over every imported copy,
+    // with a CS0436 warning that the usages' tree turns off (BuildShared).
     private const string IgnoresAccessAttrDef = """
 using System;
 
@@ -175,15 +169,15 @@ namespace System.Runtime.CompilerServices
 }
 """;
 
-    // Two ignoreaccess trees (definition + [assembly:] usage), parsed once by BuildShared
-    // and compiled alongside every user script.
+    // The ignoreaccess trees, the attribute and its usages: parsed once by BuildShared, compiled
+    // into every script.
     private static object _iaAttrTree;
     private static object _iaAssemblyTree;
 
-    // Path of every syntax tree we parse. Positions outside the user's fields (the default
-    // usings, the two ignoreaccess trees) keep it, so a diagnostic there prints as
-    // "(internal)(line,col)" instead of with no origin at all. See Compile for the #line
-    // markers that name the user's own fields.
+    // The path of every tree we parse. Positions outside the user's fields (the default usings, the
+    // ignoreaccess trees) keep it, so a diagnostic there reads "(internal)(line,col)" rather than
+    // having no origin; Compile's #line markers name the fields. Trees are parsed as UTF-8: one with
+    // a path but no encoding can't go into a PDB (CS8055).
     private const string InternalPath = "(internal)";
 
     static Compiler()
@@ -250,22 +244,17 @@ namespace System.Runtime.CompilerServices
                     && c.GetParameters().Skip(1).All(p => p.HasDefaultValue)),
             outputKindType.GetField("DynamicallyLinkedLibrary").GetValue(null));
 
-        // allowUnsafe via the With API rather than a ctor argument: the ctor's
-        // optional-parameter list shifts across Roslyn versions, while
-        // WithAllowUnsafe(bool) is the same single overload on both load paths
-        // (game 2.9 and NuGet 5.3).
+        // WithAllowUnsafe rather than the ctor, whose optional parameters shift between Roslyn
+        // versions: the method is the same on both load paths (game 2.9, NuGet 5.3).
         var withAllowUnsafe = compOptsType.GetMethod("WithAllowUnsafe", [typeof(bool)])
             ?? throw new MissingMethodException(compOptsType.FullName, "WithAllowUnsafe");
         var unsafeOptions = withAllowUnsafe.Invoke(baseOptions, [true]);
 
-        // ignoreaccess (compile-time half): let REPL scripts read the game's internal
-        // types/members. Verified end-to-end on Roslyn 5.3.0. Paired with the runtime
-        // [assembly: IgnoresAccessChecksTo] tree built in BuildShared.
-        //   (1) MetadataImportOptions.Internal — import internal members from metadata
-        //       (default Public hides them). WithMetadataImportOptions is PUBLIC.
-        //   (2) TopLevelBinderFlags = BinderFlags.IgnoreAccessibility (1<<22) — skip
-        //       the CS0122 accessibility check. WithTopLevelBinderFlags is INTERNAL
-        //       (NonPublic lookup) — fragile if Roslyn renames it, pinned to 5.3.0.
+        // ignoreaccess, compile-time half (BuildShared has the runtime half), checked end to end on
+        // Roslyn 5.3.0: import internal members from metadata, which the default leaves out
+        // (MetadataImportOptions.Internal), and skip the accessibility check, CS0122
+        // (BinderFlags.IgnoreAccessibility). WithTopLevelBinderFlags is internal to Roslyn: a version
+        // that renames it fails here.
         var mioType = commonAsm.GetType("Microsoft.CodeAnalysis.MetadataImportOptions", throwOnError: true)!;
         var withMetadataImport = compOptsType.GetMethod("WithMetadataImportOptions",
             BindingFlags.Public | BindingFlags.Instance, null, [mioType], null)
@@ -283,6 +272,14 @@ namespace System.Runtime.CompilerServices
                 && m.GetParameters()[0].ParameterType == typeof(Stream)
                 && m.GetCustomAttribute<EditorBrowsableAttribute>()?.State != EditorBrowsableState.Never
                 && m.GetParameters().Skip(1).All(p => p.HasDefaultValue));
+
+        // Portable PDB: the Windows default needs Mono.Cecil.Pdb, which Pulsar doesn't ship.
+        // EmitOptions.Default is internal, hence the all-defaults ctor (format is its 2nd arg).
+        var emitOptionsType = commonAsm.GetType("Microsoft.CodeAnalysis.Emit.EmitOptions", throwOnError: true)!;
+        var debugFormatType = commonAsm.GetType("Microsoft.CodeAnalysis.Emit.DebugInformationFormat", throwOnError: true)!;
+        EmitOptions = NewWithDefaults(
+            emitOptionsType.GetConstructors().Single(c => c.GetParameters().All(p => p.HasDefaultValue)),
+            false, Enum.Parse(debugFormatType, "PortablePdb"));
 
         EmitSuccess = emitResultType.GetProperty("Success");
         EmitDiags = emitResultType.GetProperty("Diagnostics");
@@ -346,23 +343,18 @@ namespace System.Runtime.CompilerServices
             // every script. The '@' lets an alias that happens to spell a C# keyword still be declared.
             _externAliases = string.Concat(aliases.Select(a => $"extern alias @{a};\n"));
 
-            // ignoreaccess (runtime half): one [assembly: IgnoresAccessChecksTo(name)] for
-            // EVERY referenced assembly — loaded or not yet, plain or aliased — matching
-            // the SharedReferences set exactly. (Compile-time
-            // internal import is global anyway, so per-assembly runtime gating would only
-            // cause "compiles but MethodAccessException at run".) The [assembly:] usages bind
-            // to OUR source-declared attribute (wins over the Harmony/other-plugin copies),
-            // so no CS0433 no matter how many third-party plugins also declare it.
-            _iaAttrTree = CallWithDefaults(ParseText, null, IgnoresAccessAttrDef, ParseOptions, InternalPath);
-            // #pragma is lexically scoped to THIS tree only. This tree contains nothing but
-            // [assembly: IgnoresAccessChecksTo] lines, whose only CS0436 is our attribute vs
-            // the Harmony/other-plugin copies (source wins, harmless) — so this suppresses
-            // exactly that one, while the user's own script tree still reports its CS0436s.
+            // ignoreaccess, runtime half: an IgnoresAccessChecksTo for every assembly a script
+            // compiles against, loaded or not, aliased or not. Compiling sees every internal anyway,
+            // so a script using one from an assembly left out would compile and then throw
+            // MethodAccessException.
+            _iaAttrTree = CallWithDefaults(ParseText, null, IgnoresAccessAttrDef, ParseOptions, InternalPath, Encoding.UTF8);
+            // The usages' only CS0436 is our attribute against the Harmony and plugin copies, which
+            // ours beats. The #pragma reaches this tree alone, so a script still sees its own.
             var iaAssembly = "using System.Runtime.CompilerServices;\n"
                 + "#pragma warning disable CS0436\n"
                 + string.Concat(entries.Select(e => e.Name).Distinct()
                     .Select(n => $"[assembly: IgnoresAccessChecksTo(\"{n}\")]\n"));
-            _iaAssemblyTree = CallWithDefaults(ParseText, null, iaAssembly, ParseOptions, InternalPath);
+            _iaAssemblyTree = CallWithDefaults(ParseText, null, iaAssembly, ParseOptions, InternalPath, Encoding.UTF8);
 
             var ms = (Stopwatch.GetTimestamp() - started) * 1000 / Stopwatch.Frequency;
             Common.Logger.Info($"{SharedReferences.Count} references collected ({SharedResolveMap.Count} LoadFile) in {ms} ms");
@@ -374,6 +366,7 @@ namespace System.Runtime.CompilerServices
         }
     }
 
+    // Plugin.Dispose, as the game exits: unhooks the resolver and drops the references.
     public static void ReleaseShared()
     {
         if (!_sharedInit) return;
@@ -426,24 +419,18 @@ namespace System.Runtime.CompilerServices
         return ModuleFromStream.Invoke(null, [file, MetadataOnly]);
     }
 
-    // Three-segment input maps 1:1 to C# language layers:
-    //   usings    → compilation-unit-level `using X;` directives
-    //   classBody → members of the wrapper class (methods, fields, nested types,
-    //               [DllImport] P/Invoke — anything that can't go in a method body)
-    //   code      → statements inside the entry method's body
-    // McpServer validated that `code` is present; `classBody` and `usings` may be null.
+    // Each field goes where C# takes it: usings as using directives, class_body as members of the
+    // wrapper class (anything a method body can't hold, [DllImport] included), code as Run's body.
+    // McpServer checked that code is there; class_body and usings may be null.
     //
-    // Diagnostics name their field with no arithmetic on our side: each segment opens
-    // with `#line 1 "<field>"`, so Roslyn maps every position to that field's own line
-    // numbers and Diagnostic.ToString() already reads `code(2,9): error CS0103: ...`.
-    // A mapping runs until the next #line, so an error landing on the wrapper lines
-    // after a segment (an unclosed brace, say) is reported on that segment's trailing
-    // lines — the field to fix. Positions before the first marker (the extern aliases
-    // and the default usings) keep the tree path, InternalPath.
+    // Each field opens with `#line 1 "<field>"`, so Roslyn itself gives positions in the field's own
+    // lines, with no arithmetic on our side: in diagnostics (`code(2,9): error CS0103: ...`) and,
+    // through the PDB, in stack traces (`in code:line 2`). An error on the wrapper after a field (an
+    // unclosed brace, say) is put on that field's trailing lines, the field to fix. Positions ahead of
+    // the first field, in the extern aliases and the default usings, keep InternalPath.
     //
-    // Roslyn checks `cancel` while parsing and throughout Emit (declarations, each type and
-    // member body, serialization). Its OperationCanceledException comes out wrapped in
-    // TargetInvocationException, so callers test the token, not the exception type.
+    // Roslyn checks `cancel` while parsing and throughout Emit. Its OperationCanceledException
+    // arrives wrapped in TargetInvocationException, so callers test the token, not the exception.
     public CompilationResult Compile(IReadOnlyList<string> usings, string classBody, string code, CancellationToken cancel)
     {
         var usingsBlock = usings == null ? "" : string.Concat(
@@ -458,11 +445,9 @@ namespace System.Runtime.CompilerServices
         var scriptId = Interlocked.Increment(ref _counter);
         var assemblyName = "__REPL__" + scriptId;
 
-        var tree = CallCancellable(ParseText, null, cancel, fullSource, ParseOptions, InternalPath);
+        var tree = CallCancellable(ParseText, null, cancel, fullSource, ParseOptions, InternalPath, Encoding.UTF8);
 
-        // Three files: user script + ignoreaccess [assembly:] usages + our attribute
-        // definition. BuildShared always finishes before any Compile (McpServer gates on
-        // Initialized), so both ia trees are set.
+        // The script and the ignoreaccess trees, set by now: no lane opens before BuildShared is done.
         var treesArr = Array.CreateInstance(SyntaxTreeBase, 3);
         treesArr.SetValue(tree, 0);
         treesArr.SetValue(_iaAssemblyTree, 1);
@@ -474,19 +459,18 @@ namespace System.Runtime.CompilerServices
 
         var compilation = CompilationCreate.Invoke(null, [assemblyName, treesArr, refsArr, CompileOptions]);
 
-        using var ms = new MemoryStream();
-        var emitResult = CallCancellable(Emit, compilation, cancel, ms);
+        using var pe = new MemoryStream();
+        using var pdb = new MemoryStream();
+        // Emit(peStream, pdbStream, xmlDocumentationStream, win32Resources, manifestResources, options, ...)
+        var emitResult = CallCancellable(Emit, compilation, cancel, pe, pdb, null, null, null, EmitOptions);
 
-        // Diagnostic.ToString() prints the #line-mapped position — see the comment on Compile.
         if (!(bool)EmitSuccess.GetValue(emitResult)!)
             return new CompilationResult(FailureReport((IEnumerable)EmitDiags.GetValue(emitResult)!));
 
-        ms.Seek(0, SeekOrigin.Begin);
-        var raw = ms.ToArray();
-        raw = InjectGuards(raw, scriptId);
-        // A loaded assembly stays loaded for the life of the process.
+        var (raw, symbols) = InjectGuards(pe.ToArray(), pdb.ToArray(), scriptId);
+        // A loaded assembly stays loaded for the life of the process, its PDB with it.
         cancel.ThrowIfCancellationRequested();
-        return new CompilationResult(Assembly.Load(raw), scriptId);
+        return new CompilationResult(Assembly.Load(raw, symbols), scriptId);
     }
 
     // Diagnostics shown in full; the rest are left to one count line.
@@ -510,43 +494,39 @@ namespace System.Runtime.CompilerServices
             : report;
     }
 
-    // One user segment, fenced by newlines on both sides so nothing around it can share a
-    // line with the user's text: a #line directive has to start a line, and a trailing
-    // `// comment` would otherwise swallow the wrapper line after it — Run's header, or the
-    // `yield break` that keeps Run an iterator when the user wrote no yield of their own.
-    private static string Segment(string field, string text) => $"\n#line 1 \"{field}\"\n{text}\n";
+    // One field, on lines of its own: a #line directive has to start a line, and a trailing
+    // `// comment` would swallow the wrapper line after it (Run's header, or the `yield break` that
+    // keeps Run an iterator when the script has no yield). `#line hidden` closes it, so the wrapper's
+    // frames carry no line in a stack trace instead of a wrong one in this field; diagnostics on the
+    // wrapper still name the field.
+    private static string Segment(string field, string text) => $"\n#line 1 \"{field}\"\n{text}\n#line hidden\n";
 
-    // Loads the NuGet Roslyn the plugin manifests declare (5.3.0) rather than the older one
-    // every game ships (SE1/DS Bin64 2.9, SE2 4.14).
+    // The NuGet Roslyn the plugin manifests declare (5.3.0), not the older one each game ships
+    // (SE1/DS 2.9, SE2 4.14).
     //
-    // The pin below is the .NET Framework path: there a strong-named reference binds to
-    // exactly the requested version — no roll-forward — so it must equal the manifests'
-    // version, or the bind fails with FileLoadException and the short-name fallback takes
-    // the game's own Roslyn. Keep the pin and the three manifests in step.
+    // The pin below is for .NET Framework, where a strong-named reference binds to exactly the
+    // version asked for: unless it matches the three manifests, the bind fails (FileLoadException)
+    // and the game's Roslyn is taken instead. Keep the pin and the manifests in step.
     //
-    // The same exact-version rule caps Roslyn at 5.3 on .NET Framework. 5.6+ depends on
-    // System.Collections.Immutable / System.Reflection.Metadata 10.0.1, whose net462 builds
-    // are 10.0.0.1 (NuGet bumps .NET Framework assets on every servicing release) while
-    // Roslyn references 10.0.0.0. A plugin has no config to carry the binding redirect an
-    // app would get, so the bind falls to the loader's game-dir resolver, which answers by
-    // name alone with the game's SCI 1.2.3.0: MissingMethodException on the first compile.
-    // 5.0–5.3 depend on the 9.0.0 packages, whose net462 builds are 9.0.0.0: exact matches.
+    // The same rule caps Roslyn at 5.3 there. 5.6+ references System.Collections.Immutable and
+    // System.Reflection.Metadata 10.0.0.0, but the net462 builds in their 10.0.1 packages are
+    // 10.0.0.1 (NuGet bumps .NET Framework assembly versions on every servicing release), and a
+    // plugin has no config for a binding redirect: the loader's name-only resolver hands back the
+    // game's SCI 1.2.3.0, and the first compile throws MissingMethodException. 5.0–5.3 take the
+    // 9.0.0 packages, whose net462 builds are 9.0.0.0, an exact match.
     private static (Assembly csharp, Assembly common) LoadRoslyn()
     {
 #if NETCOREAPP
-        // .NET Core keeps one version per simple name in a load context, and the default
-        // context already has the game's Roslyn: no version pin gets past it (the request is
-        // refused, and Pulsar's name-only AssemblyResolve hands back the game's copy). So the
-        // NuGet copy gets a context of its own. No separate DLL is needed for that — Roslyn
-        // is reached purely by reflection, so only BCL types ever cross the boundary.
+        // A load context holds one version per name, and the default one already has the game's
+        // Roslyn: no pin gets past it, as Pulsar's name-only resolver hands back the game's copy.
+        // So the NuGet copy gets a context of its own, with no bridge assembly: Roslyn is reached by
+        // reflection alone, so only BCL types cross.
         //
-        // Why the DLLs sit beside this plugin: Pulsar/Magnetar copy the manifest's NuGet
-        // runtime files, culture folders included, into the plugin's Bin folder next to the
-        // compiled plugin DLL and LoadFrom it there — DevFolder builds in
-        // LocalFolderPlugin.InstallDependencies, GitHub installs in
-        // GitHubPlugin.CompileFromSource (PluginCache.BinDirectory). A plugin with nothing
-        // beside it (a DLL dropped into Local, or one loaded from bytes with an empty
-        // Location) falls through to the paths below.
+        // Pulsar and Magnetar copy the manifest's NuGet files, culture folders included, into the
+        // plugin's Bin folder, beside this assembly (DevFolder: LocalFolderPlugin.InstallDependencies;
+        // GitHub: GitHubPlugin.CompileFromSource, into PluginCache.BinDirectory). A plugin with nothing
+        // beside it (dropped into Local, or loaded from bytes, with no Location) falls through to the
+        // paths below.
         var dir = Path.GetDirectoryName(typeof(Compiler).Assembly.Location);
         if (!string.IsNullOrEmpty(dir) && File.Exists(Path.Combine(dir, "Microsoft.CodeAnalysis.CSharp.dll")))
         {
@@ -581,7 +561,7 @@ namespace System.Runtime.CompilerServices
 
 #if NETCOREAPP
     // Serves Microsoft.CodeAnalysis* and their culture-folder satellites from the plugin's
-    // folder. Every other name returns null and is shared from the default context — the
+    // folder. Every other name returns null and is shared from the default context: the
     // BCL, System.Collections.Immutable and the rest come from the process's one framework.
     private sealed class RoslynLoadContext(string dir) : AssemblyLoadContext("SeMcp.Roslyn")
     {
@@ -635,55 +615,48 @@ namespace System.Runtime.CompilerServices
         return args;
     }
 
-    // Guard against accidental infinite loops and runaway recursion that would
-    // hang the lane's thread. The checks go into the script's own methods, so
-    // they also cover REPL code the game or the BCL calls back into (virtual
-    // overrides, delegates handed to LINQ, Harmony patches). Three injection
-    // points share ScriptGuard state (KillId raised by the lane's FrameWatchdog
-    // when a frame's budget runs out; _stackBase captured per step by the first
-    // StackCheck):
-    //   - Method entry → StackCheck + Bail. Every turn of a recursion enters a
-    //     REPL method, directly or through BCL / game code calling back in, so
-    //     sampling SP here catches all of it: the step's first check sets
-    //     _stackBase, later ones throw once SP is past the budget. The check
-    //     runs one frame deeper than a check before the call would, which the
-    //     headroom absorbs (lane threads have 1.5MB stacks, the budget is
-    //     700KB). The Bail is the timeout check for recursion, which has no
-    //     back-edges, and for callbacks a loop outside the script keeps making
-    //     (LINQ over a huge sequence).
-    //   - Backward branches → Bail. Catches tight loops with no calls.
-    //   - Exception handler entry → catch rewritten into a filter that refuses
-    //     while this script is being killed; Bail at finally / fault. See
-    //     GuardHandlers.
-    // Every timeout check asks Killing with scriptId, baked in as a constant, so
-    // it fires only for a kill aimed at THIS script and only on the lane's own
-    // thread — never for another script, never in this script's code running on
-    // other threads, and never once this script has left the lane (code it
-    // leaves behind, e.g. a Harmony patch or event handler, keeps running).
-    // Each Bail site is `ldc.i4 scriptId; call Bail(int)` — stack-neutral as a
-    // pair, and always inserted adjacent, so no region boundary splits it.
+    // Guards against a script hanging its lane's thread with a runaway loop or recursion. They go
+    // into the script's own methods, so they also cover its code the game or the BCL calls back
+    // into (overrides, delegates handed to LINQ, Harmony patches):
+    //   - Method entry: StackCheck, then the kill test. Every turn of a recursion enters a script
+    //     method, so checking the stack there catches all of it: the step's first check takes the
+    //     baseline, later ones throw past the budget (ScriptGuard's 700KB, on 1.5MB lane stacks),
+    //     whose headroom covers checking a frame later than a check before the call would. The kill
+    //     test here is the timeout check for recursion, which has no back-edges, and for callbacks a
+    //     loop outside the script keeps making (LINQ over a huge sequence).
+    //   - Backward branches: the kill test, for tight loops with no calls.
+    //   - Handlers: a catch becomes a filter that refuses while the script is being killed, a
+    //     finally or fault gets the kill test (GuardHandlers).
+    // The kill test (KillTest) is stack-neutral and inserted in one piece, so no region boundary
+    // splits it. The id baked into it makes a kill (FrameWatchdog raising KillId) reach this script
+    // alone, on the lane's thread alone: never another script, and never this one's code on other
+    // threads or after it left the lane (a Harmony patch, an event handler).
     //
-    // Everything that answers to KillId — every Bail site and the catch rewrite —
-    // is the timeout half, and a lane with no watchdog (guardBail null) gets none
-    // of it: nothing will ever raise KillId for its scripts, and its user catch
-    // blocks stay exactly as compiled. StackCheck is never optional: a stack
-    // overflow can't be caught in .NET, so it takes the whole process with it.
+    // A lane with no watchdog (guardKillId null) gets none of the timeout half, and its catches stay
+    // as compiled. It still gets StackCheck: a stack overflow can't be caught in .NET, and takes the
+    // process down with it.
     //
-    // And a script's async methods are built by our builders, not the BCL's
-    // (RetargetBuilders): on every lane, a faulted script Task can't take SE2
-    // down as an unobserved exception, and on the parallel lane an await resumes
-    // on the script's own thread whatever its awaiter does.
-    // Not a security boundary — token holders already have full RCE.
-    private byte[] InjectGuards(byte[] raw, int scriptId)
+    // A script's async methods also get our builders (RetargetBuilders): on every lane, a faulted
+    // script Task can't take SE2 down as an unobserved exception, and on the parallel lane an await
+    // resumes on the script's own thread whatever its awaiter does.
+    //
+    // Not a security boundary: whoever holds the token can run anything anyway.
+    private (byte[] Pe, byte[] Pdb) InjectGuards(byte[] pe, byte[] pdb, int scriptId)
     {
-        using var asm = AssemblyDefinition.ReadAssembly(new MemoryStream(raw));
+        // The PDB goes through Cecil too: the insertions below shift IL offsets, and Cecil keeps
+        // each sequence point on its instruction. Roslyn's PDB would map throws to wrong lines.
+        using var asm = AssemblyDefinition.ReadAssembly(new MemoryStream(pe), new ReaderParameters
+        {
+            ReadSymbols = true,
+            SymbolStream = new MemoryStream(pdb),
+            SymbolReaderProvider = new PortablePdbReaderProvider()
+        });
         var replType = asm.MainModule.Types.FirstOrDefault(t => t.Name == "__REPL__");
         if (replType == null)
             throw new InvalidOperationException("Compiled assembly missing __REPL__ type");
 
-        // Both null on a lane with no watchdog — see above.
-        var bailRef = guardBail == null ? null : asm.MainModule.ImportReference(guardBail);
-        var killingRef = guardBail == null ? null : asm.MainModule.ImportReference(guardKilling);
+        // Null on a lane with no watchdog (see above).
+        var kill = guardKillId == null ? null : new KillTest(asm.MainModule, guardKillId, guardLaneThread, scriptId);
         var stackRef = asm.MainModule.ImportReference(guardStackCheck);
 
         RetargetBuilders(asm.MainModule);
@@ -699,107 +672,85 @@ namespace System.Runtime.CompilerServices
             {
                 if (!method.HasBody) continue;
 
-                // Widen every short-form branch (br.s/leave.s/brfalse.s, ...) to its long
-                // form BEFORE inserting anything. Roslyn packs iterator state machines with
-                // short branches whose 1-byte ±127 offset overflows once our guard calls
-                // bloat the stream — and Cecil does NOT widen an overflowed short branch on
-                // write: it emits a truncated offset that lands mid-instruction →
-                // InvalidProgramException at JIT time. Long forms carry a 4-byte offset that
-                // cannot overflow. (Mono.Cecil.Rocks.SimplifyMacros would do this, but Pulsar
-                // ships Mono.Cecil.dll WITHOUT Mono.Cecil.Rocks.dll, so we hand-roll the only
-                // macro that affects offset encoding — branches. See WidenShortBranches.)
+                // Before any insertion, which could push a short branch's target out of reach
+                // (ShortBranchToLong).
                 WidenShortBranches(method.Body);
 
                 var il = method.Body.GetILProcessor();
 
-                // Snapshot the original IL before we touch it. The back-edge
-                // loop below iterates this snapshot, so it won't fall into the
-                // entry checks or the filter blocks we splice into catches.
+                // The IL as compiled: the back-edge pass walks this, not the checks spliced in.
                 var originalInstructions = method.Body.Instructions.ToList();
 
-                // Method entry, ahead of the first instruction: outside any try
-                // the body opens there, and a branch back to that instruction
-                // lands after the checks, so they run once per call.
+                // Ahead of the first instruction, outside any try the body opens there. A branch
+                // back to that instruction lands after the checks, so they run once per call.
                 var entry = originalInstructions[0];
                 il.InsertBefore(entry, il.Create(OpCodes.Call, stackRef));
-                InsertBail(il, entry, bailRef, scriptId);
+                InsertKillTest(il, entry, kill);
 
-                if (bailRef != null)
-                    GuardHandlers(method.Body, il, bailRef, killingRef, scriptId);
+                if (kill != null)
+                    GuardHandlers(method.Body, il, kill);
 
                 foreach (var ins in originalInstructions)
                 {
-                    // Roslyn emits an unreachable br.s self-loop right after every
-                    // finally/fault handler as the leave-target placeholder
-                    // (dotnet/roslyn#51205). Injecting before it lands physically
-                    // inside the handler (HandlerEnd is exclusive) → InvalidProgram.
+                    // Roslyn puts an unreachable br.s self-loop, a leave target, right after every
+                    // finally or fault (dotnet/roslyn#51205). A kill test before it would land inside
+                    // the handler, which ends there: InvalidProgramException.
                     if (method.Body.ExceptionHandlers.Any(eh =>
                             eh.HandlerType is ExceptionHandlerType.Finally or ExceptionHandlerType.Fault
                             && eh.HandlerEnd == ins))
                         continue;
 
-                    // Backward branch: Bail only. Tight loops don't push frames,
-                    // SP unchanged.
-                    //
-                    // Intentional: reading the stale .Offset here is SAFE in this pass.
-                    // Cecil fills Offset once at read and never updates it — but this pass
-                    // only INSERTS instructions (never removes or reorders), and both ins
-                    // and t come from the pre-rewrite snapshot, so their relative order is
-                    // preserved and the stale offsets stay monotonic. We only need "does t
-                    // come before ins?", which a monotonic snapshot answers correctly even
-                    // after SimplifyMacros widened the encodings. If this pass ever starts
-                    // removing or reordering instructions, this assumption breaks SILENTLY
-                    // (no exception, just a wrong verdict) — switch to comparing
-                    // body.Instructions.IndexOf(t) <= IndexOf(ins) at that point.
+                    // Backward branch: the kill test only, as a tight loop pushes no frames. Offsets
+                    // are the ones read before any insertion, still in order as this pass only
+                    // inserts; a pass that removed or reordered would have to compare indices
+                    // instead, or get wrong answers without a word.
                     if (ins.Operand is Instruction t && t.Offset <= ins.Offset)
-                        InsertBail(il, ins, bailRef, scriptId);
+                        InsertKillTest(il, ins, kill);
                 }
             }
         }
 
-        var output = new MemoryStream();
-        asm.Write(output);
-        return output.ToArray();
+        // Rebuild info (compilation options, every reference): ~17 of the PDB's 20 KB, unused by
+        // stack traces, and held for the life of the process.
+        asm.MainModule.CustomDebugInformations.Clear();
+
+        var peOut = new MemoryStream();
+        var pdbOut = new MemoryStream();
+        asm.Write(peOut, new WriterParameters
+        {
+            WriteSymbols = true,
+            SymbolStream = pdbOut,
+            SymbolWriterProvider = new PortablePdbWriterProvider()
+        });
+        return (peOut.ToArray(), pdbOut.ToArray());
     }
 
-    // Handler entries — the timeout half, so InjectGuards runs this only on a lane
-    // with a watchdog:
-    //  - Catch: rewrite into a filter handler. Filter runs in pass 1
-    //    (stackless virtual unwind); rejecting catches while this
-    //    script is being killed costs constant stack regardless of
-    //    recursion depth.
-    //    Previously tried throw-based Bail and `rethrow` opcode —
-    //    both cap at ~100 frames because nested ProcessClrException
-    //    routing in pass 1/2 is not actually stackless.
-    //  - Finally/Fault: `rethrow` / filter are illegal (no caught
-    //    exception in scope). Fall back to Bail. Not on the deep-
-    //    recursion attack surface.
-    //  - Existing Filter (user wrote `catch when`): skipped. Composing
-    //    filters is doable but messy — left as a documented gap,
-    //    matching SE's behavior.
-    //  - Empty finally (HandlerStart == endfinally): skipped, no body.
+    // The timeout half for handlers, on a lane with a watchdog only:
+    //  - catch: becomes a filter that refuses while this script is being killed. A filter runs in
+    //    the first pass, before anything unwinds, so refusing costs no stack at any recursion depth.
+    //    A throwing check or a `rethrow` both gave out about 100 frames deep: the runtime's nested
+    //    exception dispatch (ProcessClrException, both passes) isn't stackless.
+    //  - finally / fault: the kill test after the first instruction, inside the handler, as no
+    //    exception is in scope to filter or rethrow. Not what deep recursion runs into.
+    //  - a filter already (`catch when`): left alone. Composing two filters is messy, and SE's own
+    //    script guard leaves the same gap.
+    //  - an empty finally: left alone.
     //
-    // Filter IL layout (the filter block must physically precede the
-    // handler block per CIL III.1.6.1):
-    //   .filter {
-    //     isinst CatchType    ; entry stack [exc] → [exc-or-null]
-    //     brfalse reject      ; null → reject (consumes top)
-    //     ldc.i4 scriptId
-    //     call Killing        ; being killed, on this thread? → [bool]
-    //     brtrue reject       ; yes → reject
-    //     ldc.i4.1            ; accept
-    //     br endLabel
+    // The filter, which has to sit right before its handler (CIL III.1.6.1):
+    //     isinst   CatchType       ; the exception, or null
+    //     brfalse  reject          ; another type
+    //     <kill test, alive: accept>
+    //     br       reject          ; being killed, on this thread: pass it on
+    //   accept:
+    //     ldc.i4.1                 ; catch it
+    //     br       end
     //   reject:
     //     ldc.i4.0
-    //   endLabel:
-    //     endfilter           ; single exit; top-of-stack int32 = result
-    //   }
-    //   { stloc/pop; user catch body... }
-    // The call is fine here: it neither throws nor nests a dispatch, and returns
-    // before the filter does, so the stack stays constant. On any other thread
-    // Killing says no, so the same catch there keeps catching during a kill.
-    private static void GuardHandlers(Mono.Cecil.Cil.MethodBody body, ILProcessor il,
-        MethodReference bailRef, MethodReference killingRef, int scriptId)
+    //   end:
+    //     endfilter
+    // The test neither throws nor starts a dispatch, so the stack stays constant; on any other
+    // thread it says no, and the same catch there keeps catching during a kill.
+    private static void GuardHandlers(Mono.Cecil.Cil.MethodBody body, ILProcessor il, KillTest kill)
     {
         foreach (var eh in body.ExceptionHandlers)
         {
@@ -808,43 +759,37 @@ namespace System.Runtime.CompilerServices
 
             if (eh.HandlerType != ExceptionHandlerType.Catch)
             {
-                // Finally / Fault: keep Bail.
-                var ldId = il.Create(OpCodes.Ldc_I4, scriptId);
-                il.InsertAfter(eh.HandlerStart, ldId);
-                il.InsertAfter(ldId, il.Create(OpCodes.Call, bailRef));
+                InsertKillTest(il, eh.HandlerStart.Next, kill);
                 continue;
             }
 
-            // Single-endfilter exit. Three paths converge on it with an
-            // int32 result (0=reject, 1=accept):
-            //   accept  : isinst != null AND !Killing(scriptId)  →  push 1
-            //   reject1 : isinst == null (wrong type)            →  push 0
-            //   reject2 : isinst != null AND Killing(scriptId)   →  push 0
-            var endLabel = il.Create(OpCodes.Endfilter);
-            var rejectLabel = il.Create(OpCodes.Ldc_I4_0);
+            // The filter above, spliced in ahead of Roslyn's handler start.
             var filterStart = il.Create(OpCodes.Isinst, eh.CatchType);
+            var accept = il.Create(OpCodes.Ldc_I4_1);
+            var reject = il.Create(OpCodes.Ldc_I4_0);
+            var end = il.Create(OpCodes.Endfilter);
             var origHandlerStart = eh.HandlerStart;
-            il.InsertBefore(origHandlerStart, filterStart);
-            il.InsertBefore(origHandlerStart, il.Create(OpCodes.Brfalse, rejectLabel));
-            il.InsertBefore(origHandlerStart, il.Create(OpCodes.Ldc_I4, scriptId));
-            il.InsertBefore(origHandlerStart, il.Create(OpCodes.Call, killingRef));
-            il.InsertBefore(origHandlerStart, il.Create(OpCodes.Brtrue, rejectLabel)); // being killed
-            il.InsertBefore(origHandlerStart, il.Create(OpCodes.Ldc_I4_1));
-            il.InsertBefore(origHandlerStart, il.Create(OpCodes.Br, endLabel));
-            il.InsertBefore(origHandlerStart, rejectLabel);                          // ldc.i4.0
-            il.InsertBefore(origHandlerStart, endLabel);                             // endfilter
+            Instruction[] filter =
+            [
+                filterStart,
+                il.Create(OpCodes.Brfalse, reject),
+                .. kill.Branch(il, accept),
+                il.Create(OpCodes.Br, reject),
+                accept,
+                il.Create(OpCodes.Br, end),
+                reject,
+                end
+            ];
+            foreach (var ins in filter)
+                il.InsertBefore(origHandlerStart, ins);
 
-            // Switch handler type and point FilterStart at the filter entry.
-            // HandlerStart is unchanged (still the original Roslyn stloc/pop).
-            // CatchType must be cleared (filter handlers don't carry a type).
+            // HandlerStart stays on Roslyn's stloc/pop; a filter handler carries no CatchType.
             eh.HandlerType = ExceptionHandlerType.Filter;
             eh.FilterStart = filterStart;
             eh.CatchType = null;
 
-            // Other handlers' TryEnd/HandlerEnd may have referenced
-            // origHandlerStart (try-block end == catch-block start, etc.).
-            // Repoint them to filterStart so try/handler regions stay glued
-            // together physically (CIL III.1.6.1 adjacency requirement).
+            // A try or handler that ended where this handler began now ends at its filter, so the
+            // regions stay adjacent (CIL III.1.6.1).
             foreach (var any in body.ExceptionHandlers)
             {
                 if (any.TryEnd     == origHandlerStart) any.TryEnd     = filterStart;
@@ -853,13 +798,42 @@ namespace System.Runtime.CompilerServices
         }
     }
 
-    // One Bail site before `at`: `ldc.i4 scriptId; call Bail(int)`. None on a lane with
-    // no watchdog (bail null), so InjectGuards' insertion sites read the same for every lane.
-    private static void InsertBail(ILProcessor il, Instruction at, MethodReference bail, int scriptId)
+    // A kill test before `at`, throwing when it fires and going on to `at` when it doesn't. None on a
+    // lane with no watchdog (kill null), so InjectGuards' insertion sites read the same for every lane.
+    private static void InsertKillTest(ILProcessor il, Instruction at, KillTest kill)
     {
-        if (bail == null) return;
-        il.InsertBefore(at, il.Create(OpCodes.Ldc_I4, scriptId));
-        il.InsertBefore(at, il.Create(OpCodes.Call, bail));
+        if (kill == null) return;
+        foreach (var ins in kill.Throw(il, at))
+            il.InsertBefore(at, ins);
+    }
+
+    // Is this script being killed, here? KillId first, so outside a kill the test is a load, a compare
+    // and a branch, and the thread is only asked once the id matches. Both loads are volatile, as the
+    // fields are: a plain one could be hoisted out of a loop, which would then never see the kill.
+    private sealed class KillTest(ModuleDefinition module, FieldInfo killId, FieldInfo laneThread, int scriptId)
+    {
+        private readonly FieldReference killIdRef = module.ImportReference(killId);
+        private readonly FieldReference laneThreadRef = module.ImportReference(laneThread);
+        private readonly MethodReference threadId =
+            module.ImportReference(typeof(Environment).GetProperty(nameof(Environment.CurrentManagedThreadId))!.GetMethod);
+        private readonly MethodReference timeout =
+            module.ImportReference(typeof(ScriptTimeoutException).GetConstructor(Type.EmptyTypes));
+
+        // Falls through when this script is being killed on this thread; branches to `alive` otherwise.
+        public Instruction[] Branch(ILProcessor il, Instruction alive) =>
+        [
+            il.Create(OpCodes.Volatile),
+            il.Create(OpCodes.Ldsfld, killIdRef),
+            il.Create(OpCodes.Ldc_I4, scriptId),
+            il.Create(OpCodes.Bne_Un, alive),
+            il.Create(OpCodes.Call, threadId),
+            il.Create(OpCodes.Volatile),
+            il.Create(OpCodes.Ldsfld, laneThreadRef),
+            il.Create(OpCodes.Bne_Un, alive)
+        ];
+
+        public Instruction[] Throw(ILProcessor il, Instruction alive) =>
+            [.. Branch(il, alive), il.Create(OpCodes.Newobj, timeout), il.Create(OpCodes.Throw)];
     }
 
     // Each BCL builder by full name, and the script builder that takes its place. The ValueTask ones become
@@ -903,7 +877,7 @@ namespace System.Runtime.CompilerServices
     // becomes
     //     call    Task AsyncValueTaskMethodBuilder::get_Task()     (the type reference is retargeted next)
     //     newobj  ValueTask::.ctor(Task)
-    // That ValueTask is the script's own type reference, so nothing in the plugin names one — and nothing
+    // That ValueTask is the script's own type reference, so nothing in the plugin names one, and nothing
     // could: on .NET Framework the plugin's ValueTask is another type than the scripts', as Pulsar loads
     // Roslyn's NuGet copy of System.Threading.Tasks.Extensions beside the plugin, next to the game's.
     private static void ValueTasksOnTasks(ModuleDefinition module)
@@ -956,15 +930,13 @@ namespace System.Runtime.CompilerServices
         return open.GenericParameters[0];
     }
 
-    // Short-form branch opcode → long-form. Mono.Cecil.Rocks.SimplifyMacros would do this
-    // (and widen all the other macros too), but Pulsar ships Mono.Cecil.dll WITHOUT
-    // Mono.Cecil.Rocks.dll — so we widen by hand the only macros whose encoding length
-    // depends on offset distance: branches. Long forms use a 4-byte offset that cannot
-    // overflow no matter how much injection bloats the method, which is the entire point.
-    // The other macros (ldarg.0, ldc.i4.0, ...) are fixed-length and irrelevant here, so we
-    // leave them untouched. We also skip the OptimizeMacros() re-pack: long-form IL is fully
-    // valid, the script assembly is single-use, and a few extra bytes per branch is nothing
-    // (the form is erased at JIT time anyway — RyuJIT picks its own native jump width).
+    // Each short branch's long form. A short branch has a 1-byte offset, and Roslyn packs iterator
+    // state machines with them: the guards' insertions push targets out of reach, and Cecil writes
+    // the overflowed offset truncated, an InvalidProgramException at JIT time. The long form's 4
+    // bytes can't overflow. Mono.Cecil.Rocks' SimplifyMacros would do this, but Pulsar ships
+    // Mono.Cecil without Rocks. Branches are the only macros whose size depends on distance, and
+    // long-form IL is just as valid, so nothing is packed back afterwards: the JIT picks its own jump
+    // widths anyway.
     private static readonly Dictionary<Code, OpCode> ShortBranchToLong = new()
     {
         { Code.Br_S, OpCodes.Br },
@@ -985,10 +957,8 @@ namespace System.Runtime.CompilerServices
 
     private static void WidenShortBranches(Mono.Cecil.Cil.MethodBody body)
     {
-        // A branch's Operand is an Instruction reference, untouched by the opcode swap —
-        // Cecil re-encodes the (now 4-byte) offset from that reference at write time.
-        // Swapping OpCode mutates a struct field in place; it doesn't add/remove
-        // instructions, so iterating Instructions while assigning is safe.
+        // A branch's operand is its target instruction, so Cecil works out the 4-byte offset on
+        // write. Swapping an opcode in place adds or removes nothing, so the loop can assign as it goes.
         foreach (var ins in body.Instructions)
             if (ShortBranchToLong.TryGetValue(ins.OpCode.Code, out var lng))
                 ins.OpCode = lng;

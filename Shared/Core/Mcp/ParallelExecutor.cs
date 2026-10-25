@@ -39,7 +39,7 @@ public sealed class ParallelExecutor(string denialMessage, string defaultUsings)
 
     // StackCheck alone: nothing here raises a kill id. ScriptGuardMain's serves every worker, since its
     // baseline is [ThreadStatic] and every script has a thread of its own.
-    private readonly Compiler compiler = new(null, ScriptGuardMain.StackCheckMethod, null, defaultUsings, asyncEntry: true);
+    private readonly Compiler compiler = new(null, null, ScriptGuardMain.StackCheckMethod, defaultUsings, asyncEntry: true);
 
     // Every script not gone yet: compiling, running, or killed while its thread lives on. Only Sweep
     // removes entries, so a worker never touches this after its script ends: a killed one may have an

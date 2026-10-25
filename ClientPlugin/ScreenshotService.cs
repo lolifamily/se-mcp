@@ -11,27 +11,21 @@ using VRageRender;
 
 namespace ClientPlugin;
 
-// Screenshot capture as a single-slot service, deliberately OUTSIDE the Executor:
-// the waiter is an async HTTP task, not the frame loop. Only two things need the
-// main thread — MyRenderProxy.TakeScreenshot (the render message queue is
-// single-producer from the update thread) and reading ScreenSize — so Tick()
-// does just the issuing. Completion arrives via PatchScreenshotTaken on the
-// render thread (stock) or a background task (HdrRender-style savers) and
-// fulfills WorkItem.Done directly; RunContinuationsAsynchronously puts the
-// response work (file read + base64) on the thread pool, off game threads.
+// take_screenshot, as a single-slot service rather than a script: what waits is the HTTP request,
+// not a frame. Only issuing needs the main thread (Tick): MyRenderProxy.TakeScreenshot, whose
+// message queue has the update thread as its one producer, and ScreenSize. Completion comes through
+// PatchScreenshotTaken, on the render thread or a saver's background task (HdrRender and the like),
+// and answers the request from there.
 internal static class ScreenshotService
 {
-    // Single area cap, ~3.75MP. Bounds the encoded size (worst-case 8K JPEG
-    // base64 stays clear of the API's 10MB per-image hard limit); the value
-    // mirrors the current-generation vision input budget (4784 visual tokens
-    // x 28^2 px each). Server-side rules (long-edge etc.) are deliberately
-    // NOT replicated here — the API crops/scales the remainder itself.
+    // ~3.75 MP: the current generation's vision input budget (4784 visual tokens of 28x28 px), and it
+    // keeps a worst-case 8K JPEG's base64 under the API's hard 10 MB per image. The API's other rules
+    // (long edge and so on) aren't repeated here: it scales what remains itself.
     private const double MaxPixels = 3_750_656;
 
-    // Wall clock, not frames: encoding may run on a background task at its own
-    // pace. Covers the one unsignalled failure mode — a same-frame F4 overwrites
-    // MyRender11.m_screenshot (a single slot), so our message is consumed but no
-    // ScreenshotTaken ever fires for our path.
+    // Wall clock, not frames: a background saver encodes at its own pace. Covers the one failure
+    // nothing reports: an F4 in the same frame overwrites MyRender11.m_screenshot, a single slot, so
+    // our message is taken but no ScreenshotTaken ever comes for our path.
     private const int TimeoutMs = 8000;
 
     private const string ShutdownMessage = "[server shutting down]";
@@ -44,20 +38,16 @@ internal static class ScreenshotService
         public Stopwatch Started;
     }
 
-    // Single slot: in-flight gate and claim token in one. Writes go through
-    // Interlocked; reads through Volatile.Read. Whoever wins the CompareExchange
-    // back to null (signal, timeout, cancel, drain) owns completing the item —
-    // the losers see a different/cleared slot and do nothing.
+    // The slot: the request in flight, and the claim on it. Whoever swaps it back to null (signal,
+    // timeout, cancel, drain) answers the request; the others find it gone and do nothing.
     private static Request _pending;
 
-    // Flipped by Drain (Plugin.Dispose, main thread) before the listener stops.
-    // After that point the main-lane pump never runs again: a request that slipped
-    // into the slot would never be issued, never time out, and leave its
-    // HandleToolsCall awaiting forever. Same contract as Executor.disposed.
+    // Set by Drain, after which no main-lane pump comes: a request taken then would never be issued
+    // or time out, and its HTTP request would wait for good.
     private static volatile bool _disposed;
 
-    // HTTP thread. Slot taken => reject immediately; MyRender11.m_screenshot is a
-    // single slot too, so concurrent captures would silently overwrite each other.
+    // HTTP thread. A taken slot refuses at once: MyRender11.m_screenshot is a single slot too, and
+    // two captures would overwrite each other unnoticed.
     public static void Begin(WorkItem item, bool ignoreSprites)
     {
         if (_disposed)
@@ -73,16 +63,13 @@ internal static class ScreenshotService
             return;
         }
 
-        // Double-check after taking the slot. If Drain ran in between the first
-        // check and the CompareExchange, its claim missed this request; self-correct
-        // here so no WorkItem hangs past Dispose (mirrors Executor.Enqueue).
+        // Drain may have run between the first check and taking the slot.
         if (_disposed && TryClaim(req))
             Complete(item, error: ShutdownMessage);
     }
 
-    // Main thread, called from the main-lane pump (Plugin.Pump) every frame. Polices cancellation
-    // first — a request is cancellable in any state — then advances the state
-    // machine: not yet issued → issue; issued → wait for the signal or deadline.
+    // Main thread, every frame (Plugin.Pump). A cancel ends the request in any state; otherwise it is
+    // issued, or, once issued, waits for its signal or deadline.
     public static void Tick()
     {
         var req = Volatile.Read(ref _pending);
@@ -91,9 +78,8 @@ internal static class ScreenshotService
 
         if (req.Item.Cancel.IsCancellationRequested)
         {
-            // Before issue nothing was sent and nothing lands on disk. After issue
-            // the capture message is already in flight and the file still lands —
-            // it just joins the kept history like every other shot.
+            // Before issue nothing was sent and nothing lands on disk. After it the file still lands,
+            // and joins the kept history like every other shot.
             if (TryClaim(req))
                 Complete(req.Item, cancelled: true);
             return;
@@ -105,8 +91,8 @@ internal static class ScreenshotService
             {
                 var dir = Path.Combine(MyFileSystem.UserDataPath, "Screenshots", "SeMcp");
                 Directory.CreateDirectory(dir);
-                // InvariantCulture: the numeric format emits native digits under
-                // fa-IR / ar-SA etc., which would mangle the filename — pin ASCII.
+                // InvariantCulture: under fa-IR, ar-SA and the like the format would write native
+                // digits into the name.
                 var path = Path.Combine(dir, DateTime.Now.ToString("yyyyMMdd-HHmmss-fff", CultureInfo.InvariantCulture) + ".jpg");
 
                 var screen = MySandboxGame.ScreenSize;
@@ -136,10 +122,9 @@ internal static class ScreenshotService
             Complete(req.Item, error: $"screenshot not reported within {TimeoutMs}ms — retry");
     }
 
-    // Patch thread (render or background). Every screenshot in the game funnels
-    // through MyRenderProxy.ScreenshotTaken; claim only our own path — F4 and
-    // blueprint shots carry different filenames and fall through. A late signal
-    // for a timed-out/cancelled request finds the slot cleared and is ignored.
+    // Render thread or a saver's. Every screenshot in the game comes through here; only our path is
+    // claimed, so F4 and blueprint shots fall through, and a late signal for a request that timed out
+    // or was cancelled finds the slot empty.
     public static void NotifyScreenshotTaken(bool success, string filename)
     {
         var req = Volatile.Read(ref _pending);
@@ -162,10 +147,8 @@ internal static class ScreenshotService
         }
     }
 
-    // Plugin.Dispose, before McpServer.Dispose — close the door, then fulfill the
-    // pending promise so the awaiting HandleToolsCall wakes up and writes its
-    // response while the listener is still alive (same ordering contract as the
-    // Executors). A Begin racing past the flag is caught by its double-check.
+    // Plugin.Dispose, before the listener stops: no new requests, and the one in flight answered
+    // while its response can still be written. A Begin that slips past the flag sees it afterwards.
     public static void Drain()
     {
         _disposed = true;

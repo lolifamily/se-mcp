@@ -9,10 +9,10 @@ namespace Shared.Mcp;
 // (renderExec = null on the server). One lane list drives the schema's target enum and default,
 // the target description and dispatch, so they can't drift apart; a target not on it gets -32602.
 //
-// The schema is read by a model in every session, so it says what the next call needs and stops —
+// The schema is read by a model in every session, so it says what the next call needs and stops;
 // the Minecraft MCP's McpJson makes the full argument. What it leaves out on purpose is kept in
 // comments here, where it costs a model nothing. game and imports are the host's own words
-// (Shared.Se1/Se2 ScriptDefaults): its name, and what comes pre-imported — the one thing about
+// (Shared.Se1/Se2 ScriptDefaults): its name, and what comes pre-imported, the one thing about
 // writing a script that differs between hosts.
 public sealed class ExecuteCodeTool : ITool
 {
@@ -29,7 +29,7 @@ public sealed class ExecuteCodeTool : ITool
             ? [("main", mainExec, MainProse), ("parallel", parallelExec, ParallelProse)]
             : [("main", mainExec, MainProse), ("render", renderExec, RenderProse), ("parallel", parallelExec, ParallelProse)];
 
-        // Each field says what goes in it, and that split is what routes a script's parts — so no "do
+        // Each field says what goes in it, and that split is what routes a script's parts, so no "do
         // NOT" lines: a using directive or a type declaration put in `code` fails to compile there, and
         // a usings item written with its own `using` or `;` doubles them; either way the error names the
         // field to fix. The usings examples show the bare form; the last one is an extern alias, which
@@ -52,11 +52,11 @@ public sealed class ExecuteCodeTool : ITool
                 @enum: [.. lanes.Select(l => l.Name)], @default: lanes[0].Name));
     }
 
-    // What each lane IS; which lanes a host has, and which is the default, are the schema's enum and
+    // What each lane is; which lanes a host has, and which is the default, are the schema's enum and
     // default. Left out of the prose on purpose, kept here for maintainers:
     //   - main is pumped by a Postfix on the main thread's frame (MySandboxGame.Update on SE1,
     //     VRageCore.Update on SE2); render by one on the render thread's (MyRenderThread.RenderFrame,
-    //     Render12EngineComponent.RenderFrame) — all at int.MinValue, not Priority.Last: Last is
+    //     Render12EngineComponent.RenderFrame). All at int.MinValue, not Priority.Last: Last is
     //     only 0, and any negative priority would still run after it.
     //   - render exists to inspect what runs on that thread: other plugins' Harmony hooks there, their
     //     __instance, captured locals, accumulated fields. Game and session APIs assert-throw on it
@@ -87,7 +87,7 @@ public sealed class ExecuteCodeTool : ITool
 
         item.Code = codeEl.GetString();
 
-        // class_body: optional string. JSON null treated as absent, same rule as target.
+        // class_body, usings and target alike: JSON null counts as absent.
         if (arguments.TryGetProperty("class_body", out var cbEl) && cbEl.ValueKind != JsonValueKind.Null)
         {
             if (cbEl.ValueKind != JsonValueKind.String)
@@ -99,7 +99,7 @@ public sealed class ExecuteCodeTool : ITool
             item.ClassBody = cbEl.GetString();
         }
 
-        // usings: optional array of strings. Each item is a namespace path (no "using " prefix, no ";").
+        // Bare, as the schema shows: Compiler adds the `using` and the `;`.
         if (arguments.TryGetProperty("usings", out var uEl) && uEl.ValueKind != JsonValueKind.Null)
         {
             if (uEl.ValueKind != JsonValueKind.Array)
@@ -122,9 +122,8 @@ public sealed class ExecuteCodeTool : ITool
             item.Usings = usings;
         }
 
-        // target: a lane name; absent, JSON null or "" means the default. The string never
-        // enters WorkItem / Executor — it's resolved to a lane here and discarded. Any
-        // non-string shape is rejected rather than silently falling back to "main".
+        // Resolved to a lane here; WorkItem never carries it. Absent, null or "" picks the default;
+        // any other non-string is refused rather than read as the default.
         string target = null;
         if (arguments.TryGetProperty("target", out var tEl) && tEl.ValueKind != JsonValueKind.Null)
         {
@@ -158,7 +157,7 @@ public sealed class ExecuteCodeTool : ITool
 
     // Points at the next call, not at the cause: another lane if one is up, a retry if none is. Main
     // and parallel open once the game has loaded and BuildShared is done; render on its own thread's
-    // first frame after that — or never, when its pump doesn't run (SE1's StartSync mode, a hook
+    // first frame after that, or never, when its pump doesn't run (SE1's StartSync mode, a hook
     // broken by a game update), where "retry" alone would loop for good.
     private string NotReady(string lane)
     {

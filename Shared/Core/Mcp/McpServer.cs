@@ -13,6 +13,9 @@ using Shared.Plugin;
 
 namespace Shared.Mcp;
 
+// The MCP endpoint: Streamable HTTP on localhost, one JSON-RPC request per POST, each carrying the
+// token (SecretKey). No batches, no SSE. A tools/call holds its response until the tool answers,
+// writing a space every second meanwhile; a write that fails means the client hung up.
 public sealed class McpServer : IDisposable
 {
     private const int MaxPortRetries = 10;
@@ -22,11 +25,8 @@ public sealed class McpServer : IDisposable
 
     private readonly IPluginConfig config;
     private readonly Dictionary<string, ITool> tools;
-    // Pre-rendered {"tools":[...]} body. Tools are immutable after McpServer
-    // construction; building once at startup beats walking the list every
-    // tools/list call.
+    // The tools/list and initialize results, rendered once: nothing in them changes after startup.
     private readonly string toolsListJson;
-    // Pre-rendered initialize result; everything in it is fixed at startup too.
     private readonly string initResultJson;
     private readonly int basePort;
     private HttpListener listener;
@@ -139,14 +139,16 @@ public sealed class McpServer : IDisposable
                 return;
             }
 
-            // Browsers always send Origin and forbid JS from forging it; native MCP clients don't. Reject browser-origin (CSRF) requests.
+            // Browsers always send Origin and don't let a page forge it; native MCP clients send none.
+            // So a request with one comes from a web page: CSRF.
             if (!string.IsNullOrEmpty(ctx.Request.Headers["Origin"]))
             {
                 await Respond(ctx, 403, "Forbidden: browser origin not allowed");
                 return;
             }
 
-            // Managed server don't always check host
+            // Only Windows' http.sys guarantees Host matches the prefix; the managed implementation,
+            // which every other platform uses, doesn't.
             if (ctx.Request.Headers["Host"] != $"localhost:{config.BoundPort}")
             {
                 await Respond(ctx, 403, "Forbidden: invalid host");
@@ -170,21 +172,17 @@ public sealed class McpServer : IDisposable
                 return;
             }
 
-            // Session id namespaces the pending-request keys: official SDK clients all
-            // count JSON-RPC ids up from 0, so two clients (or one client restarted while
-            // an old script is still running) collide on ids as the norm, not the edge case.
-            // Required on every request except initialize (spec: 400 without it), but the
-            // VALUE is deliberately not validated against a table of issued ids — the
-            // spec's 404-on-unknown-session rule exists to force re-initialization when
-            // per-session server state is lost, and this server keeps none (responses pair
-            // via the HTTP context, the initialize result is fixed at startup, auth is
-            // the per-request Bearer token). Accepting any non-empty value means clients
-            // keep working across a plugin or game restart without a forced re-init.
-            // REVISIT if per-session state is ever added (SSE push, subscriptions,
-            // list_changed notifications) — at that point unknown ids must 404.
+            // Namespaces the pending-request keys: the official SDK clients all count ids up from 0, so
+            // two clients, or a restarted one and a script still running from before, share ids as a
+            // rule. Required on all but initialize (spec: 400), but not checked against the ids issued:
+            // the spec's 404 for an unknown session forces a re-initialize after per-session state is
+            // lost, and this server keeps none (each answer goes back on its own connection, the
+            // initialize result is fixed, the token comes with every request), so clients carry on
+            // across a plugin or game restart. Once there is per-session state (SSE, subscriptions,
+            // list_changed), unknown ids must get that 404.
             var sessionId = ctx.Request.Headers["Mcp-Session-Id"];
 
-            // No body size cap: auth grants execute_code (full RCE), so capping body size here would be security theater.
+            // No body size cap: a request that got here holds the token, which runs any code anyway.
             using var doc = await JsonDocument.ParseAsync(ctx.Request.InputStream);
             var root = doc.RootElement;
 
@@ -225,9 +223,8 @@ public sealed class McpServer : IDisposable
             switch (method)
             {
                 case "initialize":
-                    // Mint a fresh session id on every initialize; spec-compliant clients
-                    // MUST echo it on all subsequent requests. Headers must be set before
-                    // the body write below.
+                    // A fresh session id per initialize, which the spec has the client send back on
+                    // every later request. Set before the body is written, which sends the headers.
                     ctx.Response.AddHeader("Mcp-Session-Id", TokenGenerator.Generate());
                     await RespondJsonRpc(ctx, rawId, initResultJson);
                     break;
@@ -288,17 +285,13 @@ public sealed class McpServer : IDisposable
             return;
         }
 
-        // arguments may be absent (empty-arg tools); pass a default {} so TryDispatch
-        // can use the same lookups on every code path. ValueKind == Undefined when
-        // the property is absent — Json shows it as `default(JsonElement)`.
-        var hasArgs = p.TryGetProperty("arguments", out var args);
-        if (!hasArgs) args = default;
+        // Absent for a call with no arguments: `args` is then default(JsonElement), ValueKind
+        // Undefined, and every tool checks for an object before reading it.
+        _ = p.TryGetProperty("arguments", out var args);
 
-        // MCP requires id uniqueness per session; refuse rather than silently orphan the
-        // prior request. The session prefix scopes that uniqueness correctly: official
-        // SDK clients all count ids up from 0, so cross-client raw-id collisions are
-        // routine and must not be conflated. Claimed before TryDispatch: dispatching is
-        // the side effect, and a refused duplicate must not have it.
+        // Ids are unique per session (MCP), so a duplicate is refused rather than left to orphan the
+        // first. Claimed before TryDispatch: dispatching is the side effect a refused duplicate must
+        // not have.
         var pendingKey = sessionId + ":" + rawId;
         using var cancelSource = new CancellationTokenSource();
         if (!pending.TryAdd(pendingKey, cancelSource))
@@ -331,11 +324,9 @@ public sealed class McpServer : IDisposable
             pending.TryRemove(pendingKey, out _);
         }
 
-        // Screenshot success: item.Output is the saved file's path; read + base64
-        // happen here on the thread pool (Done uses RunContinuationsAsynchronously),
-        // off game threads. A failed read throws into HandleRequest's catch (-32603).
-        // Every text result is the output, then how the run ended — a cancel included,
-        // as its last line (ScriptRender.Combine).
+        // On success a screenshot's Output is the saved file's path, read and encoded here, off the
+        // game's threads (WorkItem.Done); a failed read reaches HandleRequest's catch as -32603. A text
+        // result is the output, then how the run ended, a cancel included (ScriptRender.Combine).
         var isError = item.Error != null || item.WasCancelled;
         var tail = item.WasCancelled ? "(cancelled)" : item.Error;
         var resultJson = tool.ReturnsImage && !isError
@@ -348,9 +339,8 @@ public sealed class McpServer : IDisposable
 
     private void HandleCancel(JsonElement root, string sessionId)
     {
-        // MCP spec: invalid cancellation notifications SHOULD be silently ignored.
-        // Session-scoped lookup: without the prefix, a client cancelling its own id=2
-        // could kill another client's in-flight id=2.
+        // An invalid cancellation is ignored, as MCP asks. Looked up within the session: a client
+        // cancelling its id 2 must not kill another client's.
         try
         {
             if (!root.TryGetProperty("params", out var p)) return;
@@ -358,7 +348,7 @@ public sealed class McpServer : IDisposable
             if (pending.TryGetValue(sessionId + ":" + rid.GetRawText(), out var cancelSource))
                 cancelSource.Cancel();
         }
-        catch (ObjectDisposedException) { /* race with HandleToolsCall.Dispose() */ }
+        catch (ObjectDisposedException) { /* HandleToolsCall disposed it in the meantime */ }
     }
 
     private static string JsonToolResult(string text, bool isError)
@@ -369,9 +359,8 @@ public sealed class McpServer : IDisposable
 
     private static string JsonToolResultImage(byte[] data, string savedPath)
     {
-        // base64 is JSON-safe as-is; only the path needs escaping. The text block
-        // carries the on-disk location so the model can point the user at it (the
-        // directory doubles as a browsable screenshot history).
+        // base64 needs no escaping, only the path does. The text block gives the file's location, so
+        // the model can point the user at it: the folder doubles as a screenshot history.
         var b64 = Convert.ToBase64String(data);
         var note = JsonEncodedText.Encode("saved to " + savedPath);
         return $$"""{"content":[{"type":"image","data":"{{b64}}","mimeType":"image/jpeg"},{"type":"text","text":"{{note}}"}],"isError":false}""";
@@ -414,6 +403,8 @@ public sealed class McpServer : IDisposable
         return IPAddress.IsLoopback(address);
     }
 
+    // Its time doesn't depend on where the two strings differ. Hand-rolled, as net48 has no
+    // CryptographicOperations.FixedTimeEquals.
     [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoOptimization)]
     private static bool ConstantTimeEquals(string a, string b)
     {

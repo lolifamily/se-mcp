@@ -56,7 +56,6 @@
       <Reference Include="Avalonia.Markup"><HintPath>$(Game2)\Avalonia.Markup.dll</HintPath><Private>false</Private></Reference>
       <Reference Include="Avalonia.Markup.Xaml"><HintPath>$(Game2)\Avalonia.Markup.Xaml.dll</HintPath><Private>false</Private></Reference>
       <Reference Include="Avalonia.Themes.Fluent"><HintPath>$(Game2)\Avalonia.Themes.Fluent.dll</HintPath><Private>false</Private></Reference>
-      <Reference Include="Game2.AutoTests"><HintPath>$(Game2)\Game2.AutoTests.dll</HintPath><Private>false</Private></Reference>
       <Reference Include="Game2.Client"><HintPath>$(Game2)\Game2.Client.dll</HintPath><Private>false</Private></Reference>
       <Reference Include="Game2.ContentBuilder"><HintPath>$(Game2)\Game2.ContentBuilder.dll</HintPath><Private>false</Private></Reference>
       <Reference Include="Game2.Game"><HintPath>$(Game2)\Game2.Game.dll</HintPath><Private>false</Private></Reference>
@@ -66,9 +65,7 @@
       <Reference Include="VRage.AI"><HintPath>$(Game2)\VRage.AI.dll</HintPath><Private>false</Private></Reference>
       <Reference Include="VRage.Analytics"><HintPath>$(Game2)\VRage.Analytics.dll</HintPath><Private>false</Private></Reference>
       <Reference Include="VRage.Animation.Client"><HintPath>$(Game2)\VRage.Animation.Client.dll</HintPath><Private>false</Private></Reference>
-      <Reference Include="VRage.Animation"><HintPath>$(Game2)\VRage.Animation.dll</HintPath><Private>false</Private></Reference>
       <Reference Include="VRage.Audio"><HintPath>$(Game2)\VRage.Audio.dll</HintPath><Private>false</Private></Reference>
-      <Reference Include="VRage.AutoTest"><HintPath>$(Game2)\VRage.AutoTest.dll</HintPath><Private>false</Private></Reference>
       <Reference Include="VRage.Client.ContentBuilder"><HintPath>$(Game2)\VRage.Client.ContentBuilder.dll</HintPath><Private>false</Private></Reference>
       <Reference Include="VRage.Client"><HintPath>$(Game2)\VRage.Client.dll</HintPath><Private>false</Private></Reference>
       <Reference Include="VRage.ContentPipeline.Animations"><HintPath>$(Game2)\VRage.ContentPipeline.Animations.dll</HintPath><Private>false</Private></Reference>
@@ -93,14 +90,11 @@
       <Reference Include="VRage.Core.Game.Editor"><HintPath>$(Game2)\VRage.Core.Game.Editor.dll</HintPath><Private>false</Private></Reference>
       <Reference Include="VRage.Core.Game"><HintPath>$(Game2)\VRage.Core.Game.dll</HintPath><Private>false</Private></Reference>
       <Reference Include="VRage.Core"><HintPath>$(Game2)\VRage.Core.dll</HintPath><Private>false</Private></Reference>
-      <Reference Include="VRage.DCS.Samples"><HintPath>$(Game2)\VRage.DCS.Samples.dll</HintPath><Private>false</Private></Reference>
       <Reference Include="VRage.DCS"><HintPath>$(Game2)\VRage.DCS.dll</HintPath><Private>false</Private></Reference>
-      <Reference Include="VRage.EOS"><HintPath>$(Game2)\VRage.EOS.dll</HintPath><Private>false</Private></Reference>
       <Reference Include="VRage.Game.Client"><HintPath>$(Game2)\VRage.Game.Client.dll</HintPath><Private>false</Private></Reference>
       <Reference Include="VRage.Game"><HintPath>$(Game2)\VRage.Game.dll</HintPath><Private>false</Private></Reference>
       <Reference Include="VRage.Input"><HintPath>$(Game2)\VRage.Input.dll</HintPath><Private>false</Private></Reference>
       <Reference Include="VRage.Library"><HintPath>$(Game2)\VRage.Library.dll</HintPath><Private>false</Private></Reference>
-      <Reference Include="VRage.Mod.Io"><HintPath>$(Game2)\VRage.Mod.Io.dll</HintPath><Private>false</Private></Reference>
       <Reference Include="VRage.Multiplayer"><HintPath>$(Game2)\VRage.Multiplayer.dll</HintPath><Private>false</Private></Reference>
       <Reference Include="VRage.Physics.Client"><HintPath>$(Game2)\VRage.Physics.Client.dll</HintPath><Private>false</Private></Reference>
       <Reference Include="VRage.Physics"><HintPath>$(Game2)\VRage.Physics.dll</HintPath><Private>false</Private></Reference>
@@ -110,10 +104,7 @@
       <Reference Include="VRage.Scripting"><HintPath>$(Game2)\VRage.Scripting.dll</HintPath><Private>false</Private></Reference>
       <Reference Include="VRage.ShaderBuilder"><HintPath>$(Game2)\VRage.ShaderBuilder.dll</HintPath><Private>false</Private></Reference>
       <Reference Include="VRage.Steam"><HintPath>$(Game2)\VRage.Steam.dll</HintPath><Private>false</Private></Reference>
-      <Reference Include="VRage.TestLogger"><HintPath>$(Game2)\VRage.TestLogger.dll</HintPath><Private>false</Private></Reference>
-      <Reference Include="VRage.Testing"><HintPath>$(Game2)\VRage.Testing.dll</HintPath><Private>false</Private></Reference>
       <Reference Include="VRage.UI.Shared"><HintPath>$(Game2)\VRage.UI.Shared.dll</HintPath><Private>false</Private></Reference>
-      <Reference Include="VRage.UI.Tests"><HintPath>$(Game2)\VRage.UI.Tests.dll</HintPath><Private>false</Private></Reference>
       <Reference Include="VRage.UI"><HintPath>$(Game2)\VRage.UI.dll</HintPath><Private>false</Private></Reference>
       <Reference Include="VRage.Voxels.Client"><HintPath>$(Game2)\VRage.Voxels.Client.dll</HintPath><Private>false</Private></Reference>
       <Reference Include="VRage.Voxels.Editor"><HintPath>$(Game2)\VRage.Voxels.Editor.dll</HintPath><Private>false</Private></Reference>

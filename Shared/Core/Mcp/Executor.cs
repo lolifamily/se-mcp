@@ -49,12 +49,12 @@ public sealed class WorkItem
 // and they do after every live script's step, on the budget left (UnwindAll).
 //
 // The guard arguments come from the lane's ScriptGuard class (ScriptGuardMain, ScriptGuardRender):
-// the checks Compiler injects into scripts, setKillId for the watchdog, and beginStep, called before
-// every step. denialMessage is the host's text for a closed deny gate, since Shared holds no SE
+// what Compiler's injected checks read and call, setKillId for the watchdog, and beginStep, called
+// before every step. denialMessage is the host's text for a closed deny gate, since Shared holds no SE
 // strings. The gate is IPluginConfig.Denied, refreshed once a frame on the main thread and read here
 // as a plain bool: atomic, and at worst a frame stale.
 public sealed class Executor(
-    MethodInfo guardBail, MethodInfo guardStackCheck, MethodInfo guardKilling,
+    FieldInfo guardKillId, FieldInfo guardLaneThread, MethodInfo guardStackCheck,
     Action<int> setKillId, Action beginStep,
     string denialMessage,
     int frameTimeoutMs,
@@ -69,7 +69,7 @@ public sealed class Executor(
 
     bool IScriptLane.Initialized => Initialized;
 
-    private readonly Compiler compiler = new(guardBail, guardStackCheck, guardKilling, defaultUsings, asyncEntry: false);
+    private readonly Compiler compiler = new(guardKillId, guardLaneThread, guardStackCheck, defaultUsings, asyncEntry: false);
     private readonly FrameWatchdog watchdog = new(setKillId, frameTimeoutMs);
 
     // Compiled scripts waiting for the next Tick to start them.

@@ -7,24 +7,11 @@ using Shared.Mcp;
 
 namespace Shared.Config;
 
-// Default implementation of IPluginConfig — the shared runtime config surface
-// the McpServer reads. Two hosts persist it the same way but the client adds
-// a GUI layer:
-//
-//   - Server: PersistentConfig<PluginConfig> (XML, 500ms auto-save on
-//             PropertyChanged). Headless, no "OK button" moment, so
-//             PropertyChanged == intent-to-commit. Auto-save is exactly right.
-//
-//   - Client: PersistentConfig<Config> too — same 500ms auto-save. Edits
-//             commit on PropertyChanged, NOT at OK-button time, so SE GUI's
-//             "Cancel to discard" semantics do not hold here. Accepted to
-//             share one persistence model with Server. (A final synchronous
-//             Save in PersistentConfig.Dispose covers the last 500ms window.)
-//             The ClientPlugin.Config subclass keeps the SEMCP-legacy storage
-//             path (MyFileSystem.UserDataPath\Storage\SeMcp.cfg) for back-compat
-//             with existing SeMcp users' stored tokens, AND attaches the
-//             [Textbox] / [Button] GUI attributes — that's why Port/SecretKey
-//             below are virtual.
+// The config both clients share, SE1's and SE2's: what McpServer reads, with change notification,
+// so PersistentConfig saves each change as it happens. In the settings dialog an edit is therefore
+// saved at once, and no Cancel takes it back: accepted, so that every host saves the same way, the
+// server included. A client subclasses it to put its settings attributes on Port and SecretKey,
+// hence the virtuals. The server has its own, ServerPlugin.Config.
 public class PluginConfig : IPluginConfig
 {
     public event PropertyChangedEventHandler PropertyChanged;
@@ -42,26 +29,16 @@ public class PluginConfig : IPluginConfig
         PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(propName));
     }
 
-    // virtual: client subclass overrides to attach [Textbox] GUI attribute. The
-    // backing storage + change notification stay here — override forwards via
-    // base.Port = value so there's exactly one source of truth.
-    //
-    // Default is empty: the host-specific default port (9876 on the client,
-    // 9000 on the server — disjoint from the client's 10-port retry range
-    // 9876-9885 so both can run side-by-side during development) is injected
-    // in Plugin.Init when this is found empty, then persisted to .cfg. Empty
-    // here means "no preference yet, ask the host". Same shape as SecretKey:
-    // empty → mint default → save.
+    // Empty until the plugin puts its default here, which is then saved. The defaults keep each
+    // host's ten ports apart, so all can run at once: SE1 9876, SE1's server 9000, SE2 6789. An
+    // override forwards to this one, which keeps the value and raises the change.
     public virtual string Port
     {
         get;
         set => SetValue(ref field, value);
     } = "";
 
-    // Empty SecretKey → mint a fresh token through this setter. The PersistentConfig
-    // auto-save tick (500ms) flushes the generated token to disk; subsequent restarts
-    // keep it (both hosts). virtual for the GUI attribute + RefreshSettings trigger on
-    // the client subclass.
+    // Empty becomes a fresh token, saved like any other change.
     public virtual string SecretKey
     {
         get;
@@ -72,19 +49,13 @@ public class PluginConfig : IPluginConfig
         }
     } = "";
 
-    // Runtime-only — never persisted. BoundPort is what McpServer actually bound
-    // (basePort..basePort+retries-1); ErrorMessage captures bind failure for UI display.
-    // Denied is refreshed each frame by the owner-thread Update on hosts that
-    // gate execution (client SE Admin check); server never writes it, stays false.
+    // Never saved. BoundPort is the port McpServer bound, Port or one of the next nine; ErrorMessage
+    // says why it bound none, for the settings dialog.
     [XmlIgnore] public int BoundPort { get; set; }
     [XmlIgnore] public string ErrorMessage { get; set; }
 
-    // Volatile.Read/Write on the field-backed property: main thread (the
-    // client's main-lane pump) writes, render thread (RenderExecutor.Tick) reads. bool
-    // reads/writes are atomic on .NET but that alone gives no memory-ordering
-    // guarantee under ECMA-335; x86/x64's strong memory model masks the
-    // omission in practice. Explicit fences here so we don't depend on that.
-    // `volatile` can't decorate a property; this is the property-level analog.
+    // Written by the main-lane pump, read from any thread. Volatile by hand, as a property can't be
+    // `volatile`: atomicity alone orders nothing under ECMA-335, and x86 merely hides that.
     [XmlIgnore]
     public bool Denied
     {

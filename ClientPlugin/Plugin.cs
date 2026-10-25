@@ -21,8 +21,8 @@ using VRage.Plugins;
 
 // Define assembly version when compiled by Pulsar
 #if !DEV_BUILD
-[assembly: AssemblyVersion("2.3.0.0")]
-[assembly: AssemblyFileVersion("2.3.0.0")]
+[assembly: AssemblyVersion("2.3.1.0")]
+[assembly: AssemblyFileVersion("2.3.1.0")]
 #endif
 
 namespace ClientPlugin;
@@ -32,12 +32,9 @@ public sealed class Plugin : IPlugin, ICommonPlugin
 {
     private const string Name = "SeMcp";
 
-    // Returned to the caller as the WorkItem error when IsDenied trips. Kept here
-    // (not in Shared) because the wording is SE-business-specific (Admin/Owner
-    // terminology, "in multiplayer" framing) — Shared.Executor stays string-neutral.
-    // The tool description says nothing of the gate: single player never meets it,
-    // a non-admin's first call gets this message instead, and no model can promote
-    // itself — knowing it sooner changes no call.
+    // A request's error while the deny gate is closed (IsSeAdminDenied). Not in the tool description:
+    // single player never meets it, a non-admin's first call says it, and knowing sooner changes no
+    // call, as no model can promote itself.
     private const string DenialMessage =
         "Code execution needs Admin or Owner promote level in multiplayer.";
 
@@ -46,15 +43,11 @@ public sealed class Plugin : IPlugin, ICommonPlugin
     public IPluginLogger Log => Logger;
     private static readonly IPluginLogger Logger = new PluginLogger(Name);
 
-    // ICommonPlugin.Config returns the live runtime config. The PersistentConfig
-    // wrapper owns persistence (500ms auto-save on PropertyChanged); its Data is
-    // ALSO published to ClientPlugin.Config.Current so SE's SettingsGenerator
-    // (which dereferences Config.Current statically) sees the same live instance.
-    // config?.Data because the wrapper is null before Init runs.
+    // The live config, which PersistentConfig saves on every change. Init also makes it
+    // Config.Current, the instance the settings dialog edits. Null before Init.
     public IPluginConfig Config => config?.Data;
     private PersistentConfig<Config> config;
-    // SeMcp 0.x kept its .cfg under UserDataPath\Storage\; preserved here so
-    // existing users' stored tokens load unchanged.
+    // Where SeMcp 0.x kept its .cfg (UserDataPath\Storage\), so existing tokens still load.
     private const string ConfigFileName = $"{Name}.cfg";
     private const string ConfigSubDir = "Storage";
 
@@ -62,17 +55,9 @@ public sealed class Plugin : IPlugin, ICommonPlugin
     internal static bool RefreshSettings;
     private SettingsGenerator settingsGenerator;
 
-    // Three execution lanes:
-    //   Main     — ticked by Pump, from Patch_MainLane's Postfix on SE's main
-    //              thread (game/API state).
-    //   Render   — ticked from Patch_RenderFrame's Postfix on SE's render thread,
-    //              for inspecting plugin Harmony hooks that run there.
-    //   Parallel — each script on a thread of its own; Pump only pushes the
-    //              deny gate onto it.
-    // Main and Render each bind to their own ScriptGuard{Main,Render} static
-    // class — the lambda closes over that class's KillId, its BeginStep marks
-    // each step's thread and stack baseline, and IL injection picks the matching
-    // tokens at compile time.
+    // The lanes (ExecuteCodeTool): main and render are stepped from their patches (PatchMainLane
+    // through Pump, PatchRenderFrame), each with its own ScriptGuard class; parallel runs on threads
+    // of its own, and Pump only pushes the deny gate onto it.
     // ReSharper disable once InconsistentNaming
     internal static Executor MainExecutor;
     internal static Executor RenderExecutor;
@@ -81,12 +66,8 @@ public sealed class Plugin : IPlugin, ICommonPlugin
 
     private McpServer mcpServer;
 
-    // AssemblyResolve is an AppDomain-global multicast event. Registering the same
-    // static handler twice (once per Executor) would re-invoke it on every resolve.
-    // Register here exactly once across both executors, paired with the matching
-    // unregister in Dispose. Compiler keeps its own per-instance resolver for
-    // Pulsar's LoadFile assemblies — that one has different state per Executor and
-    // is correctly registered/unregistered inside Compiler itself.
+    // Hands this plugin's assembly to anyone asking for it by name, scripts that use its types
+    // included. Compiler's resolver answers only scripts, with assemblies loaded by LoadFile.
     private static readonly Assembly PluginAssembly = typeof(Plugin).Assembly;
 
     private static Assembly ResolvePluginAssembly(object sender, ResolveEventArgs args)
@@ -96,12 +77,8 @@ public sealed class Plugin : IPlugin, ICommonPlugin
             : null;
     }
 
-    // The deny gate, injected into Executor. Executor caches the result of this
-    // call (volatile bool) at the top of each Tick on the owner thread (main or
-    // render) and Enqueue reads the cache — so MyAPIGateway.Session, which
-    // assert-throws off the main thread, is never accessed from the ThreadPool.
-    // Same lambda is given to both executors; render thread reads of Session are
-    // a static-field load and benign in practice.
+    // The deny gate: closed in multiplayer below Admin. Main thread only, as MyAPIGateway.Session
+    // assert-throws elsewhere; Pump stores the answer in Config.Denied for every other thread.
     private static bool IsSeAdminDenied()
     {
         var session = MyAPIGateway.Session;
@@ -115,21 +92,13 @@ public sealed class Plugin : IPlugin, ICommonPlugin
     {
         Log.Info("Loading");
 
-        // PersistentConfig.Load auto-writes a default file if missing; its directory
-        // must exist or File.CreateText throws. SEMCP 0.x's Storage/ subdir survives
-        // here for user-file back-compat (see ConfigFileName comment above).
+        // Load writes a default file when there is none, and File.CreateText needs the directory.
         var configDir = Path.Combine(MyFileSystem.UserDataPath, ConfigSubDir);
         Directory.CreateDirectory(configDir);
         config = PersistentConfig<Config>.Load(Log, Path.Combine(configDir, ConfigFileName));
-        // Publish the live instance to the static SE-GUI access point. Both
-        // SettingsGenerator (Config.Current.Title, GetValue/SetValue) and the
-        // McpServer constructor below now read/write the same Config — PropertyChanged
-        // edits route through PersistentConfig's auto-save Timer.
         ClientPlugin.Config.Current = config.Data;
 
-        // First-launch SecretKey seeding. Empty in the .cfg → mint one through
-        // the setter; PropertyChanged then schedules PersistentConfig's 500ms
-        // auto-save. No manual Save needed.
+        // First launch: a token and the default port, saved like any other change.
         if (string.IsNullOrEmpty(config.Data.SecretKey))
             config.Data.SecretKey = TokenGenerator.Generate();
 
@@ -139,9 +108,9 @@ public sealed class Plugin : IPlugin, ICommonPlugin
         Common.SetPlugin(this);
 
         MainExecutor = new Executor(
-            ScriptGuardMain.BailMethod,
+            ScriptGuardMain.KillIdField,
+            ScriptGuardMain.LaneThreadField,
             ScriptGuardMain.StackCheckMethod,
-            ScriptGuardMain.KillingMethod,
             v => ScriptGuardMain.KillId = v,
             ScriptGuardMain.BeginStep,
             DenialMessage,
@@ -149,9 +118,9 @@ public sealed class Plugin : IPlugin, ICommonPlugin
             defaultUsings: ScriptDefaults.Usings);
 
         RenderExecutor = new Executor(
-            ScriptGuardRender.BailMethod,
+            ScriptGuardRender.KillIdField,
+            ScriptGuardRender.LaneThreadField,
             ScriptGuardRender.StackCheckMethod,
-            ScriptGuardRender.KillingMethod,
             v => ScriptGuardRender.KillId = v,
             ScriptGuardRender.BeginStep,
             DenialMessage,
@@ -186,27 +155,10 @@ public sealed class Plugin : IPlugin, ICommonPlugin
 
     public void Dispose()
     {
-        // Executor.Dispose only sets `disposed` and fulfills inflight promises —
-        // it does NOT touch `active`. Coroutine cleanup must run on the thread
-        // that ran the script (finally blocks observe Thread.CurrentThread and
-        // hold thread-affine D3D11 state). So:
-        //   - Main:   we are on the main thread now. Dispose() then Tick() drains
-        //             active on this thread (the script's owning thread). No pump
-        //             runs after plugins unload, so this is the last chance.
-        //   - Render: setting disposed=true is enough. The next RenderFrame
-        //             Postfix hook drains active on the render thread (the
-        //             script's owning thread). harmony is NOT unpatched —
-        //             the hook stays in place so the drain has a chance to run;
-        //             subsequent disposed-path Ticks are cheap no-ops.
-        //   - Parallel: Dispose answers its requests and aborts its scripts; their
-        //             threads are background threads, so nothing waits on them.
-        // McpServer is disposed last because HttpListener.Stop also cuts inflight
-        // response streams. The Dispose() calls above fulfilled all inflight
-        // promises, queueing each HandleToolsCall continuation (the response
-        // write) onto the thread pool — WorkItem.Done uses
-        // RunContinuationsAsynchronously. Stopping the listener last gives those
-        // writes a head start; any that lose the race are logged and dropped by
-        // HandleToolsCall's catch.
+        // A frame lane's scripts still owe their finally blocks, run on the lane's own thread at its
+        // next Tick (Executor.Dispose). The main lane gets that Tick here, as no pump comes after
+        // this; the render lane gets it from its next frame, which is why its patch stays in place.
+        // Parallel scripts are aborted, on background threads nothing waits for.
         RenderExecutor?.Dispose();
         MainExecutor?.Dispose();
         MainExecutor?.Tick();
@@ -215,18 +167,15 @@ public sealed class Plugin : IPlugin, ICommonPlugin
         AppDomain.CurrentDomain.AssemblyResolve -= ResolvePluginAssembly;
         Compiler.ReleaseShared();
 
-        // Same ordering contract as the Executors above: fulfill the pending
-        // screenshot promise first so its HandleToolsCall continuation gets a
-        // chance to write the response before the listener is stopped.
+        // A screenshot in flight is answered too.
         ScreenshotService.Drain();
 
+        // Last: the answers above are being written on the thread pool, and stopping the listener
+        // cuts off what isn't done. Going last gives those writes a head start; one that loses the
+        // race is logged and dropped.
         mcpServer?.Dispose();
 
-        // PersistentConfig owns a PropertyChanged subscription and a save
-        // timer. Dispose unsubscribes, releases the timer, and does one
-        // synchronous final Save() — covers any change made inside the
-        // last 500ms save window. Independent of listener / executor
-        // teardown, so ordering doesn't matter; placed last.
+        // One last save, for a change still waiting out the save delay. Order doesn't matter here.
         config?.Dispose();
 
         MainExecutor = null;
@@ -246,27 +195,15 @@ public sealed class Plugin : IPlugin, ICommonPlugin
         _settingsDialog?.RecreateControls(false);
     }
 
-    // Called by Patch_MainLane.
+    // Called by PatchMainLane.
     internal static void Pump()
     {
-        // Refresh the deny gate on the main thread once per frame. Other threads
-        // (Enqueue from the ThreadPool, RenderExecutor.Tick on render) read it
-        // through Common.Config.Denied — bool atomic, at most one frame stale.
+        // Refreshed once a frame, here: the main thread is the one IsSeAdminDenied may run on.
         ClientPlugin.Config.Current.Denied = IsSeAdminDenied();
 
-        // InitShared is true once the shared compiler references, built on a
-        // thread of its own, are in; until then nothing below has work. Order
-        // matters: they must be in before MainExecutor exposes Initialized=true
-        // to the McpServer gate — that volatile write is also what publishes them
-        // across threads (see Compiler._sharedReady notes).
-        // RenderExecutor.Initialize deliberately does NOT happen here: it lives
-        // in PatchRenderFrame on the render lane's own pump, so the flag means
-        // "this lane's pump is alive". In StartSync mode (RenderFrame never
-        // ticks the render lane) render-targeted requests then keep getting
-        // -32002 instead of compiling into a queue nothing ever drains.
-        // ParallelExecutor.Initialize publishes the references the same way, and
-        // EnforceDenyGate pushes the gate refreshed above onto running scripts.
-        // MyFileSystem.ExePath is Bin64, the game folder InitShared asks for.
+        // The lanes open only once the script references are in (InitShared); render opens on its
+        // own thread (PatchRenderFrame). MyFileSystem.ExePath is Bin64, the game folder InitShared
+        // asks for.
         if (!Compiler.InitShared(MyFileSystem.ExePath)) return;
         MainExecutor?.Initialize();
         ParallelExecutor?.Initialize();

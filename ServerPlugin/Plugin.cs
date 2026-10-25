@@ -16,8 +16,8 @@ using VRage.Plugins;
 
 // Define assembly version when compiled by Magnetar
 #if !DEV_BUILD
-[assembly: AssemblyVersion("2.3.0.0")]
-[assembly: AssemblyFileVersion("2.3.0.0")]
+[assembly: AssemblyVersion("2.3.1.0")]
+[assembly: AssemblyFileVersion("2.3.1.0")]
 #endif
 
 namespace ServerPlugin;
@@ -35,29 +35,21 @@ public sealed class Plugin : IPlugin, ICommonPlugin
 
     [UsedImplicitly]
     public Config PluginConfig => config?.Data;
-    // DS writes its .cfg directly under UserDataPath (no Storage/ subdir; the
-    // server has no Settings GUI and its file layout follows the template default).
+    // Under UserDataPath itself, as the template has it; the client's Storage\ is for SeMcp 0.x.
     private const string ConfigFileName = $"{Name}.cfg";
 
-    // Two execution lanes on DS, main and parallel: there's no render thread, no
-    // Patch_RenderFrame hook. ExecuteCodeTool's `target` enum comes from the lanes
-    // it is given → tools/list exposes ["main","parallel"] on the server, and a
-    // request that asks for "render" gets a clean -32602 rather than a silent
-    // fallback.
+    // Main and parallel: a dedicated server has no render thread.
     private static Executor _mainExecutor;
     private static ParallelExecutor _parallelExecutor;
 
-    // No deny gate on DS (see Init), so no request ever reads this; kept non-null
-    // as a guardrail against a future code path that surfaces it.
+    // Never shown: the server's gate never closes (Config.Denied), as the server decides who joins
+    // and the token runs any code anyway. Non-null in case a path ever shows it.
     private const string DenialMessage = "denied";
 
     private McpServer mcpServer;
 
-    // AssemblyResolve: lets REPL-compiled scripts that reference the SeMcp.dll
-    // type system (e.g. via `using Shared.Mcp;` or class_body that captures a
-    // local of one of our types) resolve back to the loaded plugin assembly.
-    // Compiler keeps its OWN per-instance resolver for Magnetar's LoadFile
-    // assemblies — that one is registered/unregistered inside Compiler itself.
+    // Hands this plugin's assembly to anyone asking for it by name, scripts that use its types
+    // included. Compiler's resolver answers only scripts, with assemblies loaded by LoadFile.
     private static readonly Assembly PluginAssembly = typeof(Plugin).Assembly;
 
     private static Assembly ResolvePluginAssembly(object sender, ResolveEventArgs args)
@@ -76,9 +68,7 @@ public sealed class Plugin : IPlugin, ICommonPlugin
         config = PersistentConfig<Config>.Load(Log, configPath);
         ServerPlugin.Config.Instance = config.Data;
 
-        // Empty SecretKey on first launch → mint one through the setter; the
-        // base setter auto-generates via TokenGenerator and fires PropertyChanged,
-        // which PersistentConfig flushes to disk on its next 500ms tick.
+        // First launch: a token and the default port, saved like any other change.
         if (string.IsNullOrEmpty(config.Data.SecretKey))
             config.Data.SecretKey = TokenGenerator.Generate();
 
@@ -91,14 +81,10 @@ public sealed class Plugin : IPlugin, ICommonPlugin
         if (!PatchHelpers.HarmonyPatchAll(Log, new Harmony(Name)))
             return;
 
-        // No deny gate on DS: denyPolicy returns false unconditionally — the DS
-        // already gates who can join the server; once a caller has the SeMcp
-        // bearer token they have full RCE, so a "must be Admin" check on top
-        // would be security theater.
         _mainExecutor = new Executor(
-            ScriptGuardMain.BailMethod,
+            ScriptGuardMain.KillIdField,
+            ScriptGuardMain.LaneThreadField,
             ScriptGuardMain.StackCheckMethod,
-            ScriptGuardMain.KillingMethod,
             v => ScriptGuardMain.KillId = v,
             ScriptGuardMain.BeginStep,
             DenialMessage,
@@ -107,7 +93,7 @@ public sealed class Plugin : IPlugin, ICommonPlugin
 
         _parallelExecutor = new ParallelExecutor(DenialMessage, ScriptDefaults.Usings);
 
-        // No render lane on DS (renderExec null): the schema offers main and parallel.
+        // No render lane: the schema offers main and parallel, and refuses "render".
         var tools = new ITool[]
         {
             new ExecuteCodeTool(_mainExecutor, _parallelExecutor, null, ScriptDefaults.Game, ScriptDefaults.Imports)
@@ -124,11 +110,8 @@ public sealed class Plugin : IPlugin, ICommonPlugin
 
     public void Dispose()
     {
-        // Main: Dispose() sets `disposed` and fulfills inflight promises;
-        // Tick() then drains `active` on this thread (main). No pump runs after
-        // plugins unload — this is the last chance to run script finally blocks
-        // on the right thread. Parallel: Dispose answers its requests and aborts
-        // its scripts; their threads are background threads.
+        // The main lane's last Tick, for its scripts' finally blocks: no pump comes after this.
+        // Parallel scripts are aborted.
         _mainExecutor?.Dispose();
         _mainExecutor?.Tick();
         _parallelExecutor?.Dispose();
@@ -138,11 +121,7 @@ public sealed class Plugin : IPlugin, ICommonPlugin
 
         mcpServer?.Dispose();
 
-        // PersistentConfig owns a PropertyChanged subscription and a save
-        // timer. Dispose unsubscribes, releases the timer, and does one
-        // synchronous final Save() — covers any change made inside the
-        // last 500ms save window. Independent of listener / executor
-        // teardown, so ordering doesn't matter; placed last.
+        // One last save, for a change still waiting out the save delay. Order doesn't matter here.
         config?.Dispose();
 
         ServerPlugin.Config.Instance = null;
@@ -152,21 +131,16 @@ public sealed class Plugin : IPlugin, ICommonPlugin
         config = null;
     }
 
-    // Unused: Patch_MainLane pumps the main lane.
+    // Unused: PatchMainLane pumps the main lane.
     public void Update()
     {
     }
 
-    // Called by Patch_MainLane.
+    // Called by PatchMainLane.
     internal static void Pump()
     {
-        // InitShared is true once the shared compiler references, built on a
-        // thread of its own, are in; until then nothing below has work. Order
-        // matters: they must be in before MainExecutor exposes Initialized=true
-        // to the McpServer gate (the volatile write is also what publishes them
-        // across threads). ParallelExecutor publishes them the same way.
-        // MyFileSystem.ExePath is DedicatedServer64, the game folder InitShared
-        // asks for.
+        // The lanes open only once the script references are in (InitShared).
+        // MyFileSystem.ExePath is DedicatedServer64, the game folder InitShared asks for.
         if (!Compiler.InitShared(MyFileSystem.ExePath)) return;
         _mainExecutor?.Initialize();
         _parallelExecutor?.Initialize();

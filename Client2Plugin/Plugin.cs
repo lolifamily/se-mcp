@@ -14,40 +14,29 @@ using Shared.Se2;
 
 // Define assembly version when compiled by Pulsar
 #if !DEV_BUILD
-[assembly: AssemblyVersion("2.3.0.0")]
-[assembly: AssemblyFileVersion("2.3.0.0")]
+[assembly: AssemblyVersion("2.3.1.0")]
+[assembly: AssemblyFileVersion("2.3.1.0")]
 #endif
 
 namespace Client2Plugin;
 
-// SE2 client plugin entry point. Unlike SE1 (IPlugin.Init(gameInstance) + IPlugin.Dispose),
-// SE2's IPlugin is an EMPTY interface: the constructor is the load hook, and teardown
-// requires implementing IDisposable (Pulsar Modern's PluginInstance.Dispose reflectively
-// checks `plugin as IDisposable`, PluginInstance.cs:153). The per-frame pumps are Harmony
-// patches on both games — here PatchMainLane on VRageCore.Update and PatchRenderFrame on
-// Render12EngineComponent.RenderFrame.
-//
-// Structurally one-for-one with SE1's ClientPlugin.Plugin: same PersistentConfig wiring,
-// same two Executors bound to Shared/Core's ScriptGuard{Main,Render}, same McpServer +
-// ExecuteCodeTool, same AssemblyResolve, same deny-gate cache. Only the host mechanics
-// differ (constructor vs Init, IDisposable vs Dispose, Plugin2Logger vs PluginLogger,
-// GameAppComponent session vs MyAPIGateway).
+// SE2's IPlugin is an empty interface: the constructor loads the plugin, and Pulsar disposes one
+// that is IDisposable (PluginInstance.Dispose). Otherwise this is SE1's ClientPlugin.Plugin, one for
+// one; only the host's mechanics differ (Plugin2Logger, SessionGate for the deny gate, an Avalonia
+// settings screen).
 public sealed class Plugin : IPlugin, IDisposable, ICommonPlugin
 {
     public const string Name = "SeMcp2";
     internal static Plugin Instance;
 
-    // Returned as the WorkItem error when the deny gate trips: a client with no local authoritative
-    // server, which only multiplayer makes (once SE2 ships it). The gate is Config.Denied, refreshed
-    // each frame by PatchMainLane via SessionGate. SE-business-specific wording, kept here (not in
-    // Shared) — Shared.Executor stays string-neutral. Not in the tool description, for SE1's reasons:
-    // most sessions never meet it, and the first denied call says it.
+    // A request's error while the deny gate is closed: a client with no local server, which only
+    // multiplayer makes, once SE2 ships it (SessionGate). Not in the tool description, for SE1's
+    // reasons.
     private const string DenialMessage =
         "Code execution needs a local server; this is a client-only multiplayer session.";
 
-    // DataDir provided by Pulsar via reflection, injected BEFORE construction
-    // (PluginInstance.cs DependencyInject, before Activator.CreateInstance).
-    // GetConfigPath(Name, null) → Pulsar's Data\{Name}\ directory (created on use).
+    // Set by Pulsar before the constructor runs (PluginInstance.DependencyInject).
+    // GetConfigPath(Name, null) is Pulsar's Data\{Name}\.
 #pragma warning disable CS0649 // assigned by Pulsar via reflection
     // ReSharper disable once InconsistentNaming
     private static Func<string, string, string> GetConfigPath;
@@ -57,31 +46,26 @@ public sealed class Plugin : IPlugin, IDisposable, ICommonPlugin
     private static readonly IPluginLogger Logger = new Plugin2Logger(Name);
     public IPluginLogger Log => Logger;
 
-    // ICommonPlugin.Config returns the live runtime config. PersistentConfig owns persistence
-    // (500ms auto-save on PropertyChanged); its Data is also published to Config.Current so
-    // SettingsGenerator (which dereferences Config.Current statically) sees the same instance.
+    // The live config, which PersistentConfig saves on every change. The constructor also makes it
+    // Config.Current, the instance the settings screen edits.
     public IPluginConfig Config => config?.Data;
     private PersistentConfig<Config> config;
     private const string ConfigFileName = $"{Name}.cfg";
 
-    // Three execution lanes (mirrors SE1). Main is pumped by PatchMainLane (VRageCore.Update
-    // Postfix); Render by PatchRenderFrame (Render12EngineComponent.RenderFrame Postfix). Each
-    // binds its own ScriptGuard{Main,Render} static class (Shared/Core) via pre-resolved handles.
-    // Parallel runs each script on a thread of its own; PatchMainLane only pushes the deny gate
-    // onto it.
+    // As on SE1: main and render are stepped from PatchMainLane and PatchRenderFrame, each with its
+    // own ScriptGuard class; parallel runs on threads of its own, and PatchMainLane only pushes the
+    // deny gate onto it.
     internal static Executor MainExecutor;
     internal static Executor RenderExecutor;
     internal static ParallelExecutor ParallelExecutor;
 
     private McpServer mcpServer;
 
-    // Handle to the currently-open Avalonia settings screen. Held so RefreshSettingsDialog can
-    // close+reopen it when the token changes; nulled when the user closes the dialog.
+    // The open settings screen, for RefreshSettingsDialog to reopen; null when none is open.
     private IDisposable settingsScreenHandle;
 
-    // AssemblyResolve (AppDomain-global) so compiled REPL scripts can resolve this plugin's own
-    // assembly. Registered once here, unregistered in Dispose (matches SE1). Compiler keeps its
-    // own per-instance resolver for Pulsar's LoadFile assemblies.
+    // Hands this plugin's assembly to anyone asking for it by name, scripts that use its types
+    // included. Compiler's resolver answers only scripts, with assemblies loaded by LoadFile.
     private static readonly Assembly PluginAssembly = typeof(Plugin).Assembly;
     private static Assembly ResolvePluginAssembly(object sender, ResolveEventArgs args) =>
         new AssemblyName(args.Name).Name == PluginAssembly.GetName().Name ? PluginAssembly : null;
@@ -91,18 +75,16 @@ public sealed class Plugin : IPlugin, IDisposable, ICommonPlugin
         Instance = this;
         Log.Info("Loading");
 
-        // No top-level try/catch: Pulsar Modern's PluginInstance.Instantiate already wraps
-        // construction and turns any throw into ThrowError (logs + marks Error + Disposes),
-        // PluginInstance.cs:55-69. Same shape as SE1's Init — only Dispose is guarded.
+        // No try/catch: Pulsar catches a throwing constructor, logs it, marks the plugin failed and
+        // disposes it (PluginInstance.Instantiate).
 
-        // GetConfigPath's Data\{Name}\ dir may not exist yet; PersistentConfig.Load writes a
-        // default file if missing and File.CreateText needs the directory.
+        // Data\{Name}\ may not exist yet: Load writes a default file when there is none, and
+        // File.CreateText needs the directory.
         Directory.CreateDirectory(DataDir);
         config = PersistentConfig<Config>.Load(Log, Path.Combine(DataDir, ConfigFileName));
         Client2Plugin.Config.Current = config.Data;
 
-        // First-launch seeding. Empty → set through the setter, whose PropertyChanged schedules
-        // PersistentConfig's 500ms auto-save (no manual Save).
+        // First launch: a token, saved like any other change.
         if (string.IsNullOrEmpty(config.Data.SecretKey))
             config.Data.SecretKey = TokenGenerator.Generate();
 
@@ -113,14 +95,13 @@ public sealed class Plugin : IPlugin, IDisposable, ICommonPlugin
 
         Common.SetPlugin(this);
 
-        // Two lanes, each bound to its own ScriptGuard (Shared/Core). Identical to SE1's wiring.
         MainExecutor = new Executor(
-            ScriptGuardMain.BailMethod, ScriptGuardMain.StackCheckMethod, ScriptGuardMain.KillingMethod,
+            ScriptGuardMain.KillIdField, ScriptGuardMain.LaneThreadField, ScriptGuardMain.StackCheckMethod,
             v => ScriptGuardMain.KillId = v, ScriptGuardMain.BeginStep,
             DenialMessage, frameTimeoutMs: 1000, defaultUsings: ScriptDefaults.Usings);
 
         RenderExecutor = new Executor(
-            ScriptGuardRender.BailMethod, ScriptGuardRender.StackCheckMethod, ScriptGuardRender.KillingMethod,
+            ScriptGuardRender.KillIdField, ScriptGuardRender.LaneThreadField, ScriptGuardRender.StackCheckMethod,
             v => ScriptGuardRender.KillId = v, ScriptGuardRender.BeginStep,
             DenialMessage, frameTimeoutMs: 1000, defaultUsings: ScriptDefaults.Usings);
 
@@ -146,13 +127,9 @@ public sealed class Plugin : IPlugin, IDisposable, ICommonPlugin
 
     public void Dispose()
     {
-        // PluginInstance.Dispose runs on the main thread (verified: GameApp.Dispose →
-        // PluginHost → PluginLoader → PluginInstance, all main thread). So for the main lane,
-        // Dispose (sets disposed + fulfills inflight) then Tick drains `active` on the
-        // script's owning thread — finally blocks / thread-affine state stay correct. Render
-        // lane: Dispose is enough; its next RenderFrame Postfix drains on the render thread
-        // (the hook is left patched so that drain can still run). Parallel: Dispose answers its
-        // requests and aborts its scripts; their threads are background threads.
+        // Pulsar disposes on the main thread (checked: GameApp.Dispose → PluginHost → PluginLoader →
+        // PluginInstance), so the main lane gets its last Tick here, as on SE1; the render lane gets it
+        // from its next frame, its patch left in place for that. Parallel scripts are aborted.
         RenderExecutor?.Dispose();
         MainExecutor?.Dispose();
         MainExecutor?.Tick();
@@ -161,12 +138,11 @@ public sealed class Plugin : IPlugin, IDisposable, ICommonPlugin
         AppDomain.CurrentDomain.AssemblyResolve -= ResolvePluginAssembly;
         Compiler.ReleaseShared();
 
-        // McpServer after the executors: Dispose above fulfilled all inflight promises,
-        // queueing each response write onto the pool; stopping the listener last gives those
-        // writes a head start.
+        // Last: the answers above are being written on the thread pool, and stopping the listener
+        // cuts off what isn't done. Going last gives those writes a head start.
         mcpServer?.Dispose();
 
-        // PersistentConfig: unsubscribe + release timer + one synchronous final Save().
+        // One last save, for a change still waiting out the save delay. Order doesn't matter here.
         config?.Dispose();
 
         MainExecutor = null;
@@ -179,10 +155,8 @@ public sealed class Plugin : IPlugin, IDisposable, ICommonPlugin
     // Invoked by Pulsar via reflection when the user clicks the plugin's config button.
     private void OpenConfigDialog()
     {
-        // No try/catch on the Pulsar path: Modern's PluginInstance.OpenConfig already wraps
-        // the reflected Invoke (Modern/Loader/PluginInstance.cs:138). The OTHER caller —
-        // RefreshSettingsDialog, off an Avalonia UI event — has no such wrapper and guards
-        // the call on its own side.
+        // No try/catch: Pulsar wraps its call already (PluginInstance.OpenConfig), and
+        // RefreshSettingsDialog guards its own.
         var sharedUi = GameAccess.GetSharedUI();
         if (sharedUi == null)
         {
@@ -194,28 +168,22 @@ public sealed class Plugin : IPlugin, IDisposable, ICommonPlugin
         var viewModel = new SettingsScreenViewModel(
             generator.Title,
             generator.PopulateContent,
-            // onClose: forget the handle. No save-on-close — config commits on
-            // PropertyChanged via PersistentConfig's 500ms auto-save (indexed plan D3).
+            // onClose: forget the handle. Nothing to save: every change is saved already.
             () => settingsScreenHandle = null);
 
         settingsScreenHandle = sharedUi.CreateScreen<SettingsScreen>(viewModel, showCursor: true);
     }
 
-    // Re-render the settings dialog after the token changes so the new value shows in the
-    // Textbox. SE2 screens are immutable once built (no SE1-style per-frame RecreateControls),
-    // so we close the current screen and reopen — the rebuilt screen reads the fresh token.
-    // No-op if the dialog isn't open. Invoked on the UI thread (button click / textbox edit);
-    // closing the screen that owns the triggering button mid-callback is the same pattern the
-    // built-in close button uses.
+    // Shows a new token in the open settings screen, if any. An SE2 screen can't change once built
+    // (SE1 recreates its controls every frame), so it is closed and reopened. UI thread; closing the
+    // screen from its own button's callback is what the built-in close button does too.
     internal void RefreshSettingsDialog()
     {
         if (settingsScreenHandle == null)
             return;
 
-        // Invoked off a UI event (Config.SecretKey setter / RegenerateToken button), NOT
-        // through Pulsar — so nothing upstream catches. OpenConfigDialog no longer guards
-        // itself, so guard here: a screen-rebuild failure must not escape into the Avalonia
-        // event dispatcher.
+        // Called from a UI event, which nothing upstream guards: a failure here must not reach
+        // Avalonia's event dispatcher.
         try
         {
             settingsScreenHandle.Dispose();

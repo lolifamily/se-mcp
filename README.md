@@ -159,7 +159,8 @@ public class __REPL__
   script is reached through an extern alias instead, its name with `_` for `.`:
   `Foo_Bar::Namespace.Type`.
 - Compile errors come back per field with corrected line numbers:
-  `code(3,9): error CS0103: ...`.
+  `code(3,9): error CS0103: ...`, and so do the script's own frames in a
+  stack trace: `... in code:line 3`.
 - Scripts are coroutines and **run in parallel**; each step is bounded by the
   watchdog above. The 1 s is **one budget per frame, shared** by every script
   stepped in it: the script running when it runs out is killed (the report says
@@ -304,17 +305,20 @@ For anyone reading or extending the code:
   already means in a script (a type's full name defined a second time, or a type
   with no namespace hiding the one a `using` brings in) goes in under an extern
   alias.
-- **`ScriptGuard`** — a stack-depth `StackCheck` and a `Bail()` at the entry of
-  every script method, `Bail()` on backward branches, and `catch`→filter rewrites
-  (so a `catch` can't swallow the abort). Entry checks also cover script code the
-  BCL or the game calls back into — an overridden `ToString`, a lambda handed to
-  LINQ, a Harmony patch — so recursion that detours through foreign code is
-  stopped, not a stack overflow. Each script bakes its own id into those checks;
-  when a frame's 1 s budget runs out, the lane's `FrameWatchdog` raises the id of
-  the script on the stack (`KillId`), and the checks answer only on the lane's own
-  thread — so only that script is aborted, only there: never another script, never
-  the same script's code on other threads, and never the Harmony patches or
-  handlers an earlier script left behind.
+- **`ScriptGuard`** — a stack-depth `StackCheck` and a kill test at the entry of
+  every script method, the kill test on backward branches, and `catch`→filter
+  rewrites (so a `catch` can't swallow the abort). The kill test is written into
+  the script as IL, a load and a compare, not called: nothing is inlined into a
+  Debug-compiled script, so a call would cost every loop iteration. Entry checks
+  also cover script code the BCL or the game calls back into — an overridden
+  `ToString`, a lambda handed to LINQ, a Harmony patch — so recursion that
+  detours through foreign code is stopped, not a stack overflow. Each script
+  bakes its own id into those checks; when a frame's 1 s budget runs out, the
+  lane's `FrameWatchdog` raises the id of the script on the stack (`KillId`),
+  and the checks answer only on the lane's own thread — so only that script is
+  aborted, only there: never another script, never the same script's code on
+  other threads, and never the Harmony patches or handlers an earlier script
+  left behind.
 
 ## License
 

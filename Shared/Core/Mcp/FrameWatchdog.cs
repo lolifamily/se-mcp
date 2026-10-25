@@ -9,7 +9,7 @@ namespace Shared.Mcp;
 // lane thread, so their combined time is what freezes it. When it runs out, exactly one script is
 // killed: the one on the lane's stack right then, by writing its id into the lane's KillId. Each
 // script's injected checks compare KillId with the id baked into that script (Compiler.InjectGuards)
-// and answer only on the lane thread (ScriptGuard's Killing), so nothing else answers to it.
+// and answer only on the lane thread (ScriptGuard's LaneThread), so nothing else answers to it.
 //
 // An id rather than a lane-wide flag, because a script's code outlives it: a Harmony patch, an event
 // handler or a thread it started keeps running after the script is gone, and a flag would kill that
@@ -76,7 +76,7 @@ internal sealed class FrameWatchdog(Action<int> setKillId, int budgetMs)
     }
 
     // Pair with EnterStep in a finally. Clearing the kill here is what releases the code the script
-    // left behind: left raised, every Bail that code passes would throw from then on.
+    // left behind: left raised, every kill test that code passes would throw from then on.
     public void ExitStep()
     {
         lock (gate)
