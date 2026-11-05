@@ -15,9 +15,9 @@ using VRage.Game;
 using VRage.Plugins;
 
 // Define assembly version when compiled by Magnetar
-#if !DEV_BUILD
-[assembly: AssemblyVersion("2.3.1.0")]
-[assembly: AssemblyFileVersion("2.3.1.0")]
+#if !LOCAL_BUILD
+[assembly: AssemblyVersion("2.3.2.0")]
+[assembly: AssemblyFileVersion("2.3.2.0")]
 #endif
 
 namespace ServerPlugin;

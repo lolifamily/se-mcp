@@ -37,6 +37,7 @@ public sealed class ExecuteCodeTool : ITool
         SchemaJson = ToolSchema.Build(Name,
             $"Run C# inside the running {game} game; returns what the script writes to Console. "
             + "Internal and protected types and members are accessible directly; private ones need reflection. "
+            + "Scripts compile as Debug. "
             + imports,
             new ToolSchema.Param("code",
                 "Statements of the script's entry method. To wait: `await` on \"parallel\", `yield return null` (next frame) elsewhere.",

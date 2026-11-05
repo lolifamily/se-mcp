@@ -1,8 +1,11 @@
-﻿using Sandbox.Graphics.GUI;
-using System;
+﻿using System;
 using System.Collections.Generic;
+using System.Reflection;
 using ClientPlugin.Settings.Tools;
+using Sandbox.Graphics.GUI;
+using Sandbox.Graphics.Gui;
 using VRage.Game;
+using VRage.Utils;
 using VRageMath;
 
 namespace ClientPlugin.Settings.Elements;
@@ -12,48 +15,76 @@ internal class ColorAttribute : Attribute, IElement
     public readonly bool HasAlpha;
     public readonly string Label;
     public readonly string Description;
+    public string EnabledBy { get; }
 
     private Color originalBorderColor;
 
-    public ColorAttribute(bool hasAlpha = false, string label = null, string description = null)
+    // MyGuiScreenDialogColor always starts at Color.White and exposes no way to seed
+    // the initial color, so the hosted MyGuiControlColor has to be reached directly.
+    // Sandbox.Graphics is not publicized, hence the reflection.
+    private static readonly FieldInfo DialogColorControlField =
+        typeof(MyGuiScreenDialogColor).GetField(
+            "m_color",
+            BindingFlags.NonPublic | BindingFlags.Instance
+        );
+
+    public ColorAttribute(
+        bool hasAlpha = false,
+        string label = null,
+        string description = null,
+        string enabledBy = null
+    )
     {
         HasAlpha = hasAlpha;
         Label = label;
         Description = description;
+        EnabledBy = enabledBy;
     }
 
-    public List<Control> GetControls(string name, Func<object> propertyGetter, Action<object> propertySetter)
+    public List<Control> GetControls(
+        string name,
+        Func<object> propertyGetter,
+        Action<object> propertySetter
+    )
     {
         var defaultColor = (Color)propertyGetter();
-        var defaultColorHex = HasAlpha ? defaultColor.ToHexStringRgba() : defaultColor.ToHexStringRgb();
+        var defaultColorHex = HasAlpha
+            ? defaultColor.ToHexStringRgba()
+            : defaultColor.ToHexStringRgb();
 
         var sample = new MyGuiControlButton(visualStyle: MyGuiControlButtonStyleEnum.SquareSmall)
         {
-            CanHaveFocus = false,
             BorderColor = defaultColor,
             BorderEnabled = true,
-            BorderSize = 20
+            BorderSize = 20,
         };
 
-        var textBox = new MyGuiControlTextbox(defaultText: defaultColorHex, maxLength: HasAlpha ? 8 : 6)
+        var textBox = new MyGuiControlTextbox(
+            defaultText: defaultColorHex,
+            maxLength: HasAlpha ? 8 : 6
+        )
         {
-            Size = new Vector2(0.1f, 0.04f)
+            Size = new Vector2(0.1f, 0.04f),
         };
 
         originalBorderColor = textBox.BorderColor;
 
         textBox.TextChanged += box =>
         {
-            if (HasAlpha ? box.Text.TryParseColorFromHexRgba(out var color) : box.Text.TryParseColorFromHexRgb(out color))
+            if (
+                HasAlpha
+                    ? box.Text.TryParseColorFromHexRgba(out var color)
+                    : box.Text.TryParseColorFromHexRgb(out color)
+            )
             {
                 box.BorderColor = originalBorderColor;
                 box.BorderEnabled = false;
 
                 sample.BorderColor = color;
-                    
+
                 if (color != PropertyGetter())
                     PropertySetter(color);
-                    
+
                 var text = HasAlpha ? color.ToHexStringRgba() : color.ToHexStringRgb();
                 if (text != box.Text)
                     box.Text = text;
@@ -65,9 +96,13 @@ internal class ColorAttribute : Attribute, IElement
             }
         };
 
+        var label = Tools.Tools.GetLabelOrDefault(name, Label);
+
+        sample.ButtonClicked += _ => OpenColorPicker(label, sample, textBox);
+
+        sample.SetToolTip(Description);
         textBox.SetToolTip(Description);
 
-        var label = Tools.Tools.GetLabelOrDefault(name, Label);
         return new List<Control>()
         {
             new Control(new MyGuiControlLabel(text: label), minWidth: Control.LabelMinWidth),
@@ -75,12 +110,40 @@ internal class ColorAttribute : Attribute, IElement
             new Control(textBox, fixedWidth: textBox.Size.X),
         };
 
+        void OpenColorPicker(string caption, MyGuiControlButton swatch, MyGuiControlTextbox box)
+        {
+            var current = PropertyGetter();
+
+            var dialog = new MyGuiScreenDialogColor(MyStringId.GetOrCompute(caption));
+            SeedDialogColor(dialog, current);
+
+            dialog.OnConfirmed += (r, g, b) =>
+            {
+                // The dialog only picks RGB, so the alpha channel is carried over unchanged.
+                var color = new Color(r, g, b) { A = current.A };
+
+                PropertySetter(color);
+
+                swatch.BorderColor = color;
+                box.BorderColor = originalBorderColor;
+                box.BorderEnabled = false;
+                box.Text = HasAlpha ? color.ToHexStringRgba() : color.ToHexStringRgb();
+            };
+
+            MyGuiSandbox.AddScreen(dialog);
+        }
+
         void PropertySetter(Color color) => propertySetter(color);
         Color PropertyGetter() => (Color)propertyGetter();
     }
 
-    public List<Type> SupportedTypes { get; } = new List<Type>()
+    private static void SeedDialogColor(MyGuiScreenDialogColor dialog, Color color)
     {
-        typeof(Color)
-    };
+        // Setting the color also raises OnChange, which updates the value the dialog
+        // confirms with, so an unmodified picker returns the color it was opened on.
+        if (DialogColorControlField?.GetValue(dialog) is MyGuiControlColor control)
+            control.SetColor(new Color(color.R, color.G, color.B));
+    }
+
+    public List<Type> SupportedTypes { get; } = new List<Type>() { typeof(Color) };
 }

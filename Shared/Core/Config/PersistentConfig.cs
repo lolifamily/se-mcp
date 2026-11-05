@@ -1,23 +1,27 @@
 using System;
 using System.ComponentModel;
-using System.Xml.Serialization;
 using System.IO;
 using System.Threading;
+using System.Xml.Serialization;
 using Shared.Logging;
 
 namespace Shared.Config;
 
-// Ported from Torch's Persistent<T> class for compatibility of configuration files between targets and to work with IPluginLogger.
-// Simple class that manages saving <see cref="P:Torch.Persistent`1.Data" /> to disk using XML serialization.
+// Based on Torch's Persistent<T> class, works with IPluginLogger.
+// Simple class that manages saving <see cref="Data" /> to disk using XML serialization.
 // Can automatically save on changes by implementing <see cref="T:System.ComponentModel.INotifyPropertyChanged" /> in the data class.
 /// <typeparam name="T">Data class type</typeparam>
-public class PersistentConfig<T> : IDisposable where T : class, INotifyPropertyChanged, new()
+public class PersistentConfig<T> : IDisposable
+    where T : class, INotifyPropertyChanged, new()
 {
     private T data;
     private Timer saveConfigTimer;
     private const int SaveDelay = 500;
 
     private string Path { get; }
+
+    // True if the config file did not exist when it was loaded, which means a new deployment.
+    public bool IsNewDeployment { get; }
 
     public T Data
     {
@@ -34,10 +38,11 @@ public class PersistentConfig<T> : IDisposable where T : class, INotifyPropertyC
 
     ~PersistentConfig() => Dispose();
 
-    private PersistentConfig(string path, T data = null)
+    private PersistentConfig(string path, T data, bool isNewDeployment)
     {
         Path = path;
         Data = data;
+        IsNewDeployment = isNewDeployment;
     }
 
     private void SaveLater()
@@ -52,13 +57,18 @@ public class PersistentConfig<T> : IDisposable where T : class, INotifyPropertyC
 
     public static PersistentConfig<T> Load(IPluginLogger log, string path)
     {
+        var isNewDeployment = !File.Exists(path);
         try
         {
-            if (File.Exists(path))
+            if (!isNewDeployment)
             {
                 var xmlSerializer = new XmlSerializer(typeof(T));
                 using (var streamReader = File.OpenText(path))
-                    return new PersistentConfig<T>(path, (T)xmlSerializer.Deserialize(streamReader));
+                    return new PersistentConfig<T>(
+                        path,
+                        (T)xmlSerializer.Deserialize(streamReader),
+                        false
+                    );
             }
         }
         catch (Exception e)
@@ -78,7 +88,7 @@ public class PersistentConfig<T> : IDisposable where T : class, INotifyPropertyC
         }
 
         log.Info("Writing default configuration file: {0}", path);
-        var config = new PersistentConfig<T>(path, new T());
+        var config = new PersistentConfig<T>(path, new T(), isNewDeployment);
         config.Save();
         return config;
     }

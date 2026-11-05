@@ -110,3 +110,21 @@ derives from `Attribute`. `BuildRow` should return a `Control` built via
 `RowBuilder.NewRow(label, tooltip, ...)`.
 [`SettingsGenerator`](SettingsGenerator.cs) will pick the new attribute up
 automatically — no registration needed.
+
+## Defaults on a new deployment
+
+A new option may need a different default on a new deployment than on an
+existing one, for example to turn a feature on only for new users.
+`PersistentConfig<T>.IsNewDeployment` tells them apart: it is `true` if the
+config file did not exist yet when the config was loaded. `Load` writes the file
+if it is missing, so the option's field initializer can't ask for it. Set the
+option right after loading instead, see [`Plugin.cs`](../Plugin.cs):
+
+```csharp
+config = PersistentConfig<Config>.Load(Log, Path.Combine(DataDir, ConfigFileName));
+if (config.IsNewDeployment) config.Data.NewOption = true;
+```
+
+A config file written before the option existed has no value for it, so the
+option keeps the default of its field initializer. A config file that exists
+but can't be read counts as an existing deployment too.

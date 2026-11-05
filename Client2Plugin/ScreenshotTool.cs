@@ -17,7 +17,8 @@ namespace Client2Plugin;
 
 // SE2's take_screenshot. TakeScreenshotAsync returns a Task, where SE1's TakeScreenshot is fire and
 // forget, so this needs none of SE1's single-slot service: the capture is awaited, and its file's
-// path goes into item.Output for McpServer to send.
+// path goes into item.Output for McpServer to send. It is still issued from the update thread, as
+// SE1's is (CaptureAsync).
 //
 // Into Temp\SeMcp\: captures for a model are transient, SE2 has no screenshot feature or folder (its
 // roots are AppData, Content and Temp), and its own captures, blueprint and save thumbnails, go to
@@ -76,7 +77,6 @@ public sealed class ScreenshotTool(Executor mainExec) : ITool
     {
         try
         {
-            var target = RenderEngineComponent.Instance.RenderContracts.GetMainTarget();
             EnsureSubDir();
 
             // .jpg picks the JPEG encoder. InvariantCulture: under fa-IR, ar-SA and the like the
@@ -84,8 +84,26 @@ public sealed class ScreenshotTool(Executor mainExec) : ITool
             var relative = Path.Combine(SubDir, DateTime.Now.ToString("yyyyMMdd-HHmmss-fff", CultureInfo.InvariantCulture) + ".jpg");
             var handle = FileSystem.Temp.GetFileHandleWritable(relative);
 
+            // TakeScreenshotAsync writes a render command into the current update frame's buffer,
+            // which only work ordered with that frame's commit may write: from this thread, a write
+            // racing the commit can miss the render thread's last pass (lost, so the await below
+            // never returns) or land after the buffer is recycled. The update thread's queue runs
+            // after the commit (PostAppUpdateSystem.UpdateQueueJob). If the queue ends first the
+            // await throws TaskCanceledException, which the catch reports.
+            await Singleton<VRageCore>.Instance.UpdateQueue.MoveTo();
+
+            // A cancel that came in during the hop issues nothing.
+            if (item.Cancel.IsCancellationRequested)
+            {
+                Complete(item, cancelled: true);
+                return;
+            }
+
+            var target = RenderEngineComponent.Instance.RenderContracts.GetMainTarget();
+
             // downsample (null: as is), viewport, withoutUi; awaitWrite: the file is complete once
-            // the await returns.
+            // the await returns. It resumes off the update thread: a Keen task continues an awaiting
+            // System async method on whichever thread completes it, here the engine's save task.
             await target.TakeScreenshotAsync(handle, ComputeDownsample(), null, ignoreSprites, awaitWrite: true);
 
             // After the await: GetAbsolutePath throws FileNotFoundException until the file exists.
@@ -141,9 +159,10 @@ public sealed class ScreenshotTool(Executor mainExec) : ITool
         return null;
     }
 
-    private static void Complete(WorkItem item, string error = null)
+    private static void Complete(WorkItem item, string error = null, bool cancelled = false)
     {
         item.Error = error;
+        item.WasCancelled = cancelled;
         item.Done.TrySetResult(true);
     }
 }
